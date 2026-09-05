@@ -358,13 +358,13 @@ landing before the list widget is even proven.
 - [ ] **The window.** `iced::daemon` rather than `application`, because a
       second ricedir window should be a second window and not a second process.
       Theme, font and font size from the config; `decorations` left on until M6.
-- [ ] **The entry model.** `read_dir` on a worker thread, streamed to the Elm
+- [x] **The entry model.** `read_dir` on a worker thread, streamed to the Elm
       loop in chunks so a slow network mount paints progressively.
       `symlink_metadata`, so a broken symlink is shown as a symlink rather than
       vanishing. Natural sort written here rather than pulled in — digits
       compared as numbers, `file2` before `file10` — with directories first and
       a case-insensitive option.
-- [ ] **The list widget.** Only viewport rows laid out and drawn. Uniform row
+- [x] **The list widget.** Only viewport rows laid out and drawn. Uniform row
       height, so the visible range is arithmetic rather than a search. A
       `Widget` impl of ours, needing only `size`, `layout` and `draw` — the
       other nine trait methods are defaulted.
@@ -434,11 +434,69 @@ landing before the list widget is even proven.
 - [ ] **The notice line.** ricebar's `Bar::warn` idea: a strip that shows
       config errors, refused handlers and failed spawns, because a file manager
       started from a launcher has no terminal to print to.
-- [ ] **The status line.** Entry count, selection count, selected size, free
+- [x] **The status line.** Entry count, selection count, selected size, free
       space on the buffer's filesystem, and the active filter.
 - [ ] **The jobs panel, empty.** The panel and its layout, with nothing to put
       in it until M2. Cheap now, and it stops the sidebar being redesigned
       later.
+
+## M1 stage 1: what was measured
+
+Recorded because the gate is the whole reason the list widget is shaped the
+way it is, and because the next person to be tempted by `iced_widget::table`
+should have to argue with a number.
+
+Headless sway, 1280x800, software rendering, release build, 2026-09-05.
+The tree comes from `dev/make-test-tree.sh`.
+
+- [x] **Frame cost does not follow the directory.** 200 scroll frames, timed
+      by the process's own utime plus stime:
+
+      | entries | per frame |
+      | --- | --- |
+      | 1,000 | 12.55 ms |
+      | 100,000 | 12.25 ms |
+
+      A hundredfold more entries, and the same frame. That is the claim in
+      `## Known constraints`, now with a number against it. The 12 ms itself is
+      llvmpipe in a headless session and says nothing about a real GPU; the
+      flatness is the point.
+
+      **Measure this properly or not at all.** The first attempt compared 200
+      scroll steps of three notches each, and made the small directory look
+      1.6x cheaper -- because 1,000 entries is only 24,000 px tall, so it hit
+      the bottom partway through and the rest of the scrolls became no-ops
+      that skipped their redraw. Any future run has to keep both directories
+      off their end stop.
+
+- [x] **Memory does not follow the directory either.** 215 MB resident at
+      100,000 entries against 225 MB at 30. It is all renderer and font atlas;
+      the entries themselves do not show up against that.
+- [x] **Idle costs nothing.** Zero ticks over five seconds with a window open,
+      so nothing is redrawing on a timer.
+- [x] **Listing 100,000 entries costs 114 ticks**, against 48 for a small
+      directory. Mostly the 100k `symlink_metadata` calls, which is the floor.
+
+      It was 794 ticks before the sort was throttled. `extend` re-sorted every
+      accumulated entry on each of the 196 chunks, which is quadratic; sorting
+      at most ten times a second cut it sevenfold and nothing about the
+      listing looks different. Do not put the sort back in the chunk handler.
+
+- [x] **The cursor bug the screenshot caught.** A 100k directory opened with
+      the cursor on `file17`. `rebuild` follows the cursor by name so it stays
+      on its entry across a relist, but it ran from the first chunk, so it
+      latched onto whichever of the first 512 entries happened to sort first
+      and then rode it down the listing. The cursor is now only followed once
+      somebody has deliberately placed it.
+
+- [ ] **Keyboard is not verified end to end.** Nothing on this machine can
+      inject a key press into a headless compositor: `wlrctl keyboard` has no
+      `key` action, and `wtype`, `ydotool` and `dotool` are all absent. The
+      buffer's cursor and selection are unit-tested, but the path from a real
+      key through the widget to the buffer has only been read, not run.
+      ricebar wrote `vpointer` for exactly this gap on the pointer side; a
+      `vkeyboard` beside it is the fix, and until then no claim should be made
+      about keyboard navigation working.
 
 ## M2 — the job engine
 

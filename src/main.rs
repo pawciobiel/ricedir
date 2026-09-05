@@ -5,8 +5,11 @@
 // stage 1 of M1 is finished; it is not a licence to leave dead code behind.
 #![allow(dead_code)]
 
+mod app;
+mod buffer;
 mod config;
 mod entry;
+mod widget;
 
 use std::path::PathBuf;
 
@@ -28,12 +31,37 @@ fn main() {
     let config = config::load(config);
     let start = start.unwrap_or_else(home);
 
-    // Stands in for `app::run` until there is a window to open.
-    eprintln!("ricedir: nothing to draw yet; see TODO.md");
-    if let Some(path) = &config.path {
-        eprintln!("ricedir: config {}", path.display());
+    let font = config
+        .window
+        .font
+        .clone()
+        // `Font::with_name` wants a `&'static str` while the family comes from
+        // a config file, so the name is leaked once. Bounded: one per run.
+        .map_or_else(iced::Font::default, |family| {
+            iced::Font::with_name(String::leak(family))
+        });
+    let text_size = config.window.font_size;
+
+    let started = iced::daemon(
+        move || app::new(config.clone(), start.clone()),
+        app::update,
+        app::view,
+    )
+    .title(app::title)
+    .theme(app::theme)
+    .subscription(app::subscription)
+    .settings(iced::Settings {
+        id: Some(String::from("ricedir")),
+        default_text_size: iced::Pixels(text_size),
+        default_font: font,
+        ..iced::Settings::default()
+    })
+    .run();
+
+    if let Err(error) = started {
+        eprintln!("ricedir: {error}");
+        std::process::exit(1);
     }
-    eprintln!("ricedir: would open {}", start.display());
 }
 
 fn arguments() -> Arguments {
