@@ -341,11 +341,11 @@ Read-only on purpose. Nothing in this milestone can destroy a file, so the
 foundations can be got wrong safely. A copy in M1 would be the riskiest code
 landing before the list widget is even proven.
 
-- [ ] **Cargo skeleton and the checks.** `Cargo.toml` as decided above,
+- [x] **Cargo skeleton and the checks.** `Cargo.toml` as decided above,
       `src/main.rs` with ricebar's `Arguments::{Run, Handled}` shape, and
       `cargo build`/`test`/`clippy --all-targets -- -D warnings`/`fmt --check`
       all green from the first commit.
-- [ ] **`src/config/`.** Port from ricebar and change what a file manager
+- [x] **`src/config/`.** Port from ricebar and change what a file manager
       needs: `default_path()` for `$XDG_CONFIG_HOME/ricedir/config.toml`,
       never-fatal `load()`, `trustworthy()` on the file *and its parent*,
       `first_run::create()` writing a config plus the probed handler list, and
@@ -365,12 +365,25 @@ landing before the list widget is even proven.
       compared as numbers, `file2` before `file10` — with directories first and
       a case-insensitive option.
 - [ ] **The list widget.** Only viewport rows laid out and drawn. Uniform row
-      height, so the visible range is arithmetic rather than a search. Needs a
-      `Widget` impl with `advanced`, and needs `scrollable`'s
-      `scroll_to(AbsoluteOffset)` to keep the keyboard cursor on screen —
-      `AbsoluteOffset` and `RelativeOffset` are re-exported from
-      `iced_widget::scrollable`, which is a thing ricebar found *not* to be
-      true of `iced_runtime::scroll_to`, so check before assuming.
+      height, so the visible range is arithmetic rather than a search. A
+      `Widget` impl of ours, needing only `size`, `layout` and `draw` — the
+      other nine trait methods are defaulted.
+
+      **It owns its own scroll offset** rather than sitting inside a
+      `scrollable`. Both work, and the deciding argument is the keyboard:
+      if the `scrollable` owns the offset, keeping the cursor on screen costs
+      a round trip — `shell.publish` from the widget, then
+      `iced::widget::operation::scroll_to` from `update`, landing a frame
+      late. Held ArrowDown through a long directory is exactly where that
+      shows. Owning the offset in `tree::State` makes it a clamp in the same
+      `update` that moved the cursor. It also leaves room for variable row
+      heights later, which a `scrollable` cannot express, since it knows only
+      one content rect.
+
+      The cost is handling `mouse::Event::WheelScrolled` and drawing a
+      scrollbar ourselves. `scrollable.rs:855-899` is the reference for the
+      wheel arithmetic: `Lines { x, y } => -Vector::new(x, y) * 60.0` and
+      `Pixels { x, y } => -Vector::new(x, y)`.
 - [ ] **Selection.** Cursor plus an anchor: click sets both, `Ctrl+click`
       toggles one, `Shift+click` and `Shift+arrow` extend from the anchor,
       `Ctrl+A`, invert, and a rubber band from a drag on empty space. Stored as
@@ -910,6 +923,50 @@ iced 0.14.0 / iced_widget 0.14.2 / iced_winit 0.14.0 / winit 0.30.13.
   xdg-toplevel through winit, so `exclusive_zone`, `keyboard_interactivity`,
   `to_layer_message`'s appended variants and `iced_layershell`'s grabbing
   popups are all somebody else's problem. Its *iced* findings still apply.
+- **`Widget::layout` is given no viewport** — its signature is
+  `(tree, renderer, limits)`. Nor can `children()`/`diff()` depend on
+  visibility, since they run before layout. So virtualisation through child
+  `Element`s is not possible without a `responsive`-style relayout hack; a
+  widget that *draws* its rows has no such problem, which settles the design.
+- **`viewport: &Rectangle` in `draw` is comparable to `layout.bounds()`
+  directly**, no transform needed. `Column::draw`
+  (`iced_widget-0.14.2/src/column.rs:316-328`) is the culling idiom to copy.
+  Inside a `scrollable` the viewport slides down the content rect by the
+  translation, and `draw` additionally intersects it with the ancestor
+  viewport while `update` does not.
+- **0.14 renamed `Widget::on_event` to `update`**, it takes `&Event` and
+  returns nothing, and capture is `shell.capture_event()` rather than a
+  returned `event::Status`. Only `size`, `layout` and `draw` are required.
+- **`scrollable::Id` does not exist.** Use `iced::widget::Id`. The scrolling
+  helpers are `iced::widget::operation::{scroll_to, snap_to, snap_to_end,
+  scroll_by}` (from `iced_runtime`), *not* `iced_widget::scrollable::*`, which
+  re-exports only the `AbsoluteOffset`/`RelativeOffset` types.
+- **`iced_runtime::task::blocking` is not reachable through `iced`.**
+  `iced::task` re-exports only `Handle` and `Task`. It would have been ideal
+  for the directory scan — it runs a closure on a real thread and streams
+  results back — so the listing gets a hand-rolled `std::thread` plus a
+  `tokio::sync::mpsc` channel instead. `iced::widget::operation::*` *is*
+  reachable, because `iced::widget` does `pub use iced_runtime::widget::*`.
+- **`Task::abortable()` returns a `Handle`.** That is how an in-flight
+  directory scan is cancelled when someone navigates away before it finishes.
+- **`event::listen_with` takes a bare `fn` pointer, not a closure**, so it
+  cannot capture anything. Relevant to tracking the cursor for context menus.
+- **`text_input` does not capture ArrowUp, ArrowDown, PageUp, PageDown or
+  Tab** — it handles only Enter, Backspace, Delete, Home, End, the horizontal
+  arrows and Escape. So the filter box can keep text focus while the list
+  handles vertical navigation, and there is no fight to arbitrate. Escape
+  unfocuses it for free.
+- **Focus is a widget operation**: `iced::widget::operation::focus(id)`
+  unfocuses everything else in one traversal. Nothing in the runtime binds Tab
+  to `focus_next`; that has to be wired by hand.
+- **`fill_text` re-shapes the text every frame.** For a list, cache a
+  `Paragraph` per visible row in `tree::State` and use `fill_paragraph`.
+- **`keyboard::Event::KeyPressed` carries `repeat: bool`**, which is how a
+  held ArrowDown through 100k rows gets throttled.
+- **`iced::daemon` opens no window by itself and does not exit when the last
+  one closes.** A `window::open` task is needed to get the first window, and
+  `iced::exit()` to stop. `window::open` hands back the `Id` synchronously
+  alongside the task, so state can be keyed on it before the window exists.
 - **Text cannot be measured outside a renderer.** ricebar hit this repeatedly.
   Column widths therefore come from the config and from a glyph-count estimate,
   or from a `Widget` impl that has a renderer to hand — which the list widget

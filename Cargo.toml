@@ -1,0 +1,36 @@
+[package]
+name = "ricedir"
+version = "0.1.0"
+edition = "2024"
+description = "A Wayland file manager built with iced, that an agent can be watched using"
+license = "MIT"
+repository = "https://github.com/pawciobiel/ricedir"
+keywords = ["wayland", "file-manager", "iced", "hyprland", "mcp"]
+categories = ["gui"]
+readme = "README.md"
+# Installed with `cargo install --git`, not from crates.io, for the same reason
+# as ricebar: publishing there means signing in through GitHub and granting that
+# login access it does not need. The metadata above stays accurate either way,
+# and this stops an accidental `cargo publish` rather than a deliberate one.
+publish = false
+# docs/ holds prose and the README's recordings, and dev/ is for working on
+# ricedir. Neither belongs in a package.
+exclude = ["/docs", "/dev"]
+
+[dependencies]
+# `image` and `svg` are what let a file type's icon be a picture from an icon
+# theme rather than a font glyph. They pull in decoders and resvg, which is
+# most of ricedir's compile time -- worth it for a program whose whole job is
+# to show a directory and look good doing it.
+#
+# `advanced` exposes the widget traits. It is not optional here: the file list
+# is a widget of ours, because iced's own `table` builds an `Element` per cell
+# and a directory can hold 100k of them.
+iced = { version = "0.14", features = ["tokio", "image", "svg", "advanced"] }
+jiff = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+# `sync` is the bridge from the listing and job threads to the Elm loop: file
+# work is blocking I/O and belongs on plain threads, and a tokio channel is
+# what carries results back into a subscription.
+tokio = { version = "1", features = ["io-util", "process", "sync", "time"] }
