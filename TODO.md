@@ -489,14 +489,31 @@ The tree comes from `dev/make-test-tree.sh`.
       and then rode it down the listing. The cursor is now only followed once
       somebody has deliberately placed it.
 
-- [ ] **Keyboard is not verified end to end.** Nothing on this machine can
-      inject a key press into a headless compositor: `wlrctl keyboard` has no
-      `key` action, and `wtype`, `ydotool` and `dotool` are all absent. The
-      buffer's cursor and selection are unit-tested, but the path from a real
-      key through the widget to the buffer has only been read, not run.
-      ricebar wrote `vpointer` for exactly this gap on the pointer side; a
-      `vkeyboard` beside it is the fix, and until then no claim should be made
-      about keyboard navigation working.
+- [x] **Keyboard is verified now, and it took a tool.** Nothing installed
+      here can inject a key press into a headless compositor: `wlrctl
+      keyboard` has no `key` action, and `wtype`, `ydotool` and `dotool` are
+      all absent. `dev/vkeyboard` is the sibling of ricebar's `vpointer` and
+      exists for the same reason -- the capability has to stay up between
+      events -- and `dev/keys.sh` drives it.
+
+      It earned its keep immediately. Arrows and `End` were fine, but the
+      first keyboard screenshot showed two things every pointer test had
+      missed: a 250-character name **wrapped onto a second line** and painted
+      over the row below it, and a filename containing newlines was drawn
+      **three rows tall**. Both are legal Linux names and both are in
+      `dev/make-test-tree.sh` on purpose; neither had ever been looked at.
+
+      The fixes: text is laid out with unbounded width so a long name is
+      clipped rather than wrapped, since even `Wrapping::None` breaks a line
+      when it is given a real width; and every control character in a name is
+      replaced before it is drawn.
+
+      `dev/make-test-tree.sh` had a bug of its own, found the same way: it
+      creates a directory at mode 000, which `rm -rf` cannot descend into, so
+      running it twice failed halfway and left a tree with no marker file. It
+      now chmods before removing -- and the `[ -e "$ROOT" ] && chmod` that was
+      the obvious way to write it exits the whole script under `set -e` on
+      every first run, which is its own small lesson.
 
 ## M1 stage 2: what the trust check turned out to get wrong
 

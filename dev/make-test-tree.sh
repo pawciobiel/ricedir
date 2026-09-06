@@ -23,11 +23,22 @@ case "$ROOT" in
         ;;
 esac
 
-if [ -e "$ROOT" ] && [ ! -e "$ROOT/.ricedir-test-tree" ]; then
+# The marker says this tree is ours to delete. A tree left half-built by an
+# interrupted run has no marker, so `--force` is how you say you know.
+if [ -e "$ROOT" ] && [ ! -e "$ROOT/.ricedir-test-tree" ] && [ "${FORCE:-}" != 1 ]; then
     echo "make-test-tree: $ROOT exists and was not made by this script" >&2
+    echo "make-test-tree: run with FORCE=1 if it is yours to delete" >&2
     exit 1
 fi
 
+# The forbidden directory below is mode 000, and `rm -rf` cannot descend into
+# it. Without this, running the script a second time fails halfway and leaves
+# a half-built tree -- which is exactly what it did the first time.
+# `[ -e ] && chmod` would be shorter and wrong: under `set -e` the whole
+# script exits when the test fails, which is every first run.
+if [ -e "$ROOT" ]; then
+    chmod -R u+rwX "$ROOT"
+fi
 rm -rf "$ROOT"
 mkdir -p "$ROOT"
 : > "$ROOT/.ricedir-test-tree"

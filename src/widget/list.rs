@@ -462,9 +462,9 @@ impl<Message> FileList<'_, Message> {
         };
 
         let name = if entry.kind.is_directory() {
-            format!("{}/", entry.name)
+            format!("{}/", one_line(&entry.name))
         } else {
-            entry.name.clone()
+            one_line(&entry.name)
         };
 
         self.draw_text(
@@ -523,7 +523,11 @@ impl<Message> FileList<'_, Message> {
         renderer.fill_text(
             text::Text {
                 content,
-                bounds: Size::new(bounds.width, bounds.height),
+                // Unbounded width. A row is one line, and a name too long for
+                // it must run off the edge and be clipped, not wrap: with a
+                // real width even `Wrapping::None` breaks a 250-character
+                // name across two lines and over the row below it.
+                bounds: Size::new(f32::INFINITY, bounds.height),
                 size: Pixels(self.text_size),
                 line_height: text::LineHeight::default(),
                 font: renderer.default_font(),
@@ -589,6 +593,24 @@ where
     }
 }
 
+/// A filename as one line of text.
+///
+/// Every byte except `/` and NUL is legal in a Linux filename, newlines and
+/// tabs included, and `dev/make-test-tree.sh` makes some on purpose. Drawn
+/// as they are, a name with two newlines in it is three lines tall and paints
+/// over the rows either side of it.
+fn one_line(name: &str) -> String {
+    if !name.chars().any(|c| c.is_control()) {
+        return name.to_owned();
+    }
+
+    // U+2400 SYMBOL FOR NULL and its neighbours would be prettier, but a font
+    // that has them is not a font anyone is guaranteed to have.
+    name.chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect()
+}
+
 /// A size a person can read at a glance.
 fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 6] = ["B", "K", "M", "G", "T", "P"];
@@ -644,6 +666,21 @@ mod tests {
     #[test]
     fn an_empty_directory_draws_nothing() {
         assert_eq!(visible_range(0, 24.0, 0.0, 600.0), 0..0);
+    }
+
+    /// A name with a newline in it is three lines tall if it is drawn as it
+    /// is, and paints over the rows either side. Legal on Linux, and in the
+    /// test tree on purpose.
+    #[test]
+    fn a_name_is_always_one_line() {
+        assert_eq!(one_line("plain.txt"), "plain.txt");
+        assert_eq!(one_line("with\na\nnewline").lines().count(), 1);
+        assert!(!one_line("with\ta\ttab").contains('\t'));
+        assert!(!one_line("bell\u{7}here").chars().any(char::is_control));
+        // Anything that is not a control character survives untouched,
+        // including the ones that make a name awkward for a shell.
+        assert_eq!(one_line("zażółć-gęślą.txt"), "zażółć-gęślą.txt");
+        assert_eq!(one_line("; rm -rf ~ #"), "; rm -rf ~ #");
     }
 
     /// Sizes are read at a glance, so the units matter more than the digits.

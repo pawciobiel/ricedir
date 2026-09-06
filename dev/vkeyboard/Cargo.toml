@@ -1,0 +1,13 @@
+# A testing tool, not part of ricedir: its own package, built on demand by
+# dev/keys.sh. The empty `[workspace]` keeps it out of the crate above it.
+[workspace]
+
+[package]
+name = "vkeyboard"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
