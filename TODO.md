@@ -399,9 +399,9 @@ landing before the list widget is even proven.
       `/proc/self/mountinfo` (filtered: no `sysfs`, `proc`, `cgroup`, `tmpfs`
       under `/run`), and bookmarks in ricedir's own file so nothing is written
       into GTK's. Drag a directory onto the panel to bookmark it.
-- [ ] **Path bar.** Breadcrumbs that are buttons, an editable path with
+- [x] **Path bar.** Breadcrumbs that are buttons, an editable path with
       completion, and back/forward/up with a per-buffer history.
-- [ ] **Filter and sort.** A filter box that narrows as you type (substring by
+- [x] **Filter and sort.** A filter box that narrows as you type (substring by
       default, glob with a leading `:`), a hidden-files toggle, and a sort menu
       over name, size, modified, type and extension.
 - [ ] **Context menu and toolbar.** Right click on an entry, on the selection,
@@ -409,7 +409,7 @@ landing before the list widget is even proven.
       geometry, so the cursor position has to come from
       `iced::event::listen_with` tracking `Mouse(CursorMoved)`; the menu is
       then a `Stack` over the list rather than a real popup.
-- [ ] **Watching.** `notify` on the visible buffers only, debounced ~100 ms and
+- [x] **Watching.** `notify` on the visible buffers only, debounced ~100 ms and
       coalesced into "relist this directory". Beware the rename dance ricebar
       documents: editors and `mv` replace a file rather than writing it, and a
       watch on the old inode misses that entirely.
@@ -579,6 +579,39 @@ Two things the run found that no test had:
       `docs/` once there is a README section to put them in, and the sequence
       that produces them belongs in a script beside `dev/rig.conf` rather than
       in a shell history.
+
+## M1 stage 3: what the keyboard found
+
+- [x] **A box that appears without focus swallows what is typed into it.**
+      Pressing `/` put the filter box on screen and the following `file1`
+      nowhere: the box was drawn but nothing had told it to take the keyboard.
+      `iced::widget::operation::focus(id)` unfocuses everything else in the
+      same traversal, so nothing has to be asked to let go first. Only visible
+      because the keys were actually sent.
+
+- [x] **`text_input` really does leave the vertical arrows alone.** The API
+      notes said so and the design leans on it, so it was worth confirming
+      rather than trusting: with `file1` typed and the box holding its own
+      text cursor, two `Down` presses moved the *list* cursor two rows. There
+      is no focus to arbitrate between the filter and the list, and no
+      mechanism needs building to do it.
+
+- [x] **A capturing closure cannot identify a subscription.** Watching each
+      visible buffer meant one subscription per index, and
+      `.map(move |()| Message::Changed(index))` fails to compile at all --
+      iced hashes the closure to identify the subscription and rejects one
+      that captures. `.with(*index)` then a non-capturing map is the shape,
+      which is the same rule `CLAUDE.md` already recorded for ricebar's
+      modules.
+
+- [x] **A relist must not clear the filter.** Watching a directory that is
+      being filtered would otherwise wipe the box on every change to it, which
+      is precisely when somebody is looking for something.
+
+- [ ] **The breadcrumbs leaked, briefly.** The first version made each
+      component a `&'static str` with `Box::leak`, in a `view` that runs every
+      frame. Caught by reading it back rather than by any tool. Worth a look
+      for others: nothing else in the tree leaks per frame, but nothing checks.
 
 ## M2 — the job engine
 

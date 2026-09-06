@@ -28,6 +28,9 @@ exclude = ["/docs", "/dev"]
 # and a directory can hold 100k of them.
 iced = { version = "0.14", features = ["tokio", "image", "svg", "advanced"] }
 jiff = "0.2"
+# Directory watching. `macos_fsevent` and the serde features are for platforms
+# and uses ricedir has none of, so only the inotify backend is compiled.
+notify = { version = "8", default-features = false }
 # `regex-lite` rather than `regex`: the scan chain matches filenames, which is
 # a hundred bytes against a pattern somebody typed into their own config. It
 # has no dependencies and a fraction of the compile time, and none of what it

@@ -66,6 +66,9 @@ pub struct Buffer {
     /// Selected entries, by index into `entries`.
     pub selection: HashSet<usize>,
 
+    /// What the filter box says. Empty means everything.
+    pub filter: String,
+
     /// Directories already visited, for back and forward.
     pub history: Vec<PathBuf>,
     pub future: Vec<PathBuf>,
@@ -90,6 +93,7 @@ impl Buffer {
             placed: false,
             anchor: 0,
             selection: HashSet::new(),
+            filter: String::new(),
             history: Vec::new(),
             future: Vec::new(),
             generation: 0,
@@ -174,11 +178,14 @@ impl Buffer {
         self.entries
             .sort_by(|left, right| entry::compare(left, right, list));
 
+        let filter = Filter::new(&self.filter);
+
         self.view = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| list.show_hidden || !entry.hidden)
+            .filter(|(_, entry)| filter.admits(&entry.name))
             .map(|(index, _)| index)
             .collect();
 
@@ -283,6 +290,45 @@ impl Buffer {
     /// What the status line adds up.
     pub fn selected_size(&self) -> u64 {
         self.selected().map(|entry| entry.size).sum()
+    }
+}
+
+/// What the filter box means.
+///
+/// A substring by default, because that is what typing into a box means to
+/// most people. A leading `:` switches to a glob, for when it does not.
+struct Filter<'a> {
+    text: &'a str,
+    glob: bool,
+    lowered: String,
+}
+
+impl<'a> Filter<'a> {
+    fn new(text: &'a str) -> Self {
+        match text.strip_prefix(':') {
+            Some(glob) => Self {
+                text: glob,
+                glob: true,
+                lowered: String::new(),
+            },
+            None => Self {
+                text,
+                glob: false,
+                lowered: text.to_lowercase(),
+            },
+        }
+    }
+
+    fn admits(&self, name: &str) -> bool {
+        if self.text.is_empty() {
+            return true;
+        }
+
+        if self.glob {
+            return crate::open::mime::glob_matches(self.text, name);
+        }
+
+        name.to_lowercase().contains(&self.lowered)
     }
 }
 
@@ -444,6 +490,73 @@ mod tests {
         buffer.extend(vec![entry("a"), entry("b")], &list);
 
         assert_eq!(buffer.at(buffer.cursor).map(|e| e.name.as_str()), Some("m"));
+    }
+
+    /// A filter narrows what is shown without touching what is selected, so
+    /// clearing it brings the selection back rather than losing it.
+    #[test]
+    fn a_filter_narrows_the_view_and_keeps_the_selection() {
+        let list = List::default();
+        let mut buffer = buffer(&["alpha.txt", "beta.txt", "gamma.md"]);
+
+        buffer.select_all();
+        assert_eq!(buffer.selected().count(), 3);
+
+        buffer.filter = String::from("a.txt");
+        buffer.rebuild(&list);
+        assert_eq!(buffer.rows(), 2, "alpha.txt and beta.txt");
+
+        buffer.filter.clear();
+        buffer.rebuild(&list);
+        assert_eq!(buffer.rows(), 3);
+        assert_eq!(buffer.selected().count(), 3, "the selection came back");
+    }
+
+    /// Typing into a box means a substring to most people; a leading colon is
+    /// how to ask for a glob instead.
+    #[test]
+    fn a_leading_colon_means_a_glob() {
+        let list = List::default();
+        let mut buffer = buffer(&["notes.md", "notes.txt", "read.md"]);
+
+        buffer.filter = String::from(":*.md");
+        buffer.rebuild(&list);
+        assert_eq!(buffer.rows(), 2);
+
+        // The same text without the colon is a substring, and matches nothing
+        // because no name contains the literal `*.md`.
+        buffer.filter = String::from("*.md");
+        buffer.rebuild(&list);
+        assert_eq!(buffer.rows(), 0);
+    }
+
+    /// A filter is case-insensitive: nobody typing `readme` means to exclude
+    /// `README`.
+    #[test]
+    fn a_filter_ignores_case() {
+        let list = List::default();
+        let mut buffer = buffer(&["README", "readme.txt", "other"]);
+
+        buffer.filter = String::from("READ");
+        buffer.rebuild(&list);
+        assert_eq!(buffer.rows(), 2);
+    }
+
+    /// A filter that matches nothing leaves an empty list that is still
+    /// navigable, rather than a cursor pointing past the end.
+    #[test]
+    fn a_filter_matching_nothing_is_survivable() {
+        let list = List::default();
+        let mut buffer = buffer(&["a", "b", "c"]);
+        buffer.move_to(2);
+
+        buffer.filter = String::from("nothing matches this");
+        buffer.rebuild(&list);
+
+        assert_eq!(buffer.rows(), 0);
+        assert_eq!(buffer.cursor, 0);
+        buffer.move_cursor(1);
+        assert_eq!(buffer.cursor, 0);
     }
 
     /// Holding an arrow key at the end of a directory should stop there, not

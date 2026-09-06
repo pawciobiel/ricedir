@@ -56,6 +56,10 @@ pub enum Action {
     /// Backspace: go to the parent directory.
     Leave,
     SelectAll,
+    /// `/` or Ctrl-F: show the filter box.
+    Filter,
+    /// Escape: put away whatever is showing.
+    Escape,
     /// Right click, with where it happened, so a menu can be put there.
     Menu {
         row: usize,
@@ -334,10 +338,23 @@ where
                 let action = match key {
                     keyboard::Key::Named(key::Named::Enter) => Some(Action::Activate(cursor_row)),
                     keyboard::Key::Named(key::Named::Backspace) => Some(Action::Leave),
+                    keyboard::Key::Named(key::Named::Escape) => Some(Action::Escape),
                     keyboard::Key::Character(character)
                         if character.as_str() == "a" && modifiers.command() =>
                     {
                         Some(Action::SelectAll)
+                    }
+                    // `/` because it is what every list in a terminal uses,
+                    // and Ctrl-F because it is what every window does.
+                    keyboard::Key::Character(character)
+                        if character.as_str() == "/" && !modifiers.command() =>
+                    {
+                        Some(Action::Filter)
+                    }
+                    keyboard::Key::Character(character)
+                        if character.as_str() == "f" && modifiers.command() =>
+                    {
+                        Some(Action::Filter)
                     }
                     _ => None,
                 };

@@ -31,6 +31,9 @@ pub struct App {
     dialogue: Option<Dialogue>,
     /// What has been typed into the dialogue's program box.
     typed: String,
+    /// Whether the filter box is on screen. Hidden until asked for, because a
+    /// box that is always there is a box that is always in the way.
+    filtering: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +44,16 @@ pub enum Message {
     /// so a chunk from one that has been replaced can be dropped.
     Listed(usize, u64, buffer::Update),
     List(usize, list::Action),
+    /// The directory a buffer is showing changed on disk.
+    Changed(usize),
+    /// The filter box was typed into.
+    Filter(usize, String),
+    /// Show or hide the filter box.
+    Filtering(bool),
+    /// A breadcrumb, or back, forward, up.
+    Go(usize, PathBuf),
+    Back(usize),
+    Forward(usize),
     /// The scan chain finished on a file somebody asked to open.
     Scanned(PathBuf, scan::Report),
     /// A handler was started, or would not start.
@@ -63,6 +76,7 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
         notice,
         dialogue: None,
         typed: String::new(),
+        filtering: false,
     };
 
     // The id comes back before the window exists, so the buffer can be tied to
@@ -129,6 +143,15 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 list::Action::Extend(row) => buffer.extend_to(row),
                 list::Action::Cursor(row) => buffer.move_to(row),
                 list::Action::SelectAll => buffer.select_all(),
+                list::Action::Filter => return Task::done(Message::Filtering(true)),
+                list::Action::Escape => {
+                    // One key for "put away whatever is in front of me", in
+                    // the order things are stacked.
+                    if app.dialogue.is_some() {
+                        return Task::done(Message::Dialogue(Choice::Dismiss));
+                    }
+                    return Task::done(Message::Filtering(false));
+                }
                 // The menu is stage 3; the click still moves the cursor, so
                 // right-clicking does something rather than nothing.
                 list::Action::Menu { row, .. } => buffer.move_to(row),
@@ -222,6 +245,85 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
 
         Message::Dialogue(choice) => chose(app, choice),
+
+        Message::Changed(index) => relist(app, index),
+
+        Message::Filter(index, text) => {
+            let list = app.config.list.clone();
+            let Some(buffer) = app.buffers.get_mut(index) else {
+                return Task::none();
+            };
+
+            buffer.filter = text;
+            buffer.rebuild(&list);
+            Task::none()
+        }
+
+        Message::Filtering(showing) => {
+            app.filtering = showing;
+
+            if showing {
+                // A box that appears without focus is a box that swallows the
+                // first thing typed into it -- `/` then `file1` put the box on
+                // screen and the text nowhere. `focus` unfocuses everything
+                // else in the same traversal, so nothing has to be told to let
+                // go first.
+                return iced::widget::operation::focus(filter_id());
+            }
+
+            if !showing {
+                // Leaving the box behind with text in it would leave the
+                // listing narrowed and nothing on screen saying why.
+                let list = app.config.list.clone();
+                for buffer in &mut app.buffers {
+                    if !buffer.filter.is_empty() {
+                        buffer.filter.clear();
+                        buffer.rebuild(&list);
+                    }
+                }
+            }
+            Task::none()
+        }
+
+        Message::Go(index, into) => {
+            let Some(buffer) = app.buffers.get_mut(index) else {
+                return Task::none();
+            };
+            if buffer.path == into {
+                return Task::none();
+            }
+
+            let from = std::mem::replace(&mut buffer.path, into);
+            buffer.history.push(from);
+            buffer.future.clear();
+            relist(app, index)
+        }
+
+        Message::Back(index) => {
+            let Some(buffer) = app.buffers.get_mut(index) else {
+                return Task::none();
+            };
+            let Some(back) = buffer.history.pop() else {
+                return Task::none();
+            };
+
+            let from = std::mem::replace(&mut buffer.path, back);
+            buffer.future.push(from);
+            relist(app, index)
+        }
+
+        Message::Forward(index) => {
+            let Some(buffer) = app.buffers.get_mut(index) else {
+                return Task::none();
+            };
+            let Some(forward) = buffer.future.pop() else {
+                return Task::none();
+            };
+
+            let from = std::mem::replace(&mut buffer.path, forward);
+            buffer.history.push(from);
+            relist(app, index)
+        }
     }
 }
 
@@ -379,13 +481,34 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
         &app.config.theme,
         &app.config.list,
         app.config.window.font_size,
-        true,
+        // Not focused while a dialogue is up: otherwise Escape would close
+        // the dialogue and clear the filter in the same keystroke, and arrows
+        // would move a cursor nobody can see.
+        app.dialogue.is_none(),
         move |action| Message::List(index, action),
     );
 
     let body = container(list).width(Length::Fill).height(Length::Fill);
 
-    let page = column![path_bar(buffer), body, status(app, buffer)]
+    let mut page = column![path_bar(app, index, buffer)];
+
+    if app.filtering {
+        page = page.push(
+            container(
+                iced::widget::text_input("filter, or :glob", &buffer.filter)
+                    .id(filter_id())
+                    .on_input(move |text| Message::Filter(index, text))
+                    .on_submit(Message::Filtering(false))
+                    .size(14)
+                    .padding(6),
+            )
+            .padding([0, 4]),
+        );
+    }
+
+    let page = page
+        .push(body)
+        .push(status(app, buffer))
         .width(Length::Fill)
         .height(Length::Fill);
 
@@ -419,15 +542,95 @@ pub fn theme(app: &App, _window: window::Id) -> iced::Theme {
     )
 }
 
-pub fn subscription(_app: &App) -> iced::Subscription<Message> {
-    window::close_events().map(Message::Closed)
+pub fn subscription(app: &App) -> iced::Subscription<Message> {
+    // Only the buffers on screen are watched. inotify allows 128 instances
+    // here, and a long session opens more directories than that.
+    let watching = app
+        .windows
+        .values()
+        .collect::<std::collections::HashSet<_>>();
+
+    let watches = watching.into_iter().filter_map(|index| {
+        let buffer = app.buffers.get(*index)?;
+        if buffer.listing == Listing::Loading {
+            // Watching a directory still being read would ask for a relist
+            // before the first one had finished.
+            return None;
+        }
+
+        // `.with` rather than a closure that captures the index: iced hashes
+        // a subscription's closure to identify it, and rejects a capturing one
+        // outright. It is the same rule that makes two buffers sharing a
+        // recipe collapse into one stream without it.
+        Some(
+            crate::watch::directory(buffer.path.clone(), buffer.generation)
+                .with(*index)
+                .map(|(index, ())| Message::Changed(index)),
+        )
+    });
+
+    iced::Subscription::batch(
+        watches.chain(std::iter::once(window::close_events().map(Message::Closed))),
+    )
 }
 
-fn path_bar(buffer: &Buffer) -> Element<'_, Message> {
-    container(text(buffer.path.display().to_string()).size(14))
-        .padding(8)
-        .width(Length::Fill)
-        .into()
+/// Breadcrumbs, and the two arrows.
+///
+/// Each component is a button rather than one long string, because the thing
+/// people want from a path bar is to jump three levels up without typing.
+fn path_bar<'a>(app: &'a App, index: usize, buffer: &'a Buffer) -> Element<'a, Message> {
+    use iced::widget::button;
+
+    let dim = app.config.theme.dim.color();
+    // Takes an owned `String`: an earlier version leaked a `&'static str` per
+    // component with `Box::leak`, which in a function that runs every frame is
+    // a leak that grows for as long as the window is open.
+    let quiet = move |label: String, message: Option<Message>| {
+        let mut made =
+            button(text(label).size(14))
+                .padding([2, 6])
+                .style(move |_: &iced::Theme, status| {
+                    let hovered = matches!(status, button::Status::Hovered);
+                    button::Style {
+                        background: None,
+                        text_color: if hovered { iced::Color::WHITE } else { dim },
+                        ..button::Style::default()
+                    }
+                });
+        if let Some(message) = message {
+            made = made.on_press(message);
+        }
+        made
+    };
+
+    let mut crumbs = row![
+        quiet(
+            String::from("<"),
+            (!buffer.history.is_empty()).then_some(Message::Back(index)),
+        ),
+        quiet(
+            String::from(">"),
+            (!buffer.future.is_empty()).then_some(Message::Forward(index)),
+        ),
+    ]
+    .spacing(2)
+    .align_y(iced::Alignment::Center);
+
+    // Built from the components rather than by splitting the string, so a
+    // directory with a slash-looking name in it cannot fool the crumbs.
+    let mut walked = PathBuf::new();
+    for component in buffer.path.components() {
+        walked.push(component.as_os_str());
+
+        let label = match component {
+            std::path::Component::RootDir => String::from("/"),
+            other => other.as_os_str().to_string_lossy().into_owned(),
+        };
+
+        crumbs = crumbs.push(quiet(label, Some(Message::Go(index, walked.clone()))));
+    }
+
+    container(crumbs).padding([4, 4]).width(Length::Fill).into()
 }
 
 fn status<'a>(app: &'a App, buffer: &'a Buffer) -> Element<'a, Message> {
@@ -450,10 +653,26 @@ fn status<'a>(app: &'a App, buffer: &'a Buffer) -> Element<'a, Message> {
         Listing::Ready => format!("{} items", buffer.rows()),
     };
 
+    // Saying a filter is on matters more than the count: a listing that is
+    // narrowed and does not say so looks like a directory that lost files.
+    let counts = if buffer.filter.is_empty() {
+        counts
+    } else {
+        format!("{counts}  ·  filtered by `{}`", buffer.filter)
+    };
+
     container(row![text(counts).size(13)].spacing(12))
         .padding(8)
         .width(Length::Fill)
         .into()
+}
+
+/// The filter box, so it can be focused when it appears.
+///
+/// A fixed id rather than one per buffer: there is one box, and it belongs to
+/// whichever tile is in front.
+fn filter_id() -> iced::widget::Id {
+    iced::widget::Id::new("ricedir-filter")
 }
 
 fn buffer_of(app: &App, window: window::Id) -> Option<&Buffer> {
@@ -476,6 +695,10 @@ fn relist(app: &mut App, index: usize) -> Task<Message> {
         fresh.generation = generation;
         fresh.history = std::mem::take(&mut buffer.history);
         fresh.future = std::mem::take(&mut buffer.future);
+        // A relist because the directory changed must not also clear what was
+        // typed into the filter box, or watching a directory would fight
+        // whoever is filtering it.
+        fresh.filter = std::mem::take(&mut buffer.filter);
         fresh
     };
 
@@ -502,6 +725,7 @@ mod tests {
             notice: None,
             dialogue: None,
             typed: String::new(),
+            filtering: false,
         }
     }
 

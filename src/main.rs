@@ -11,6 +11,7 @@ mod config;
 mod dialogue;
 mod entry;
 mod open;
+mod watch;
 mod widget;
 
 use std::path::PathBuf;
