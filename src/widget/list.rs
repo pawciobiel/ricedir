@@ -63,6 +63,13 @@ pub enum Action {
     },
 }
 
+/// How long after a click a second one on the same row counts as a double.
+///
+/// The widget counts these itself: `mouse_area` has `on_double_click`, but
+/// this list is a `Widget` rather than a tree of them, so nothing above is
+/// watching the presses.
+const DOUBLE: std::time::Duration = std::time::Duration::from_millis(400);
+
 /// Scroll offset and what the cursor was, kept across frames.
 #[derive(Debug, Default)]
 struct State {
@@ -70,6 +77,11 @@ struct State {
     /// The cursor as of the last frame. A change means the cursor moved, from
     /// the keyboard or from an agent, and the offset should follow it.
     seen_cursor: usize,
+    /// When the last left press landed, and on which row.
+    clicked: Option<(usize, std::time::Instant)>,
+    /// A mouse press carries no modifiers, so they are kept from the last
+    /// `ModifiersChanged` -- the same thing `slider` does.
+    modifiers: keyboard::Modifiers,
 }
 
 pub struct FileList<'a, Message> {
@@ -245,7 +257,30 @@ where
 
                 let action = match button {
                     mouse::Button::Right => Some(Action::Menu { row, at: point }),
-                    mouse::Button::Left => Some(Action::Select(row)),
+
+                    mouse::Button::Left => {
+                        let now = std::time::Instant::now();
+                        let again = state
+                            .clicked
+                            .is_some_and(|(last, at)| last == row && now - at < DOUBLE);
+
+                        // A double click opens; the first of the pair has
+                        // already selected the row, which is what every file
+                        // manager does and what makes the selection visible
+                        // before anything happens to it.
+                        state.clicked = (!again).then_some((row, now));
+
+                        Some(if again {
+                            Action::Activate(row)
+                        } else if state.modifiers.command() {
+                            Action::Toggle(row)
+                        } else if state.modifiers.shift() {
+                            Action::Extend(row)
+                        } else {
+                            Action::Select(row)
+                        })
+                    }
+
                     _ => None,
                 };
 
@@ -253,6 +288,10 @@ where
                     shell.publish((self.on_action)(action));
                     shell.capture_event();
                 }
+            }
+
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.modifiers = *modifiers;
             }
 
             Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {

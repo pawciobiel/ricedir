@@ -413,25 +413,25 @@ landing before the list widget is even proven.
       coalesced into "relist this directory". Beware the rename dance ricebar
       documents: editors and `mv` replace a file rather than writing it, and a
       watch on the old inode misses that entirely.
-- [ ] **MIME resolution.** Parse `/usr/share/mime/globs2` (`weight:type:glob`,
+- [x] **MIME resolution.** Parse `/usr/share/mime/globs2` (`weight:type:glob`,
       one per line, already sorted by weight) plus `aliases`, and fall back to
       a small hand-written magic sniffer for the couple of dozen signatures
       worth knowing. No libmagic: it is a C parser for hostile input, which is
       the one thing this program exists to avoid.
-- [ ] **The scan chain.** `[[scan]]` entries, evaluated in order, first
+- [x] **The scan chain.** `[[scan]]` entries, evaluated in order, first
       non-allow verdict wins. Kinds: `glob`, `regex`, `magic-mismatch`,
       `size`, `command`. `warn` shows a dialogue naming the rule that fired and
       offers open-anyway, reveal-in-terminal, or cancel; `block` refuses and
       says which rule refused.
-- [ ] **The opener.** The handler table, flatpak preference, argv spawn with
+- [x] **The opener.** The handler table, flatpak preference, argv spawn with
       `kill_on_drop(true)`, stderr captured into the notice line, and a
       hard rule that a file is never executed because it is executable.
-- [ ] **The no-handler dialogue.** What happens when nothing matches: name the
+- [x] **The no-handler dialogue.** What happens when nothing matches: name the
       type, offer choose-a-program, `xdg-open` once, `xdg-open` always, or
       cancel, and write the config on "always". Refuse the fallback for the
       run-rather-than-open types listed in `## The opener`. This is the first
       dialogue in the program, so it also settles what a dialogue looks like.
-- [ ] **The notice line.** ricebar's `Bar::warn` idea: a strip that shows
+- [x] **The notice line.** ricebar's `Bar::warn` idea: a strip that shows
       config errors, refused handlers and failed spawns, because a file manager
       started from a launcher has no terminal to print to.
 - [x] **The status line.** Entry count, selection count, selected size, free
@@ -518,6 +518,50 @@ parses nothing whose presence depends on being trusted.
       an owner may rename or unlink their own entries, so the replace-the-file
       attack the check exists to stop cannot happen there. `trustworthy` now
       makes the exception; ricebar's version still does not.
+
+## M1 stage 2: the four opening cases, run
+
+Driven by pointer in a headless sway on 2026-09-06, against a directory built
+to be nasty. Screenshots were taken of each, and the point of writing them
+down is that these four are what the whole opener exists for -- any change to
+`src/open/` has to still pass them.
+
+- [x] **A `.desktop` file is data.** Double-clicked `evil.desktop`, whose
+      `Exec=` line would have touched a file. Nothing ran, and the dialogue
+      said "evil.desktop would be run, not opened". Verified by the absence of
+      the file `Exec=` would have created, not by reading the screen.
+- [x] **A double extension is refused, by name.** `invoice.pdf.exe` was
+      blocked, and the dialogue named the rule -- `double extension` -- quoted
+      its pattern, and said to edit it in the config if that was wrong.
+- [x] **A name that lies is caught.** `invoice.pdf` holding an ELF header
+      raised the `magic-mismatch` rule as a warning, with `Open it anyway` and
+      `Cancel`. This is the one the whole `mime` module exists for.
+- [x] **An unknown type asks.** `mystery.bin` offered a program box,
+      `xdg-open` once, `xdg-open` always, and cancel. Choosing "always" wrote
+      `glob = "*.bin"` with `run = ["xdg-open"]` into the config and said so in
+      the notice line, which is the loop that makes the fallback teach the
+      config rather than become a hole.
+
+Two things the run found that no test had:
+
+- [x] **The list had no double click.** Only `Enter` activated a row, and
+      nothing can inject a key into a headless compositor, so the first three
+      cases silently did nothing at all. `mouse_area` has `on_double_click`,
+      but this list is a `Widget` rather than a tree of them, so the presses
+      are counted in its own `tree::State`. Modifiers came with it: a press
+      carries none, so they are kept from the last `ModifiersChanged`, which
+      is what `slider` does -- and that is Ctrl-click and Shift-click working
+      as a side effect.
+- [x] **"Always" could not keep its promise for an unknown type.**
+      `mystery.bin` has no MIME type at all, and the first version keyed a
+      remembered handler on the type alone: it would have run the program and
+      quietly written nothing. It now falls back to the extension, and says
+      plainly when there is neither.
+
+- [ ] **The screenshots are not in the repository yet.** They belong in
+      `docs/` once there is a README section to put them in, and the sequence
+      that produces them belongs in a script beside `dev/rig.conf` rather than
+      in a shell history.
 
 ## M2 — the job engine
 

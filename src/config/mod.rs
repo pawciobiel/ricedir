@@ -6,6 +6,7 @@
 //! mention it.
 
 mod color;
+mod first_run;
 
 use std::path::{Path, PathBuf};
 
@@ -58,12 +59,12 @@ impl Default for Config {
 /// What ricedir parses out of the file, before the fields above are decided.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct Raw {
+pub(crate) struct Raw {
     window: Window,
     theme: Theme,
     list: List,
     open: Open,
-    handler: Vec<Handler>,
+    pub(crate) handler: Vec<Handler>,
     scan: Vec<Scan>,
 }
 
@@ -89,6 +90,41 @@ pub enum Fallback {
     None,
 }
 
+/// One pattern, or a list of them.
+///
+/// `mime = "video/*"` and `mime = ["video/*", "audio/*"]` both read, because a
+/// handler for one type is the common case and a handler for six is the next
+/// one. The alternative was brace expansion inside a glob, which would have
+/// meant inventing syntax; a TOML array is syntax people already have.
+#[derive(Debug, Clone, Default)]
+pub struct Patterns(Vec<String>);
+
+impl Patterns {
+    pub fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.0.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'de> Deserialize<'de> for Patterns {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            One(String),
+            Many(Vec<String>),
+        }
+
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::One(one) => Self(vec![one]),
+            Raw::Many(many) => Self(many),
+        })
+    }
+}
+
 /// One program that may open files, and what it opens.
 ///
 /// `run` is an argv vector and never a command line. There is no shell
@@ -99,10 +135,11 @@ pub enum Fallback {
 pub struct Handler {
     /// What to call this in a message. Defaults to the program's own name.
     pub name: Option<String>,
-    /// A MIME type, with `*` allowed as the whole subtype: `video/*`.
-    pub mime: Option<String>,
-    /// A filename glob, for types the database does not know.
-    pub glob: Option<String>,
+    /// One MIME type or several, with `*` allowed as the whole subtype:
+    /// `video/*`.
+    pub mime: Patterns,
+    /// One filename glob or several, for types the database does not know.
+    pub glob: Patterns,
     /// The argv to run. `{path}` becomes the file, as one element.
     pub run: Vec<String>,
     /// A flatpak application id, preferred over `run` when it is installed,
@@ -293,12 +330,22 @@ pub fn load(named: Option<PathBuf>) -> Config {
 
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // Writing a starter config belongs to stage 2, where probing what
-            // is installed makes one worth writing.
-            if explicit {
-                eprintln!("ricedir: {} does not exist, using defaults", path.display());
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !explicit => {
+            // First run. Coming up on built-in defaults would open nothing and
+            // leave no trace of what can be configured, so write a starter
+            // config from what is installed and read that.
+            match first_run::create(&path).and_then(|()| std::fs::read_to_string(&path)) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("ricedir: cannot write {}: {error}", path.display());
+                    eprintln!("ricedir: using defaults");
+                    return Config::default();
+                }
             }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Asked for by name and not there is a mistake, not a first run.
+            eprintln!("ricedir: {} does not exist, using defaults", path.display());
             return Config {
                 path: Some(path),
                 ..Config::default()
@@ -354,6 +401,99 @@ pub fn parse(path: &Path, text: &str) -> Result<Config, String> {
         path: Some(path.to_path_buf()),
         problem: None,
     })
+}
+
+/// Add a handler to the end of the config file.
+///
+/// What makes the no-handler dialogue teach the config rather than become a
+/// permanent hole: choosing a program once writes it down, and the second
+/// time that type is opened it is a named handler like any other.
+///
+/// Appended as text rather than by reparsing and re-serialising, because
+/// serialising would throw away every comment in the file -- and the comments
+/// are most of what the config is for.
+pub fn append_handler(path: &Path, matcher: &Matcher, run: &[String]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let argv: Vec<String> = run.iter().map(|word| Quoted(word).to_string()).collect();
+    let (key, value) = match matcher {
+        Matcher::Mime(mime) => ("mime", mime),
+        Matcher::Glob(glob) => ("glob", glob),
+    };
+
+    let block = format!(
+        "\n# Added by ricedir when you chose a program for this type.\n\
+         [[handler]]\n\
+         {key} = {}\n\
+         run = [{}]\n",
+        Quoted(value),
+        argv.join(", ")
+    );
+
+    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    file.write_all(block.as_bytes())
+}
+
+/// What a remembered handler is keyed on.
+///
+/// A MIME type where the database knows one, and the extension otherwise.
+/// Without the second, choosing "always" for a file whose type nothing
+/// recognises would run the program and quietly write nothing down, which is
+/// the opposite of what the dialogue promises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Matcher {
+    Mime(String),
+    Glob(String),
+}
+
+impl Matcher {
+    /// How to remember a handler for this file, if it can be remembered.
+    pub fn of(path: &Path, mime: Option<&str>) -> Option<Self> {
+        if let Some(mime) = mime {
+            return Some(Self::Mime(mime.to_owned()));
+        }
+
+        // A leading dot is a hidden file, not an extension.
+        let name = path.file_name()?.to_str()?;
+        let (before, extension) = name.rsplit_once('.')?;
+        (!before.is_empty() && !extension.is_empty())
+            .then(|| Self::Glob(format!("*.{}", extension.to_lowercase())))
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Mime(mime) => mime.clone(),
+            Self::Glob(glob) => glob.clone(),
+        }
+    }
+}
+
+/// A value written as a TOML basic string.
+///
+/// Everything written this way came from a person typing into a dialogue, so
+/// a quote or a backslash in it must not be able to end the string and start
+/// something else. TOML's escapes, not a shell's -- there is no shell here.
+struct Quoted<'a>(&'a str);
+
+impl std::fmt::Display for Quoted<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+
+        formatter.write_str("\"")?;
+        for character in self.0.chars() {
+            match character {
+                '"' => formatter.write_str("\\\"")?,
+                '\\' => formatter.write_str("\\\\")?,
+                '\n' => formatter.write_str("\\n")?,
+                '\r' => formatter.write_str("\\r")?,
+                '\t' => formatter.write_str("\\t")?,
+                // The C0 range has no literal form in a TOML basic string.
+                control if control < ' ' => write!(formatter, "\\u{:04X}", control as u32)?,
+                other => formatter.write_char(other)?,
+            }
+        }
+        formatter.write_str("\"")
+    }
 }
 
 /// Whether commands in this config may be run.
@@ -467,6 +607,61 @@ mod tests {
             .expect("kebab-case keys should parse");
         assert!(config.list.show_hidden);
         assert!(!config.list.directories_first);
+    }
+
+    /// "Always" has to write something down even for a type the database has
+    /// never heard of, or the dialogue is promising what it cannot do.
+    #[test]
+    fn a_handler_is_remembered_by_type_or_by_extension() {
+        assert_eq!(
+            Matcher::of(Path::new("/tmp/photo.png"), Some("image/png")),
+            Some(Matcher::Mime(String::from("image/png")))
+        );
+        assert_eq!(
+            Matcher::of(Path::new("/tmp/mystery.BIN"), None),
+            Some(Matcher::Glob(String::from("*.bin")))
+        );
+        // Nothing to key on: no type, and a leading dot is hidden rather than
+        // an extension.
+        assert_eq!(Matcher::of(Path::new("/tmp/README"), None), None);
+        assert_eq!(Matcher::of(Path::new("/tmp/.bashrc"), None), None);
+    }
+
+    /// The program comes from a person typing into a box, so a quote in it
+    /// must not be able to end the TOML string and start something else.
+    #[test]
+    fn a_written_handler_escapes_what_was_typed() {
+        assert_eq!(Quoted(r#"say "hi""#).to_string(), r#""say \"hi\"""#);
+        assert_eq!(Quoted(r"back\slash").to_string(), r#""back\\slash""#);
+        assert_eq!(Quoted("two\nlines").to_string(), r#""two\nlines""#);
+    }
+
+    /// A written handler has to be one ricedir can read back, or "always"
+    /// breaks the config it was meant to teach.
+    #[test]
+    fn a_written_handler_parses_again() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!("ricedir-append-{}.toml", std::process::id()));
+        std::fs::write(&path, "[list]\nrow-height = 24\n").expect("should write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+
+        append_handler(
+            &path,
+            &Matcher::Glob(String::from("*.bin")),
+            &[String::from("some \"odd\" program")],
+        )
+        .expect("should append");
+
+        let text = std::fs::read_to_string(&path).expect("should read back");
+        let config = parse(&path, &text).expect("what ricedir writes it must read");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(config.handler.len(), 1);
+        assert_eq!(
+            config.handler[0].run,
+            [String::from("some \"odd\" program")]
+        );
     }
 
     /// A colour is the key most likely to be mistyped, and the message has to

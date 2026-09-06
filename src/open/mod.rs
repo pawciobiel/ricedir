@@ -114,20 +114,19 @@ fn suits(handler: &Handler, mime: Option<&str>, name: &str) -> bool {
         return false;
     }
 
-    if let Some(pattern) = &handler.mime
-        && let Some(mime) = mime
-        && mime_matches(pattern, mime)
+    if let Some(mime) = mime
+        && handler
+            .mime
+            .iter()
+            .any(|pattern| mime_matches(pattern, mime))
     {
         return true;
     }
 
-    if let Some(glob) = &handler.glob
-        && mime::glob_matches(glob, name)
-    {
-        return true;
-    }
-
-    false
+    handler
+        .glob
+        .iter()
+        .any(|glob| mime::glob_matches(glob, name))
 }
 
 /// `video/*` against `video/mp4`. Only the whole subtype may be a star:
@@ -301,12 +300,20 @@ mod tests {
     }
 
     fn handler(mime: Option<&str>, glob: Option<&str>, run: &[&str]) -> Handler {
-        Handler {
-            mime: mime.map(str::to_owned),
-            glob: glob.map(str::to_owned),
-            run: run.iter().map(|text| (*text).to_owned()).collect(),
-            ..Handler::default()
+        // Built through the parser, so the tests exercise the same
+        // scalar-or-array deserialiser a real config goes through.
+        let mut text = String::from("[[handler]]\n");
+        if let Some(mime) = mime {
+            text.push_str(&format!("mime = \"{mime}\"\n"));
         }
+        if let Some(glob) = glob {
+            text.push_str(&format!("glob = \"{glob}\"\n"));
+        }
+        let quoted: Vec<String> = run.iter().map(|text| format!("\"{text}\"")).collect();
+        text.push_str(&format!("run = [{}]\n", quoted.join(", ")));
+
+        let raw: crate::config::Raw = toml::from_str(&text).expect("test handler should parse");
+        raw.handler.into_iter().next().expect("one handler")
     }
 
     /// The path goes in as one argv element after `--`, so a file named like

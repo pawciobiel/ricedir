@@ -8,6 +8,7 @@
 mod app;
 mod buffer;
 mod config;
+mod dialogue;
 mod entry;
 mod open;
 mod widget;

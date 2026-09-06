@@ -5,13 +5,15 @@
 //! that can exercise the list widget against a real directory.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use iced::widget::{column, container, row, text};
 use iced::{Element, Length, Task, window};
 
 use crate::buffer::{self, Buffer, Listing};
 use crate::config::Config;
+use crate::dialogue::{self, Choice, Dialogue};
+use crate::open::{self, Plan, scan};
 use crate::widget::list::{self, FileList};
 
 pub struct App {
@@ -25,6 +27,10 @@ pub struct App {
     /// Anything the person needs to be told, since a file manager started from
     /// a launcher has no terminal to print to.
     notice: Option<String>,
+    /// The one modal, when there is one.
+    dialogue: Option<Dialogue>,
+    /// What has been typed into the dialogue's program box.
+    typed: String,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +41,11 @@ pub enum Message {
     /// so a chunk from one that has been replaced can be dropped.
     Listed(usize, u64, buffer::Update),
     List(usize, list::Action),
+    /// The scan chain finished on a file somebody asked to open.
+    Scanned(PathBuf, scan::Report),
+    /// A handler was started, or would not start.
+    Spawned(Result<(), String>),
+    Dialogue(Choice),
 }
 
 pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
@@ -50,6 +61,8 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
         buffers: vec![Buffer::new(start.clone())],
         windows: HashMap::new(),
         notice,
+        dialogue: None,
+        typed: String::new(),
     };
 
     // The id comes back before the window exists, so the buffer can be tied to
@@ -129,8 +142,12 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                         .map(|entry| entry.path.clone());
 
                     let Some(into) = into else {
-                        app.notice = Some(String::from("opening files lands in M1 stage 2"));
-                        return Task::none();
+                        // A file, not a directory. The scan chain gets its say
+                        // before anything is chosen to run it with.
+                        let Some(path) = buffer.at(row).map(|entry| entry.path.clone()) else {
+                            return Task::none();
+                        };
+                        return scanned(app, path);
                     };
 
                     let from = std::mem::replace(&mut buffer.path, into);
@@ -154,6 +171,198 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             let _ = list;
             Task::none()
         }
+
+        Message::Scanned(path, report) => {
+            use crate::config::Verdict;
+
+            match report.verdict {
+                Verdict::Block => {
+                    app.dialogue = Some(Dialogue::Blocked {
+                        path,
+                        rule: report.rule.unwrap_or_else(|| String::from("a scan rule")),
+                        detail: report.detail,
+                    });
+                    Task::none()
+                }
+
+                Verdict::Warn => match open::plan(&app.config, &path) {
+                    // A warning about a file nothing opens anyway is one
+                    // dialogue too many: the handler question is the useful
+                    // one, and the warning rides along in it.
+                    plan @ Plan::Run { .. } => {
+                        app.dialogue = Some(Dialogue::Warned {
+                            path,
+                            plan: Box::new(plan),
+                            rule: report.rule.unwrap_or_else(|| String::from("a scan rule")),
+                            detail: report.detail,
+                        });
+                        Task::none()
+                    }
+                    other => {
+                        app.dialogue = Some(from_plan(path, other));
+                        Task::none()
+                    }
+                },
+
+                Verdict::Allow => match open::plan(&app.config, &path) {
+                    plan @ Plan::Run { .. } => start(plan),
+                    other => {
+                        app.dialogue = Some(from_plan(path, other));
+                        Task::none()
+                    }
+                },
+            }
+        }
+
+        Message::Spawned(result) => {
+            if let Err(problem) = result {
+                app.notice = Some(problem);
+            }
+            Task::none()
+        }
+
+        Message::Dialogue(choice) => chose(app, choice),
+    }
+}
+
+/// Run the scan chain over a file, then come back with what it said.
+fn scanned(app: &App, path: PathBuf) -> Task<Message> {
+    let rules = app.config.scan.clone();
+
+    Task::perform(
+        async move {
+            let report = scan::run(&rules, &path).await;
+            (path, report)
+        },
+        |(path, report)| Message::Scanned(path, report),
+    )
+}
+
+/// Start a handler, and report only a failure.
+fn start(plan: Plan) -> Task<Message> {
+    Task::perform(async move { open::spawn(&plan).await }, Message::Spawned)
+}
+
+/// Turn a plan that cannot run into the dialogue that asks about it.
+fn from_plan(path: PathBuf, plan: Plan) -> Dialogue {
+    match plan {
+        Plan::Refused { mime } => Dialogue::Refused { path, mime },
+        _ => Dialogue::NoHandler {
+            path: path.clone(),
+            mime: open::kind(&path),
+        },
+    }
+}
+
+/// What the dialogue's buttons do.
+fn chose(app: &mut App, choice: Choice) -> Task<Message> {
+    let Some(dialogue) = app.dialogue.take() else {
+        return Task::none();
+    };
+
+    match (choice, dialogue) {
+        (Choice::Typing(typed), held) => {
+            // Still open; only the box changed.
+            app.dialogue = Some(held);
+            app.typed = typed;
+            Task::none()
+        }
+
+        (Choice::Dismiss, _) => {
+            app.typed.clear();
+            Task::none()
+        }
+
+        (Choice::Anyway, Dialogue::Warned { plan, .. }) => start(*plan),
+
+        (Choice::Once, Dialogue::NoHandler { path, .. }) => start(xdg_open(&path)),
+
+        (Choice::Always, Dialogue::NoHandler { path, mime }) => {
+            // Remember it before running it, so the answer holds even if the
+            // handler itself then fails.
+            remember(app, &path, mime.as_deref(), &["xdg-open".to_owned()]);
+            start(xdg_open(&path))
+        }
+
+        (Choice::Named, Dialogue::NoHandler { path, mime }) => {
+            let typed = std::mem::take(&mut app.typed);
+            let program = typed.trim();
+
+            if program.is_empty() {
+                app.dialogue = Some(Dialogue::NoHandler { path, mime });
+                return Task::none();
+            }
+
+            // Split on spaces so `foot -e nvim` works, and each word stays its
+            // own argv element. There is no shell, so nothing else happens to
+            // what was typed.
+            let run: Vec<String> = program.split_whitespace().map(str::to_owned).collect();
+            remember(app, &path, mime.as_deref(), &run);
+
+            let Some((program, rest)) = run.split_first() else {
+                return Task::none();
+            };
+            let mut arguments: Vec<std::ffi::OsString> =
+                rest.iter().map(std::ffi::OsString::from).collect();
+            arguments.push(std::ffi::OsString::from("--"));
+            arguments.push(path.as_os_str().to_owned());
+
+            start(Plan::Run {
+                name: program.clone(),
+                program: std::ffi::OsString::from(program),
+                arguments,
+                directory: None,
+            })
+        }
+
+        // Every other pairing is a button the dialogue did not draw.
+        (_, held) => {
+            app.dialogue = Some(held);
+            Task::none()
+        }
+    }
+}
+
+fn xdg_open(path: &Path) -> Plan {
+    Plan::Run {
+        name: String::from("xdg-open"),
+        program: std::ffi::OsString::from("xdg-open"),
+        arguments: vec![std::ffi::OsString::from("--"), path.as_os_str().to_owned()],
+        directory: None,
+    }
+}
+
+/// Write a chosen handler into the config, and say so.
+///
+/// Keyed on the MIME type where there is one and the extension otherwise, so
+/// "always" means what it says even for a type the database has never heard
+/// of. A file with neither cannot be remembered, and the notice says so
+/// rather than letting the promise quietly fail.
+fn remember(app: &mut App, path: &Path, mime: Option<&str>, run: &[String]) {
+    use crate::config::Matcher;
+
+    let Some(config) = app.config.path.clone() else {
+        return;
+    };
+
+    let Some(matcher) = Matcher::of(path, mime) else {
+        app.notice = Some(String::from(
+            "opened it, but there is no type or extension to remember it by",
+        ));
+        return;
+    };
+
+    match crate::config::append_handler(&config, &matcher, run) {
+        Ok(()) => {
+            app.notice = Some(format!(
+                "{} now opens with `{}`",
+                matcher.describe(),
+                run.join(" ")
+            ));
+        }
+        Err(error) => {
+            app.notice = Some(format!("could not write {}: {error}", config.display()));
+        }
     }
 }
 
@@ -176,10 +385,22 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
 
     let body = container(list).width(Length::Fill).height(Length::Fill);
 
-    column![path_bar(buffer), body, status(app, buffer)]
+    let page = column![path_bar(buffer), body, status(app, buffer)]
         .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        .height(Length::Fill);
+
+    let Some(dialogue) = &app.dialogue else {
+        return page.into();
+    };
+
+    // A `Stack` rather than a second surface: iced's own popups take a grab,
+    // and a modal that starves the window of pointer events is worse than no
+    // modal at all -- a lesson ricebar paid for with its tooltips.
+    iced::widget::stack![
+        page,
+        dialogue::view(dialogue, &app.config.theme, &app.typed).map(Message::Dialogue),
+    ]
+    .into()
 }
 
 pub fn theme(app: &App, _window: window::Id) -> iced::Theme {
@@ -279,6 +500,8 @@ mod tests {
             buffers: vec![Buffer::new(PathBuf::from("/tmp/one"))],
             windows: HashMap::new(),
             notice: None,
+            dialogue: None,
+            typed: String::new(),
         }
     }
 
@@ -344,18 +567,114 @@ mod tests {
         assert!(app.buffers[0].history.is_empty());
     }
 
-    /// Activating a file cannot open it until stage 2, and the person has to
-    /// be told rather than left wondering why nothing happened.
+    /// Activating a file must not move the buffer anywhere. Where it goes
+    /// next is the scan chain's business, which happens in a task.
     #[test]
-    fn activating_a_file_says_so_rather_than_nothing() {
+    fn activating_a_file_does_not_navigate() {
         let mut app = app();
         let list = Config::default().list;
         app.buffers[0].extend(vec![entry("notes.md", Kind::File)], &list);
         app.buffers[0].finish(&list);
 
         tell(&mut app, Message::List(0, list::Action::Activate(0)));
-        assert!(app.notice.is_some(), "no notice after opening a file");
         assert_eq!(app.buffers[0].path, PathBuf::from("/tmp/one"));
+        assert!(app.dialogue.is_none(), "the dialogue waits for the scan");
+    }
+
+    /// A blocked file raises a dialogue that names the rule, because a person
+    /// told only "blocked" has nothing to go and edit.
+    #[test]
+    fn a_blocked_file_names_the_rule_that_refused() {
+        use crate::config::Verdict;
+
+        let mut app = app();
+        tell(
+            &mut app,
+            Message::Scanned(
+                PathBuf::from("/tmp/one/invoice.pdf.exe"),
+                scan::Report {
+                    verdict: Verdict::Block,
+                    rule: Some(String::from("double extension")),
+                    detail: Some(String::from("it ends .pdf.exe")),
+                },
+            ),
+        );
+
+        let Some(Dialogue::Blocked { rule, .. }) = &app.dialogue else {
+            panic!("expected a blocked dialogue, got {:?}", app.dialogue);
+        };
+        assert_eq!(rule, "double extension");
+    }
+
+    /// Nothing in the config opens it, so the question is which program --
+    /// and the answer must not be silence.
+    #[test]
+    fn an_unopenable_file_asks() {
+        use crate::config::Verdict;
+
+        let mut app = app();
+        tell(
+            &mut app,
+            Message::Scanned(
+                PathBuf::from("/tmp/one/mystery.zip"),
+                scan::Report::allowed(),
+            ),
+        );
+
+        assert!(
+            matches!(app.dialogue, Some(Dialogue::NoHandler { .. })),
+            "got {:?}",
+            app.dialogue
+        );
+        let _ = Verdict::Allow;
+    }
+
+    /// Typing in the dialogue must not close it, or the box would lose a
+    /// character at a time.
+    #[test]
+    fn typing_leaves_the_dialogue_open() {
+        let mut app = app();
+        app.dialogue = Some(Dialogue::NoHandler {
+            path: PathBuf::from("/tmp/one/mystery"),
+            mime: None,
+        });
+
+        tell(
+            &mut app,
+            Message::Dialogue(Choice::Typing(String::from("em"))),
+        );
+        assert!(app.dialogue.is_some());
+        assert_eq!(app.typed, "em");
+    }
+
+    /// Cancelling closes it and forgets what was typed, so the next file does
+    /// not inherit half a program name.
+    #[test]
+    fn cancelling_clears_the_box() {
+        let mut app = app();
+        app.typed = String::from("emacs");
+        app.dialogue = Some(Dialogue::NoHandler {
+            path: PathBuf::from("/tmp/one/mystery"),
+            mime: None,
+        });
+
+        tell(&mut app, Message::Dialogue(Choice::Dismiss));
+        assert!(app.dialogue.is_none());
+        assert!(app.typed.is_empty());
+    }
+
+    /// An empty box is not a program. Pressing the button must leave the
+    /// dialogue up rather than running nothing.
+    #[test]
+    fn an_empty_program_box_does_nothing() {
+        let mut app = app();
+        app.dialogue = Some(Dialogue::NoHandler {
+            path: PathBuf::from("/tmp/one/mystery"),
+            mime: None,
+        });
+
+        tell(&mut app, Message::Dialogue(Choice::Named));
+        assert!(app.dialogue.is_some(), "the dialogue should stay up");
     }
 
     /// A message naming a buffer that is gone must not panic.

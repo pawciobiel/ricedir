@@ -1,0 +1,116 @@
+# ricedir — written on first run. Edit freely; ricedir never rewrites it.
+#
+# Every option is documented in config.example.toml, shipped with the source.
+# Saving this file reloads the running window.
+#
+# The handler and scan lists below were generated from what was actually
+# installed when this file was written. Anything commented out says what it
+# needs beside it.
+
+# --- the window ---------------------------------------------------------
+[window]
+width = 1100
+height = 700
+# Family as fontconfig names it. List them with `fc-list : family`, and check
+# one with `fc-match "<name>" family`. Leave it unset for the system default.
+#
+#   font = "JetBrainsMono Nerd Font"
+font-size = 14
+
+# --- the file list ------------------------------------------------------
+[list]
+row-height = 24
+show-hidden = false
+directories-first = true
+sort = "name"             # name | size | modified | extension
+sort-reversed = false
+ignore-case = true        # whether Apple and apple sort together
+
+# --- colours ------------------------------------------------------------
+[theme]
+# #rgb, #rgba, #rrggbb and #rrggbbaa all work.
+background = "#1e1e2e"
+foreground = "#cdd6f4"
+accent = "#89b4fa"        # fill behind the row the cursor is on
+muted = "#45475a"         # fill behind a selected row that is not the cursor
+dim = "#6c7086"           # sizes, symlink targets, the status line
+urgent = "#f38ba8"        # a broken symlink, a blocked file, a failed job
+
+# --- opening files ------------------------------------------------------
+#
+# This is the part that matters. ricedir never consults a .desktop file and
+# never runs a shell: a handler is an argv vector, the path goes in as one
+# element after `--`, and a file called `; rm -rf ~ #` is a file with a silly
+# name.
+#
+# `fallback` says what happens when nothing below matches:
+#
+#   ask       name the type and offer the choices, including xdg-open once or
+#             always. Choosing "always" writes a real handler in here.
+#   xdg-open  hand it straight over. Quicker, and it is the resolution chain
+#             this program exists to replace, so it is not the default.
+#   none      say there is no handler, and stop.
+#
+# Whichever is set, the fallback is refused outright for anything that would
+# be *run* rather than opened -- .desktop, .sh, an executable -- because
+# handing one of those to the desktop's own resolution is the whole problem.
+# A handler named below may still open one deliberately; what is refused is
+# guessing.
+[open]
+fallback = "ask"
+
+# --- handlers -----------------------------------------------------------
+#
+# Checked in order, so put the specific ones first. Each needs `mime` or
+# `glob`, and `run` or `flatpak`.
+#
+#   mime          a type, with `*` for the whole subtype: "video/*"
+#   glob          a filename pattern, for types the database does not know
+#   run           the argv. `{path}` becomes the file, as one element; without
+#                 it the path is appended after `--`.
+#   flatpak       an application id, preferred over `run` where it is
+#                 installed, because it brings a sandbox we did not write
+#   name          what to call it in a message. Defaults to the program.
+#   in-directory  whether the file's directory becomes the working directory
+#
+# @HANDLERS@
+
+# --- the scan chain -----------------------------------------------------
+#
+# Runs before every open, whichever handler wins. Each rule returns allow,
+# warn or block, and the strongest verdict wins rather than the first, so the
+# order these sit in is not a claim about severity.
+#
+#   kind = "glob"            a filename pattern
+#   kind = "regex"           a filename pattern with more teeth
+#   kind = "magic-mismatch"  the name says one type and the content another
+#   kind = "size"            larger than `over` bytes
+#   kind = "command"         an external scanner, judged by its exit code
+#
+# A `command` rule takes `run` (argv, `{path}` substituted), `timeout` in
+# seconds, and `block-on` / `warn-on` lists of exit codes.
+
+[[scan]]
+name = "double extension"
+kind = "regex"
+# invoice.pdf.exe, holiday.jpg.scr -- the oldest trick there is.
+match = '''\.(pdf|jpe?g|png|docx?|xlsx?|txt)\.(exe|scr|com|pif|bat|cmd|js|vbs|jar|sh)$'''
+verdict = "block"
+
+[[scan]]
+name = "the name does not match the content"
+kind = "magic-mismatch"
+# Only a real disagreement counts. A .docx really is a zip and a .py really is
+# text, and those are not reported.
+verdict = "warn"
+
+# An external scanner, if you install one. clamav is the obvious choice;
+# yara-x is better if you would rather read the rules than trust a database.
+#
+#   [[scan]]
+#   name = "clamav"
+#   kind = "command"
+#   run = ["clamdscan", "--no-summary", "--", "{path}"]
+#   timeout = 5
+#   block-on = [1]          # 0 clean, 1 infected, 2 error
+#   warn-on = [2]
