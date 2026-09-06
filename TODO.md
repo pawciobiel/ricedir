@@ -498,6 +498,27 @@ The tree comes from `dev/make-test-tree.sh`.
       `vkeyboard` beside it is the fix, and until then no claim should be made
       about keyboard navigation working.
 
+## M1 stage 2: what the trust check turned out to get wrong
+
+Both inherited from ricebar, and both only visible once something was gated on
+the answer. ricebar has the same two and has never been bitten, because it
+parses nothing whose presence depends on being trusted.
+
+- [x] **`/dev/null` is mode 0666, so it is not a neutral stand-in for "a file
+      that exists".** ricebar's config tests all pass `/dev/null` as the path,
+      which means every one of them has been running with `trusted: false`.
+      Harmless there. Here it silently emptied the handler table before a test
+      could look at it. Tests that care about trust write a real file at 0600
+      into the temp directory instead.
+
+- [x] **A sticky directory is not a writable one.** `/tmp` and `/var/tmp` are
+      both 1777, and the parent check refused any config inside either --
+      which would have ruled out the `-c /tmp/rig.toml` way of testing that
+      `CLAUDE.md` documents. The sticky bit is exactly the rule that says only
+      an owner may rename or unlink their own entries, so the replace-the-file
+      attack the check exists to stop cannot happen there. `trustworthy` now
+      makes the exception; ricebar's version still does not.
+
 ## M2 — the job engine
 
 - [ ] **The queue.** A job is a plan built before any byte moves: the full

@@ -9,6 +9,7 @@ mod app;
 mod buffer;
 mod config;
 mod entry;
+mod open;
 mod widget;
 
 use std::path::PathBuf;

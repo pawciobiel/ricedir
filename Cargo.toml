@@ -28,6 +28,11 @@ exclude = ["/docs", "/dev"]
 # and a directory can hold 100k of them.
 iced = { version = "0.14", features = ["tokio", "image", "svg", "advanced"] }
 jiff = "0.2"
+# `regex-lite` rather than `regex`: the scan chain matches filenames, which is
+# a hundred bytes against a pattern somebody typed into their own config. It
+# has no dependencies and a fraction of the compile time, and none of what it
+# gives up -- Unicode character classes, the SIMD search -- is wanted here.
+regex-lite = "0.1"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 # `sync` is the bridge from the listing and job threads to the Elm loop: file

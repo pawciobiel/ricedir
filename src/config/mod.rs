@@ -18,6 +18,11 @@ pub struct Config {
     pub window: Window,
     pub theme: Theme,
     pub list: List,
+    pub open: Open,
+    /// Checked in order; the first that matches opens the file.
+    pub handler: Vec<Handler>,
+    /// Checked in order; the strongest verdict wins.
+    pub scan: Vec<Scan>,
 
     /// Whether commands in this config may be run. See [`trustworthy`]. Not a
     /// config key; decided when the file is read.
@@ -37,6 +42,11 @@ impl Default for Config {
             window: Window::default(),
             theme: Theme::default(),
             list: List::default(),
+            open: Open::default(),
+            // Nothing to open anything with until a config says so, which is
+            // what makes the no-handler dialogue the normal first experience.
+            handler: Vec::new(),
+            scan: Vec::new(),
             // Nothing to distrust: there is no file.
             trusted: true,
             path: None,
@@ -52,6 +62,121 @@ struct Raw {
     window: Window,
     theme: Theme,
     list: List,
+    open: Open,
+    handler: Vec<Handler>,
+    scan: Vec<Scan>,
+}
+
+/// How a file is opened when a handler has to be chosen.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Open {
+    pub fallback: Fallback,
+}
+
+/// What to do about a file no handler matches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Fallback {
+    /// Name the type and offer the choices, including `xdg-open`. Taking
+    /// "always" writes a real handler into the config.
+    #[default]
+    Ask,
+    /// Hand it straight to `xdg-open`. Never silent for the types that would
+    /// be run rather than opened -- see `open::REFUSED`.
+    XdgOpen,
+    /// Say there is no handler, and stop.
+    None,
+}
+
+/// One program that may open files, and what it opens.
+///
+/// `run` is an argv vector and never a command line. There is no shell
+/// anywhere in this program, so a file called `; rm -rf ~ #` is a file with a
+/// silly name.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Handler {
+    /// What to call this in a message. Defaults to the program's own name.
+    pub name: Option<String>,
+    /// A MIME type, with `*` allowed as the whole subtype: `video/*`.
+    pub mime: Option<String>,
+    /// A filename glob, for types the database does not know.
+    pub glob: Option<String>,
+    /// The argv to run. `{path}` becomes the file, as one element.
+    pub run: Vec<String>,
+    /// A flatpak application id, preferred over `run` when it is installed,
+    /// because it brings a sandbox nobody here had to write.
+    pub flatpak: Option<String>,
+    /// Whether the file's directory becomes the working directory. Off by
+    /// default: a handler should not be able to infer where it was opened
+    /// from unless it needs to.
+    pub in_directory: bool,
+}
+
+/// One check that runs before a file is opened.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Scan {
+    /// Named so a refusal can say which rule refused. A rule with no name is
+    /// a rule nobody can act on.
+    pub name: String,
+    pub kind: Kind,
+    /// The pattern, for `glob` and `regex`.
+    #[serde(rename = "match")]
+    pub pattern: Option<String>,
+    /// The limit in bytes, for `size`.
+    pub over: Option<u64>,
+    /// The argv to run, for `command`. `{path}` becomes the file.
+    pub run: Vec<String>,
+    /// How long `command` may take before it is killed and skipped.
+    pub timeout: Option<u64>,
+    /// Exit codes that mean block, and that mean warn. Anything else allows.
+    pub block_on: Vec<i32>,
+    pub warn_on: Vec<i32>,
+    /// What a match means.
+    pub verdict: Verdict,
+}
+
+impl Default for Scan {
+    fn default() -> Self {
+        Self {
+            name: String::from("unnamed"),
+            kind: Kind::Glob,
+            pattern: None,
+            over: None,
+            run: Vec::new(),
+            timeout: Some(5),
+            block_on: Vec::new(),
+            warn_on: Vec::new(),
+            verdict: Verdict::Warn,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Kind {
+    #[default]
+    Glob,
+    Regex,
+    /// The name says one type and the content says another.
+    MagicMismatch,
+    Size,
+    /// An external scanner, judged by its exit code.
+    Command,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Verdict {
+    /// Nothing to say; the next rule gets a turn.
+    #[default]
+    Allow,
+    /// Open it, but say which rule was unhappy first.
+    Warn,
+    /// Refuse, and say which rule refused.
+    Block,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,11 +338,19 @@ pub fn load(named: Option<PathBuf>) -> Config {
 pub fn parse(path: &Path, text: &str) -> Result<Config, String> {
     let raw: Raw = toml::from_str(text).map_err(|error| error.to_string())?;
 
+    let trusted = trustworthy(path);
+
     Ok(Config {
         window: raw.window,
         theme: raw.theme,
         list: raw.list,
-        trusted: trustworthy(path),
+        open: raw.open,
+        // A config others can write is a config that must not name programs
+        // to run, so the tables are dropped rather than stored. The refusal
+        // shows in the window, not only on stderr.
+        handler: if trusted { raw.handler } else { Vec::new() },
+        scan: if trusted { raw.scan } else { Vec::new() },
+        trusted,
         path: Some(path.to_path_buf()),
         problem: None,
     })
@@ -249,9 +382,16 @@ fn trustworthy(path: &Path) -> bool {
         return false;
     }
 
-    // A writable directory means the file can simply be replaced.
+    // A writable directory means the file can simply be replaced -- unless it
+    // is sticky, which is exactly the rule that says only an owner may rename
+    // or unlink their own entries. Without this, `/tmp` and `/var/tmp` are
+    // both 1777 and no config under either could name a program, which would
+    // rule out the `-c /tmp/rig.toml` way of testing that `CLAUDE.md`
+    // documents. ricebar's version of this check does not make the exception,
+    // and has simply never had a config in a sticky directory.
     if let Some(parent) = path.parent()
         && writable_by_others(parent)
+        && !sticky(parent)
     {
         eprintln!(
             "ricedir: {} is writable by other users; refusing to run commands from configs inside it",
@@ -264,14 +404,39 @@ fn trustworthy(path: &Path) -> bool {
     true
 }
 
+/// Whether a directory has the sticky bit, so only owners may remove entries.
+fn sticky(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o1000 != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `/dev/null` stands in for a file that exists and is not group- or
-    /// other-writable, so `parse` can be exercised without touching a disk.
+    /// Parse some config text as if it came from a file nobody else can write.
+    ///
+    /// A real file, mode 0600, rather than `/dev/null`: `/dev/null` is 0666,
+    /// so `trustworthy` refuses it and every handler and scan rule would be
+    /// dropped before a test could see them. ricebar uses `/dev/null` here and
+    /// gets away with it only because nothing it parses is trust-gated.
     fn parse_text(text: &str) -> Result<Config, String> {
-        parse(Path::new("/dev/null"), text)
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "ricedir-config-test-{}-{:?}.toml",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+
+        std::fs::write(&path, text).expect("should write a test config");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("should set the mode");
+
+        let parsed = parse(&path, text);
+        let _ = std::fs::remove_file(&path);
+        parsed
     }
 
     /// An empty config has to mean "all defaults" rather than an error, since
