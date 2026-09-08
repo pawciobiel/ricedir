@@ -350,12 +350,20 @@ landing before the list widget is even proven.
       never-fatal `load()`, `trustworthy()` on the file *and its parent*,
       `first_run::create()` writing a config plus the probed handler list, and
       `color.rs` verbatim (`#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa`, 9 tests).
-- [ ] **The action registry.** One `Action` enum with typed arguments, one
+- [ ] **The action registry — not started, and the docs said otherwise.**
+      `CLAUDE.md` listed `src/action.rs` as written and described it as the
+      single door every request goes through. There is no such file: the list
+      widget's own `Action` enum goes straight into `app::update`, which is
+      fine for a keyboard and a mouse and is exactly the shape M3 cannot use.
+      Doing it late is the retrofit `## Decided before any code` said would be
+      expensive, so it should come before the socket rather than with it.
+
+      One `Action` enum with typed arguments, one
       `dispatch(action) -> Task<Message>`, and a name plus a one-line
       description per variant. The menus, the toolbar and the bindings table
       are all built from it, so a new action appears in all three at once and
       M3 gets its tool list for free. Nothing here talks to an agent yet.
-- [ ] **The window.** `iced::daemon` rather than `application`, because a
+- [x] **The window.** `iced::daemon` rather than `application`, because a
       second ricedir window should be a second window and not a second process.
       Theme, font and font size from the config; `decorations` left on until M6.
 - [x] **The entry model.** `read_dir` on a worker thread, streamed to the Elm
@@ -384,11 +392,13 @@ landing before the list widget is even proven.
       scrollbar ourselves. `scrollable.rs:855-899` is the reference for the
       wheel arithmetic: `Lines { x, y } => -Vector::new(x, y) * 60.0` and
       `Pixels { x, y } => -Vector::new(x, y)`.
-- [ ] **Selection.** Cursor plus an anchor: click sets both, `Ctrl+click`
-      toggles one, `Shift+click` and `Shift+arrow` extend from the anchor,
-      `Ctrl+A`, invert, and a rubber band from a drag on empty space. Stored as
-      a `HashSet<usize>` into the buffer's entry vector, cleared on relist
-      unless the entry survived it by name.
+- [x] **Selection, most of it.** Cursor plus an anchor: click sets both,
+      `Ctrl+click` toggles one, `Shift+click` and `Shift+arrow` extend from the
+      anchor, `Ctrl+A`. A `HashSet<usize>` into the buffer's entry vector, kept
+      across a relist by name rather than by index.
+- [ ] **Selection, the rest:** invert, and a rubber band from a drag on empty
+      space. The rubber band needs a drag in the widget's own state and a
+      rectangle drawn over the rows, neither of which exists yet.
 - [ ] **Layouts.** Detail rows, compact grid, large icons. One trait, chosen
       per buffer, defaulting from the config.
 - [ ] **Tiles and buffers.** `pane_grid` for the tiles, a flat `Vec<Buffer>`
