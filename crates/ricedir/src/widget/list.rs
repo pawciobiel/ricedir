@@ -53,7 +53,9 @@ const CELL: iced::Size = iced::Size::new(110.0, 92.0);
 /// The widget changes only its own scroll offset. Everything that touches the
 /// buffer goes back as one of these, so the action registry stays the single
 /// door through which a selection changes -- the same door an agent uses.
-#[derive(Debug, Clone, Copy, PartialEq)]
+// Not `Copy`: `Band` carries two ranges. Everything here is made once per
+// event, so cloning one is not worth a thought.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     /// A plain click: select this row alone.
     Select(usize),
@@ -86,6 +88,24 @@ pub enum Action {
         row: usize,
         at: Point,
     },
+    /// A rubber band was dragged over these cells.
+    ///
+    /// Geometry rather than a set of indices: the widget changes its own
+    /// scroll offset and nothing else, and a band over 100k rows must not
+    /// mean 100k numbers crossing on every mouse move.
+    Band {
+        rows: std::ops::Range<usize>,
+        /// `None` in the list layouts, where a band covers whole rows.
+        columns: Option<std::ops::Range<usize>>,
+        /// How many cells sit side by side. Sent rather than guessed: only
+        /// the widget knows the real width, and the application turning a
+        /// rectangle into indices needs the stride to be right.
+        across: usize,
+        /// Whether the band adds to the selection or replaces it.
+        add: bool,
+    },
+    /// Ctrl-I: select what is not selected.
+    Invert,
 }
 
 /// How long after a click a second one on the same row counts as a double.
@@ -107,6 +127,10 @@ struct State {
     /// A mouse press carries no modifiers, so they are kept from the last
     /// `ModifiersChanged` -- the same thing `slider` does.
     modifiers: keyboard::Modifiers,
+    /// Where a rubber band started and where it is now, in content
+    /// coordinates -- the offset is already added in, so scrolling mid-drag
+    /// keeps the band over the same files rather than the same pixels.
+    band: Option<(Point, Point)>,
 }
 
 pub struct FileList<'a, Message> {
@@ -255,6 +279,48 @@ impl<'a, Message> FileList<'a, Message> {
         (index < self.buffer.rows()).then_some(index)
     }
 
+    /// Which cells a rubber band covers, as ranges rather than as indices.
+    ///
+    /// Ranges because a band dragged over a large directory must not put a
+    /// hundred thousand numbers on the message queue every time the pointer
+    /// moves a pixel. The application turns these into a selection, which
+    /// costs what the selection costs and no more.
+    fn band_over(&self, from: Point, to: Point, bounds: Rectangle) -> Option<Action> {
+        let rows = self.buffer.rows();
+        if rows == 0 {
+            return None;
+        }
+
+        let (across, line) = self.grid(bounds.width);
+        let (top, low) = (from.y.min(to.y), from.y.max(to.y));
+
+        let first_line = ((top - bounds.y) / line).floor().max(0.0) as usize;
+        let last_line = (((low - bounds.y) / line).ceil().max(0.0) as usize).min(rows);
+
+        if across == 1 {
+            let first = first_line.min(rows);
+            let last = last_line.min(rows);
+            return Some(Action::Band {
+                rows: first..last,
+                columns: None,
+                across: 1,
+                add: false,
+            });
+        }
+
+        let (left, right) = (from.x.min(to.x), from.x.max(to.x));
+        let column_of = |x: f32| ((x - bounds.x - PADDING) / CELL.width).floor();
+        let first_column = column_of(left).max(0.0) as usize;
+        let last_column = (column_of(right).max(0.0) as usize + 1).min(across);
+
+        Some(Action::Band {
+            rows: first_line..last_line,
+            columns: Some(first_column..last_column),
+            across,
+            add: false,
+        })
+    }
+
     /// Move the offset so a row is fully on screen, if it is not already.
     ///
     /// Only as far as it has to: scrolling a row into view should not also
@@ -358,6 +424,25 @@ where
                     return;
                 };
                 let Some(row) = self.row_at(point, bounds, state.offset) else {
+                    // Empty space. A drag from here is a rubber band, which is
+                    // the one selection gesture a mouse-first file manager
+                    // cannot be without.
+                    if *button == mouse::Button::Left {
+                        let at = Point::new(point.x, point.y + state.offset);
+                        state.band = Some((at, at));
+                        // An empty band clears the selection at once, so a
+                        // click on empty space deselects even if the pointer
+                        // never moves. Ctrl held means "keep what I have".
+                        if !state.modifiers.command() {
+                            shell.publish((self.on_action)(Action::Band {
+                                rows: 0..0,
+                                columns: None,
+                                across: 1,
+                                add: false,
+                            }));
+                        }
+                        shell.capture_event();
+                    }
                     return;
                 };
 
@@ -393,6 +478,29 @@ where
                 if let Some(action) = action {
                     shell.publish((self.on_action)(action));
                     shell.capture_event();
+                }
+            }
+
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let Some((from, _)) = state.band else {
+                    return;
+                };
+                let Some(point) = cursor.position() else {
+                    return;
+                };
+
+                let now = Point::new(point.x, point.y + state.offset);
+                state.band = Some((from, now));
+
+                if let Some(action) = self.band_over(from, now, bounds) {
+                    shell.publish((self.on_action)(action));
+                }
+                shell.request_redraw();
+            }
+
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.band.take().is_some() {
+                    shell.request_redraw();
                 }
             }
 
@@ -445,6 +553,11 @@ where
                         if character.as_str() == "a" && modifiers.command() =>
                     {
                         Some(Action::SelectAll)
+                    }
+                    keyboard::Key::Character(character)
+                        if character.as_str() == "i" && modifiers.command() =>
+                    {
+                        Some(Action::Invert)
                     }
                     // `/` because it is what every list in a terminal uses,
                     // and Ctrl-F because it is what every window does.
@@ -540,6 +653,37 @@ where
                     config::Layout::Icons => self.draw_tile(renderer, entry, row, rectangle),
                     _ => self.draw_row(renderer, entry, row, rectangle),
                 }
+            }
+
+            // The band goes inside this layer, not after it. A primitive
+            // issued once `with_layer` has returned belongs to the *parent*
+            // layer, and the parent is composited underneath: drawn outside,
+            // the band appeared only in the strip below the last row, hidden
+            // behind the rows everywhere else. It took a solid red quad to
+            // see that it was painting at all.
+            if let Some((from, to)) = state.band {
+                let rectangle = Rectangle {
+                    x: from.x.min(to.x),
+                    y: from.y.min(to.y) - offset,
+                    width: (to.x - from.x).abs(),
+                    height: (to.y - from.y).abs(),
+                };
+
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: rectangle,
+                        border: iced::Border {
+                            color: self.theme.accent.color(),
+                            width: 1.0,
+                            ..iced::Border::default()
+                        },
+                        ..renderer::Quad::default()
+                    },
+                    iced::Color {
+                        a: 0.25,
+                        ..self.theme.accent.color()
+                    },
+                );
             }
         });
 

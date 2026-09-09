@@ -46,6 +46,20 @@ pub enum Action {
     SelectAll {
         buffer: usize,
     },
+    /// Select what is not selected.
+    Invert {
+        buffer: usize,
+    },
+    /// Select the cells a rubber band covered.
+    Band {
+        buffer: usize,
+        rows: std::ops::Range<usize>,
+        /// `None` means whole rows, which is what the list layouts drag.
+        columns: Option<std::ops::Range<usize>>,
+        /// How many cells sit side by side, from the widget that knows.
+        across: usize,
+        add: bool,
+    },
     /// Show a directory.
     Go {
         buffer: usize,
@@ -126,6 +140,8 @@ impl Action {
             | Self::Toggle { .. }
             | Self::Extend { .. }
             | Self::SelectAll { .. }
+            | Self::Invert { .. }
+            | Self::Band { .. }
             | Self::Go { .. }
             | Self::Back { .. }
             | Self::Forward { .. }
@@ -233,6 +249,14 @@ mod tests {
             Action::Toggle { buffer: 0, row: 0 },
             Action::Extend { buffer: 0, row: 0 },
             Action::SelectAll { buffer: 0 },
+            Action::Invert { buffer: 0 },
+            Action::Band {
+                buffer: 0,
+                rows: 0..1,
+                columns: None,
+                across: 1,
+                add: false,
+            },
             Action::Go {
                 buffer: 0,
                 path: PathBuf::from("/"),

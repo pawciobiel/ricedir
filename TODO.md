@@ -407,9 +407,16 @@ landing before the list widget is even proven.
       `Ctrl+click` toggles one, `Shift+click` and `Shift+arrow` extend from the
       anchor, `Ctrl+A`. A `HashSet<usize>` into the buffer's entry vector, kept
       across a relist by name rather than by index.
-- [ ] **Selection, the rest:** invert, and a rubber band from a drag on empty
-      space. The rubber band needs a drag in the widget's own state and a
-      rectangle drawn over the rows, neither of which exists yet.
+- [x] **Selection, the rest.** A rubber band from a drag on empty space, and
+      `Ctrl+I` to invert. A press on a row still selects; only a press on
+      empty space starts a band, so there is room later for a drag from a row
+      to mean something else.
+
+      The band travels as **ranges, not indices**: a drag over 100k rows must
+      not put 100k numbers on the queue every time the pointer moves. In the
+      list layouts it is a row range; in the grid it is a row range and a
+      column range, and the widget sends the stride because only it knows the
+      real width.
 - [x] **Layouts: list, detail and icons.** `Ctrl+1`, `Ctrl+2`, `Ctrl+3` pick
       one and the backtick cycles; the context menu names the next one.
       `[list] layout` sets the one a window opens with.
@@ -870,6 +877,27 @@ Two things the run found that no test had:
       screenshot. `dev/wait-for-window.sh` is the half that waits for the
       window, because a shot taken before the first frame is a shot of the
       wallpaper and looks exactly like a rendering bug.
+
+## M1 stage 3: the rubber band, and a layer that hid it
+
+- [x] **A primitive issued after `with_layer` returns is drawn underneath it.**
+      The band was painted just after the closure that clips the rows, and it
+      appeared only in the strip below the last row. Everywhere else the rows
+      were on top of it.
+
+      What made this expensive: a quad at 20% alpha that is mostly hidden
+      looks exactly like a quad that was never drawn. Three attempts went into
+      checking the geometry, the state and the event delivery -- all of which
+      were right -- before a **solid red fill** settled in one run that it was
+      painting, and a pixel scan found it at y 678..728 instead of 250..730.
+
+      Reach for the loud colour sooner. "Is it drawn?" and "is it visible?"
+      are different questions and the cheap experiment separates them.
+
+- [x] **The band carries geometry, not a selection.** The widget changes its
+      own scroll offset and nothing else; ranges go out and the application
+      turns them into indices, so the cost follows what is selected rather
+      than what the directory holds.
 
 ## M2 — the job engine
 

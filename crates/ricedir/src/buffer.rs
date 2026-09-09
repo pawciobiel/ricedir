@@ -279,6 +279,62 @@ impl Buffer {
         self.selection = self.view.iter().copied().collect();
     }
 
+    /// Select what is not selected.
+    pub fn invert(&mut self) {
+        self.selection = self
+            .view
+            .iter()
+            .copied()
+            .filter(|index| !self.selection.contains(index))
+            .collect();
+    }
+
+    /// Select the cells a rubber band covered.
+    ///
+    /// Ranges rather than a list of indices, so a band dragged over a large
+    /// directory costs what it selects and not what the directory holds. In
+    /// the list layouts `columns` is `None` and the range is whole rows; in
+    /// the grid it is a rectangle, and the cells outside it are skipped.
+    pub fn select_band(
+        &mut self,
+        rows: &std::ops::Range<usize>,
+        columns: Option<&std::ops::Range<usize>>,
+        across: usize,
+        add: bool,
+    ) {
+        if !add {
+            self.selection.clear();
+        }
+
+        let last = self.view.len();
+
+        match columns {
+            None => {
+                let from = rows.start.min(last);
+                let to = rows.end.min(last);
+                self.selection.extend(self.view[from..to].iter().copied());
+            }
+            Some(columns) => {
+                for line in rows.clone() {
+                    for column in columns.clone() {
+                        // `across` may be larger than the real width; the
+                        // widget has already clamped `columns` to what was on
+                        // screen, so a too-large stride only ends the row.
+                        let Some(at) = line
+                            .checked_mul(across)
+                            .and_then(|base| base.checked_add(column))
+                        else {
+                            continue;
+                        };
+                        if let Some(index) = self.view.get(at) {
+                            self.selection.insert(*index);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// The selected entries, in the order they are shown.
     pub fn selected(&self) -> impl Iterator<Item = &Entry> {
         self.view
@@ -557,6 +613,91 @@ mod tests {
         assert_eq!(buffer.cursor, 0);
         buffer.move_cursor(1);
         assert_eq!(buffer.cursor, 0);
+    }
+
+    /// A band over whole rows selects the run it covered and nothing else.
+    #[test]
+    fn a_band_selects_the_rows_it_covered() {
+        let mut buffer = buffer(&["a", "b", "c", "d", "e"]);
+
+        buffer.select_band(&(1..4), None, 1, false);
+        let selected: Vec<&str> = buffer.selected().map(|e| e.name.as_str()).collect();
+        assert_eq!(selected, ["b", "c", "d"]);
+    }
+
+    /// A band that runs off the end of the listing clamps rather than
+    /// panicking. Dragging past the last row is the normal way to select to
+    /// the bottom.
+    #[test]
+    fn a_band_past_the_end_is_clamped() {
+        let mut buffer = buffer(&["a", "b"]);
+
+        buffer.select_band(&(0..999), None, 1, false);
+        assert_eq!(buffer.selected().count(), 2);
+
+        buffer.select_band(&(500..999), None, 1, false);
+        assert_eq!(buffer.selected().count(), 0);
+    }
+
+    /// In the grid a band is a rectangle, so the cells outside its columns
+    /// are left alone even though they lie between its first and last index.
+    #[test]
+    fn a_band_in_a_grid_is_a_rectangle() {
+        // Three across: a b c / d e f / g h i
+        let mut buffer = buffer(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+
+        // The first two columns of the first two rows.
+        buffer.select_band(&(0..2), Some(&(0..2)), 3, false);
+        let selected: Vec<&str> = buffer.selected().map(|e| e.name.as_str()).collect();
+        assert_eq!(selected, ["a", "b", "d", "e"], "not c, and not f");
+    }
+
+    /// Holding Ctrl adds to what is already selected rather than replacing
+    /// it, so two bands can be drawn in different places.
+    #[test]
+    fn a_band_can_add_to_a_selection() {
+        let mut buffer = buffer(&["a", "b", "c", "d"]);
+
+        buffer.select_band(&(0..1), None, 1, false);
+        buffer.select_band(&(3..4), None, 1, true);
+
+        let selected: Vec<&str> = buffer.selected().map(|e| e.name.as_str()).collect();
+        assert_eq!(selected, ["a", "d"]);
+    }
+
+    /// Inverting twice is the same as not inverting, and inverting nothing
+    /// selects everything.
+    #[test]
+    fn inverting_turns_the_selection_over() {
+        let mut buffer = buffer(&["a", "b", "c"]);
+
+        buffer.invert();
+        assert_eq!(buffer.selected().count(), 3);
+
+        buffer.invert();
+        assert_eq!(buffer.selected().count(), 0);
+
+        buffer.select_only(1);
+        buffer.invert();
+        let selected: Vec<&str> = buffer.selected().map(|e| e.name.as_str()).collect();
+        assert_eq!(selected, ["a", "c"]);
+    }
+
+    /// A filter hides rows, and inverting must not select something that is
+    /// not on screen. Somebody who inverts a filtered listing means the rows
+    /// they can see.
+    #[test]
+    fn inverting_only_reaches_what_is_shown() {
+        let list = List::default();
+        let mut buffer = buffer(&["keep-a", "keep-b", "other"]);
+
+        buffer.filter = String::from("keep");
+        buffer.rebuild(&list);
+        buffer.select_only(0);
+        buffer.invert();
+
+        let selected: Vec<&str> = buffer.selected().map(|e| e.name.as_str()).collect();
+        assert_eq!(selected, ["keep-b"], "not the hidden one");
     }
 
     /// Holding an arrow key at the end of a directory should stop there, not

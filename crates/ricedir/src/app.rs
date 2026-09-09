@@ -334,6 +334,19 @@ fn translate(buffer: usize, found: list::Action, current: crate::config::Layout)
         list::Action::Extend(row) => Action::Extend { buffer, row },
         list::Action::Cursor(row) => Action::Select { buffer, row },
         list::Action::SelectAll => Action::SelectAll { buffer },
+        list::Action::Invert => Action::Invert { buffer },
+        list::Action::Band {
+            rows,
+            columns,
+            across,
+            add,
+        } => Action::Band {
+            buffer,
+            rows,
+            columns,
+            across,
+            add,
+        },
         list::Action::Activate(row) => Action::Activate { buffer, row },
         list::Action::Leave => Action::Leave { buffer },
         list::Action::Filter => Action::Filtering(true),
@@ -570,6 +583,24 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
         }
         Action::SelectAll { buffer } => {
             with(app, buffer, Buffer::select_all);
+            Task::none()
+        }
+
+        Action::Invert { buffer } => {
+            with(app, buffer, Buffer::invert);
+            Task::none()
+        }
+
+        Action::Band {
+            buffer,
+            rows,
+            columns,
+            across,
+            add,
+        } => {
+            with(app, buffer, |found| {
+                found.select_band(&rows, columns.as_ref(), across, add);
+            });
             Task::none()
         }
 
