@@ -442,6 +442,57 @@ landing before the list widget is even proven.
 - [x] **Filter and sort.** A filter box that narrows as you type (substring by
       default, glob with a leading `:`), a hidden-files toggle, and a sort menu
       over name, size, modified, type and extension.
+- [ ] **A bindings table, with defaults a Windows user already knows.** Can
+      wait: the keys work today, they are just written into
+      `widget/list.rs` rather than read from the config. `## Decided before any
+      code` settled the shape — a flat table, no modes, no chords, no leader
+      key — so this is only the table and the reading of it.
+
+      ```toml
+      [keys]
+      "ctrl+c" = "copy"
+      "f2" = "rename"
+      "alt+left" = "back"
+      ```
+
+      The defaults. Windows and GNOME agree on most of these, which is the
+      point: somebody's first hour should cost them nothing.
+
+      | key | does |
+      | --- | --- |
+      | `Enter`, double click | open |
+      | `Backspace`, `Alt+Up` | up one level |
+      | `Alt+Left` / `Alt+Right` | back / forward |
+      | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | copy / cut / paste |
+      | `Delete` | trash |
+      | `Shift+Delete` | delete, with the dialogue that says it cannot be undone |
+      | `F2` | rename |
+      | `Ctrl+A` | select all |
+      | `Ctrl+Shift+N` | new folder |
+      | `F5` | relist |
+      | `Ctrl+H` | show hidden files |
+      | `Ctrl+F`, `/` | filter |
+      | `Ctrl+L` | edit the path |
+      | `Ctrl+D` | add to favourite places |
+      | `Escape` | put away whatever is in front |
+
+      **`Ctrl+C` is copy, not `Ctrl+Shift+C`.** A terminal needs the shift
+      because `Ctrl+C` already means interrupt there; a file manager has no
+      such clash, and every other window on the desktop uses the plain one.
+      `Ctrl+Shift+C` is worth having, but for **copy the path as text**, which
+      is what several file managers already use it for and what people
+      actually reach for when they want to paste a path into a terminal.
+
+      Two things this gets from the action registry for free. The right-hand
+      side of each line is an action name, so a typo names an action that does
+      not exist and is **reported** rather than silently doing nothing. And a
+      binding cannot reach anything the registry does not offer, so the keys
+      cannot become a second door either.
+
+      The file-operation rows need M2's actions before they can be bound to
+      anything. The rest can be read from the config as soon as somebody wants
+      to change one.
+
 - [ ] **Context menu and toolbar.** Right click on an entry, on the selection,
       and on empty space, each with its own items. iced hands `update` no
       geometry, so the cursor position has to come from
