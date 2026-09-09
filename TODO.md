@@ -858,12 +858,18 @@ Two things the run found that no test had:
 - [x] **The focused tile is edged in the accent.** With two tiles and no mark,
       nothing on screen says which one the keyboard will reach.
 
-- [ ] **The rig's display number is not `wayland-2`.** Restarting sway while
+- [x] **The rig's display number is not `wayland-2`.** Restarting sway while
       an old socket is still on disk gives the new one `wayland-3`, and a
       client sent at the old number looks exactly like a client that will not
-      start -- which cost a few minutes. `dev/rig.sh` now asks the compositor
-      which display it is on and prints the environment to `eval`. Use it
-      rather than writing a display name by hand.
+      start -- which cost a few minutes. `dev/rig.sh` asks the compositor
+      which display it is on and prints the environment to `eval`.
+- [x] **Waiting for a clock is not waiting.** The rig slept four seconds for a
+      sway that is ready in 0.28, and five for a ricedir that maps a window in
+      0.5. Every visual check cost nine seconds and should have cost one.
+      Measured, then replaced with polling: 0.73 s from nothing to a
+      screenshot. `dev/wait-for-window.sh` is the half that waits for the
+      window, because a shot taken before the first frame is a shot of the
+      wallpaper and looks exactly like a rendering bug.
 
 ## M2 — the job engine
 
