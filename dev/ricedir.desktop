@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=ricedir
+GenericName=File Manager
+Comment=Browse files, and watch an agent do it
+Exec=ricedir %f
+Icon=system-file-manager
+Terminal=false
+# One main category only. `desktop-file-validate` warns that more than one
+# can make the entry appear twice in a menu.
+Categories=System;FileManager;
+Keywords=files;folders;browser;manager;
+# Claimed so `xdg-open .` and "open containing folder" reach ricedir. Remove
+# this line if you would rather another manager kept them.
+MimeType=inode/directory;
+StartupNotify=true

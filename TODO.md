@@ -441,6 +441,13 @@ landing before the list widget is even proven.
       tile a buffer of its own, which is what a file manager wants: two
       independent panes. Sharing a listing between two tiles is the *other*
       move, and there is no way to ask for it yet.
+      - [ ] `Action::ShowBuffer { tile, buffer }` — the whole mechanism; the
+            rest is how somebody asks for it
+      - [ ] a list to pick from, over the tile, showing each open directory
+            and how many tiles already show it
+      - [ ] close a buffer no tile is showing, so a long session does not
+            accumulate them forever
+      - [ ] `Ctrl+B` to open the list, digits to pick
 - [x] **Places.** Home and the XDG user directories from
       `~/.config/user-dirs.dirs`, mounted filesystems from
       `/proc/self/mountinfo` (filtered: no `sysfs`, `proc`, `cgroup`, `tmpfs`
@@ -449,24 +456,27 @@ landing before the list widget is even proven.
 - [x] **Add to favourite places, from the menu.** `Action::Bookmark { path }`,
       offered on a directory by name and on the current directory otherwise.
       The panel refreshes and the notice line says which path went in.
-- [ ] **Add to favourite places, the other three ways in**, and taking one
-      out again:
-
-      - a keystroke on the row the cursor is on
-      - dragging a directory onto the panel
-      - `Ctrl+D`, which is what a browser taught everybody
-
-      Removal matters more than any of them: without it a mistake is
-      permanent. A right click on a bookmark is where it belongs, which needs
-      the panel to have a menu of its own.
+- [ ] **Add to favourite places, the other ways in.** Removal first: without
+      it a mistake is permanent.
+      - [ ] `Action::Unbookmark { path }`, and rewriting the file without
+            that line
+      - [ ] a menu on the places panel, which is where removal belongs
+      - [ ] `Ctrl+D` on the focused tile, which is what a browser taught
+            everybody
+      - [ ] drag a directory from the list onto the panel
+      - [ ] reorder them by dragging, since the file is an order and nothing
+            else respects it yet
 - [x] **Path bar, the breadcrumbs half.** Each component is a button, built
       from `Path::components` rather than by splitting the string, so a name
       with a slash-looking character in it cannot fool them. Back, forward and
       up work off a per-buffer history.
 - [ ] **Path bar, the text half.** Not built, and this entry was ticked once
-      claiming it was. There is no way to edit the path and no completion.
-      Wanted, and the design for it is in `## M6`: one click turns the
-      breadcrumbs into plain text you can select part of and copy.
+      claiming it was. The two-faced design is in `## M6`; these are the parts.
+      - [ ] a text face that shows the path and can be typed into
+      - [ ] `Ctrl+L` to reach it, `Escape` and losing focus to leave
+      - [ ] a click on the bar but not on a crumb, which is the ambiguous one
+      - [ ] completion on Tab, against the directory being typed
+      - [ ] a path that does not exist says so rather than listing nothing
 - [x] **Filter and sort.** A filter box that narrows as you type (substring by
       default, glob with a leading `:`), a hidden-files toggle, and a sort menu
       over name, size, modified, type and extension.
@@ -521,17 +531,33 @@ landing before the list widget is even proven.
       anything. The rest can be read from the config as soon as somebody wants
       to change one.
 
+      - [ ] `Action::name()` and a `from_name`, so a line of config finds one
+      - [ ] parse `"ctrl+shift+n"` into a key and a set of modifiers
+      - [ ] the default table, in code, so an empty config still works
+      - [ ] a key the table does not know is reported by name, not ignored
+      - [ ] `Ctrl+Shift+C` for copy the path, since the plain one is copy
+      - [ ] a way to see the list: `?` or a menu item, because a table
+            nobody can read is a table nobody edits
+
 - [x] **The context menu.** Right click opens it where the click landed, with
       Open, Copy path, Add to places, Show hidden files and Relist. A click
       anywhere else puts it away, and so does Escape.
-- [ ] **A toolbar**, and a menu on the places panel. The path bar has back and
-      forward; a toolbar would carry the layout switch and the sort menu, and
-      neither exists yet.
-- [ ] **The old entry, for reference.** Right click on an entry, on the selection,
-      and on empty space, each with its own items. iced hands `update` no
-      geometry, so the cursor position has to come from
-      `iced::event::listen_with` tracking `Mouse(CursorMoved)`; the menu is
-      then a `Stack` over the list rather than a real popup.
+- [ ] **A toolbar.** The path bar has back and forward; everything else is a
+      key or a menu item, which is the wrong way round for a mouse-first
+      program. Small pieces, in the order they are worth having:
+      - [ ] a layout switch: three buttons, or one that cycles
+      - [ ] a sort menu: the field, and which way round
+      - [ ] a hidden-files toggle that shows its state
+      - [ ] a split button, and a close-tile button
+      - [ ] where it lives: one bar across the top, above the tiles, or one
+            per tile beside the path bar. One is less clutter; per tile is
+            honest about which tile a button acts on.
+- [ ] **The menu should differ by where the click landed.** One menu is drawn
+      today whatever is under the pointer. Three are wanted:
+      - [ ] on an entry: Open, Open with, Copy path, Properties
+      - [ ] on empty space: Paste, New folder, Show hidden, Relist, and
+            "Add this directory to places"
+      - [ ] on a place in the sidebar: Open in a new tile, Remove from places
 - [x] **Watching.** `notify` on the visible buffers only, debounced 120 ms and
       coalesced into "relist this directory". Beware the rename dance ricebar
       documents: editors and `mv` replace a file rather than writing it, and a
