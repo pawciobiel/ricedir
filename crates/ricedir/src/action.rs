@@ -89,6 +89,8 @@ pub enum Action {
     },
     /// Show or hide the files whose names start with a dot.
     ShowHidden(bool),
+    /// Arrange the entries a different way.
+    Layout(crate::config::Layout),
     /// Read the directory again.
     Relist {
         buffer: usize,
@@ -126,6 +128,7 @@ impl Action {
             | Self::Menu { .. }
             | Self::CopyPath { .. }
             | Self::ShowHidden(_)
+            | Self::Layout(_)
             | Self::Relist { .. } => Kind::View,
 
             // A bookmark writes a file, but ricedir's own, not one of the
@@ -241,6 +244,7 @@ mod tests {
                 path: PathBuf::from("/tmp"),
             },
             Action::ShowHidden(true),
+            Action::Layout(crate::config::Layout::Icons),
             Action::Relist { buffer: 0 },
             Action::Activate { buffer: 0, row: 0 },
         ];

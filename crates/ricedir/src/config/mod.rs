@@ -279,6 +279,8 @@ pub struct List {
     pub sort_reversed: bool,
     /// Whether `Apple` and `apple` sort together.
     pub ignore_case: bool,
+    /// How the entries are arranged.
+    pub layout: Layout,
     /// Whether a glyph is drawn before each name.
     pub icons: bool,
     /// The family the glyphs come from.
@@ -298,8 +300,41 @@ impl Default for List {
             sort: Sort::Name,
             sort_reversed: false,
             ignore_case: true,
+            layout: Layout::List,
             icons: true,
             icon_font: Some(String::from("Symbols Nerd Font")),
+        }
+    }
+}
+
+/// How the entries are arranged on screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Layout {
+    /// One row each: glyph, name, size. What ricedir has always drawn.
+    #[default]
+    List,
+    /// One row each, with more columns: modified, and the mode.
+    Detail,
+    /// A grid of larger glyphs with the name underneath.
+    Icons,
+}
+
+impl Layout {
+    /// The next one, for a key or a button that cycles them.
+    pub fn next(self) -> Self {
+        match self {
+            Self::List => Self::Detail,
+            Self::Detail => Self::Icons,
+            Self::Icons => Self::List,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Detail => "detail",
+            Self::Icons => "icons",
         }
     }
 }

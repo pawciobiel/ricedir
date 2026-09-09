@@ -39,6 +39,15 @@ const ICON: f32 = 22.0;
 /// Width reserved for the size column.
 const SIZE_COLUMN: f32 = 90.0;
 
+/// Width reserved for the modified column, in the detail layout.
+const WHEN_COLUMN: f32 = 130.0;
+
+/// Width reserved for the mode column, in the detail layout.
+const MODE_COLUMN: f32 = 90.0;
+
+/// One cell of the icon grid.
+const CELL: iced::Size = iced::Size::new(110.0, 92.0);
+
 /// What the list wants the application to do about a click or a key.
 ///
 /// The widget changes only its own scroll offset. Everything that touches the
@@ -61,6 +70,8 @@ pub enum Action {
     SelectAll,
     /// `/` or Ctrl-F: show the filter box.
     Filter,
+    /// Ctrl-1, Ctrl-2, Ctrl-3, or the backtick to cycle.
+    Layout(Option<config::Layout>),
     /// Escape: put away whatever is showing.
     Escape,
     /// Right click, with where it happened, so a menu can be put there.
@@ -96,6 +107,7 @@ pub struct FileList<'a, Message> {
     theme: &'a config::Theme,
     row_height: f32,
     text_size: f32,
+    layout: config::Layout,
     /// The glyph font, when there is one. `None` draws no icons at all: a
     /// machine with no Nerd Font would otherwise show a column of boxes.
     icons: Option<iced::Font>,
@@ -122,15 +134,44 @@ impl<'a, Message> FileList<'a, Message> {
             theme,
             row_height: list.row_height.max(1.0),
             text_size,
+            layout: list.layout,
             icons: list.icons.then_some(icons).flatten(),
             focused,
             on_action: Box::new(on_action),
         }
     }
 
-    /// Total height of every row, drawn or not.
+    /// How many entries sit side by side, and how tall one line of them is.
+    ///
+    /// A list is a grid one cell wide. Saying it that way once means the
+    /// visible-range arithmetic, the hit test and the reveal are written once
+    /// rather than three times.
+    fn grid(&self, width: f32) -> (usize, f32) {
+        match self.layout {
+            config::Layout::Icons => {
+                let across = ((width - PADDING * 2.0 - BAR) / CELL.width).floor();
+                ((across as usize).max(1), CELL.height)
+            }
+            _ => (1, self.row_height),
+        }
+    }
+
+    /// How many lines of cells there are.
+    fn lines(&self, width: f32) -> usize {
+        let (across, _) = self.grid(width);
+        self.buffer.rows().div_ceil(across)
+    }
+
+    /// Total height of everything, drawn or not.
     fn content_height(&self) -> f32 {
+        // Width is not known here, and the callers that matter pass it in.
         self.buffer.rows() as f32 * self.row_height
+    }
+
+    /// Total height for a viewport of this width.
+    fn content_height_at(&self, width: f32) -> f32 {
+        let (_, line) = self.grid(width);
+        self.lines(width) as f32 * line
     }
 
     /// The furthest the list can be scrolled without showing empty space.
@@ -138,50 +179,93 @@ impl<'a, Message> FileList<'a, Message> {
         (self.content_height() - height).max(0.0)
     }
 
+    /// The same, for a viewport of a known width.
+    fn max_offset_at(&self, bounds: Rectangle) -> f32 {
+        (self.content_height_at(bounds.width) - bounds.height).max(0.0)
+    }
+
     /// Which rows fall inside a viewport of this height at this offset.
     ///
     /// Arithmetic rather than a search, which is what a uniform row height
     /// buys: the cost of a frame does not grow with the directory.
-    fn visible(&self, offset: f32, height: f32) -> std::ops::Range<usize> {
+    fn visible(&self, offset: f32, bounds: Rectangle) -> std::ops::Range<usize> {
         let rows = self.buffer.rows();
         if rows == 0 {
             return 0..0;
         }
 
-        let first = (offset / self.row_height).floor().max(0.0) as usize;
-        let last = (((offset + height) / self.row_height).ceil() as usize).min(rows);
+        let (across, line) = self.grid(bounds.width);
+        let first_line = (offset / line).floor().max(0.0) as usize;
+        let last_line = ((offset + bounds.height) / line).ceil() as usize;
 
-        first.min(rows)..last
+        let first = (first_line * across).min(rows);
+        let last = (last_line * across).min(rows);
+        first..last
     }
 
-    /// Which row is under a point, if any.
+    /// Where one entry is drawn.
+    fn cell(&self, index: usize, bounds: Rectangle, offset: f32) -> Rectangle {
+        let (across, line) = self.grid(bounds.width);
+        let column = index % across;
+        let row = index / across;
+
+        match self.layout {
+            config::Layout::Icons => Rectangle {
+                x: bounds.x + PADDING + column as f32 * CELL.width,
+                y: bounds.y + row as f32 * line - offset,
+                width: CELL.width,
+                height: CELL.height,
+            },
+            _ => Rectangle {
+                x: bounds.x,
+                y: bounds.y + row as f32 * line - offset,
+                width: bounds.width,
+                height: line,
+            },
+        }
+    }
+
+    /// Which entry is under a point, if any.
     fn row_at(&self, point: Point, bounds: Rectangle, offset: f32) -> Option<usize> {
-        let row = ((point.y - bounds.y + offset) / self.row_height).floor();
+        let (across, line) = self.grid(bounds.width);
+
+        let row = ((point.y - bounds.y + offset) / line).floor();
         if row < 0.0 {
             return None;
         }
 
-        let row = row as usize;
-        (row < self.buffer.rows()).then_some(row)
+        let column = if across == 1 {
+            0
+        } else {
+            let across_from = ((point.x - bounds.x - PADDING) / CELL.width).floor();
+            if across_from < 0.0 || across_from >= across as f32 {
+                return None;
+            }
+            across_from as usize
+        };
+
+        let index = row as usize * across + column;
+        (index < self.buffer.rows()).then_some(index)
     }
 
     /// Move the offset so a row is fully on screen, if it is not already.
     ///
     /// Only as far as it has to: scrolling a row into view should not also
     /// recentre the list under someone who was reading it.
-    fn reveal(&self, offset: f32, row: usize, height: f32) -> f32 {
-        let top = row as f32 * self.row_height;
-        let bottom = top + self.row_height;
+    fn reveal(&self, offset: f32, row: usize, bounds: Rectangle) -> f32 {
+        let (across, line) = self.grid(bounds.width);
+        let top = (row / across) as f32 * line;
+        let bottom = top + line;
 
         let offset = if top < offset {
             top
-        } else if bottom > offset + height {
-            bottom - height
+        } else if bottom > offset + bounds.height {
+            bottom - bounds.height
         } else {
             offset
         };
 
-        offset.clamp(0.0, self.max_offset(height))
+        offset.clamp(0.0, self.max_offset_at(bounds))
     }
 }
 
@@ -239,9 +323,9 @@ where
             Event::Window(window::Event::RedrawRequested(_)) => {
                 if state.seen_cursor != self.buffer.cursor {
                     state.seen_cursor = self.buffer.cursor;
-                    state.offset = self.reveal(state.offset, self.buffer.cursor, bounds.height);
+                    state.offset = self.reveal(state.offset, self.buffer.cursor, bounds);
                 }
-                state.offset = state.offset.clamp(0.0, self.max_offset(bounds.height));
+                state.offset = state.offset.clamp(0.0, self.max_offset_at(bounds));
             }
 
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
@@ -254,7 +338,7 @@ where
                     mouse::ScrollDelta::Pixels { y, .. } => -y,
                 };
 
-                let moved = (state.offset + lines).clamp(0.0, self.max_offset(bounds.height));
+                let moved = (state.offset + lines).clamp(0.0, self.max_offset_at(bounds));
                 if moved != state.offset {
                     state.offset = moved;
                     shell.capture_event();
@@ -367,6 +451,22 @@ where
                     {
                         Some(Action::Filter)
                     }
+                    // The backtick cycles, and the digits pick one directly.
+                    // Both are what a person reaches for; neither collides
+                    // with anything a filter box wants.
+                    keyboard::Key::Character(character)
+                        if character.as_str() == "`" && !modifiers.command() =>
+                    {
+                        Some(Action::Layout(None))
+                    }
+                    keyboard::Key::Character(character) if modifiers.command() => {
+                        match character.as_str() {
+                            "1" => Some(Action::Layout(Some(config::Layout::List))),
+                            "2" => Some(Action::Layout(Some(config::Layout::Detail))),
+                            "3" => Some(Action::Layout(Some(config::Layout::Icons))),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 };
 
@@ -396,7 +496,7 @@ where
         };
 
         let state = tree.state.downcast_ref::<State>();
-        let offset = state.offset.clamp(0.0, self.max_offset(bounds.height));
+        let offset = state.offset.clamp(0.0, self.max_offset_at(bounds));
 
         renderer.fill_quad(
             renderer::Quad {
@@ -409,20 +509,16 @@ where
         // Clip to the list, so a row half off the bottom is cut rather than
         // drawn over whatever is below.
         renderer.with_layer(visible, |renderer| {
-            for row in self.visible(offset, bounds.height) {
+            for row in self.visible(offset, bounds) {
                 let Some(entry) = self.buffer.at(row) else {
                     continue;
                 };
 
-                let top = bounds.y + (row as f32 * self.row_height) - offset;
-                let rectangle = Rectangle {
-                    x: bounds.x,
-                    y: top,
-                    width: bounds.width,
-                    height: self.row_height,
-                };
-
-                self.draw_row(renderer, entry, row, rectangle);
+                let rectangle = self.cell(row, bounds, offset);
+                match self.layout {
+                    config::Layout::Icons => self.draw_tile(renderer, entry, row, rectangle),
+                    _ => self.draw_row(renderer, entry, row, rectangle),
+                }
             }
         });
 
@@ -515,17 +611,60 @@ impl<Message> FileList<'_, Message> {
             None => 0.0,
         };
 
+        let extra = if self.layout == config::Layout::Detail {
+            WHEN_COLUMN + MODE_COLUMN
+        } else {
+            0.0
+        };
+
         self.draw_text(
             renderer,
             name,
             Rectangle {
                 x: bounds.x + PADDING + indent,
-                width: (bounds.width - SIZE_COLUMN - BAR - PADDING * 2.0 - indent).max(0.0),
+                width: (bounds.width - SIZE_COLUMN - extra - BAR - PADDING * 2.0 - indent).max(0.0),
                 ..bounds
             },
             colour,
             text::Alignment::Left,
         );
+
+        let quiet = if under_cursor && self.focused {
+            self.theme.background.color()
+        } else {
+            self.theme.dim.color()
+        };
+
+        if self.layout == config::Layout::Detail {
+            self.draw_text(
+                renderer,
+                when(entry),
+                Rectangle {
+                    x: bounds.x + bounds.width
+                        - SIZE_COLUMN
+                        - WHEN_COLUMN
+                        - MODE_COLUMN
+                        - BAR
+                        - PADDING,
+                    width: WHEN_COLUMN,
+                    ..bounds
+                },
+                quiet,
+                text::Alignment::Left,
+            );
+
+            self.draw_text(
+                renderer,
+                mode(entry),
+                Rectangle {
+                    x: bounds.x + bounds.width - SIZE_COLUMN - MODE_COLUMN - BAR - PADDING,
+                    width: MODE_COLUMN,
+                    ..bounds
+                },
+                quiet,
+                text::Alignment::Left,
+            );
+        }
 
         if !entry.kind.is_directory() {
             self.draw_text(
@@ -536,11 +675,7 @@ impl<Message> FileList<'_, Message> {
                     width: SIZE_COLUMN,
                     ..bounds
                 },
-                if under_cursor && self.focused {
-                    self.theme.background.color()
-                } else {
-                    self.theme.dim.color()
-                },
+                quiet,
                 text::Alignment::Right,
             );
         }
@@ -592,6 +727,90 @@ impl<Message> FileList<'_, Message> {
         );
     }
 
+    /// Draw one entry as a tile: a big glyph with its name beneath.
+    fn draw_tile<Renderer: text::Renderer<Font = iced::Font>>(
+        &self,
+        renderer: &mut Renderer,
+        entry: &Entry,
+        row: usize,
+        bounds: Rectangle,
+    ) {
+        let selected = self.buffer.is_selected(row);
+        let under_cursor = row == self.buffer.cursor;
+
+        if selected || under_cursor {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: bounds.shrink(4.0),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..iced::Border::default()
+                    },
+                    ..renderer::Quad::default()
+                },
+                if under_cursor && self.focused {
+                    self.theme.accent.color()
+                } else {
+                    self.theme.muted.color()
+                },
+            );
+        }
+
+        let colour = if under_cursor && self.focused {
+            self.theme.background.color()
+        } else {
+            self.colour_of(entry)
+        };
+
+        if let Some(font) = self.icons {
+            // Two and a half times the text, which is what makes this layout
+            // worth having: at the same size it is a list with more gaps.
+            self.draw_glyph_sized(
+                renderer,
+                crate::icon::of(entry),
+                Rectangle {
+                    x: bounds.x,
+                    y: bounds.y + 10.0,
+                    width: bounds.width,
+                    height: CELL.height * 0.45,
+                },
+                colour,
+                font,
+                self.text_size * 2.5,
+                text::Alignment::Center,
+            );
+        }
+
+        // Two lines of name at most, and the second one clipped. A tile is a
+        // fixed size, so a long name cannot be allowed to grow it.
+        self.draw_text_in(
+            renderer,
+            one_line(&entry.name),
+            Rectangle {
+                x: bounds.x + 4.0,
+                y: bounds.y + CELL.height * 0.52,
+                width: bounds.width - 8.0,
+                height: CELL.height * 0.4,
+            },
+            colour,
+            text::Alignment::Center,
+            text::Wrapping::Glyph,
+            alignment::Vertical::Top,
+        );
+    }
+
+    /// The colour an entry's name is drawn in, before the cursor overrides it.
+    fn colour_of(&self, entry: &Entry) -> Color {
+        match entry.kind {
+            Kind::Link { broken: true, .. } => self.theme.urgent.color(),
+            Kind::Directory
+            | Kind::Link {
+                directory: true, ..
+            } => self.theme.accent.color(),
+            _ => self.theme.foreground.color(),
+        }
+    }
+
     /// Draw one glyph, in the icon face rather than the window's.
     fn draw_glyph<Renderer: text::Renderer<Font = iced::Font>>(
         &self,
@@ -619,13 +838,83 @@ impl<Message> FileList<'_, Message> {
         );
     }
 
+    /// A glyph at a size of its own, for the tile layout.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_glyph_sized<Renderer: text::Renderer<Font = iced::Font>>(
+        &self,
+        renderer: &mut Renderer,
+        glyph: char,
+        bounds: Rectangle,
+        colour: Color,
+        font: iced::Font,
+        size: f32,
+        align_x: text::Alignment,
+    ) {
+        renderer.fill_text(
+            text::Text {
+                content: glyph.to_string(),
+                bounds: Size::new(bounds.width, bounds.height),
+                size: Pixels(size),
+                line_height: text::LineHeight::default(),
+                font,
+                align_x,
+                align_y: alignment::Vertical::Top,
+                shaping: text::Shaping::Advanced,
+                wrapping: text::Wrapping::None,
+            },
+            Point::new(bounds.center_x(), bounds.y),
+            colour,
+            bounds,
+        );
+    }
+
+    /// Text inside a box, wrapped and aligned as asked.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_text_in<Renderer: text::Renderer>(
+        &self,
+        renderer: &mut Renderer,
+        content: String,
+        bounds: Rectangle,
+        colour: Color,
+        align_x: text::Alignment,
+        wrapping: text::Wrapping,
+        align_y: alignment::Vertical,
+    ) {
+        if bounds.width <= 0.0 {
+            return;
+        }
+
+        let position = match align_x {
+            text::Alignment::Center => Point::new(bounds.center_x(), bounds.y),
+            text::Alignment::Right => Point::new(bounds.x + bounds.width, bounds.y),
+            _ => Point::new(bounds.x, bounds.y),
+        };
+
+        renderer.fill_text(
+            text::Text {
+                content,
+                bounds: Size::new(bounds.width, bounds.height),
+                size: Pixels(self.text_size),
+                line_height: text::LineHeight::default(),
+                font: renderer.default_font(),
+                align_x,
+                align_y,
+                shaping: text::Shaping::Advanced,
+                wrapping,
+            },
+            position,
+            colour,
+            bounds,
+        );
+    }
+
     fn draw_scrollbar<Renderer: renderer::Renderer>(
         &self,
         renderer: &mut Renderer,
         bounds: Rectangle,
         offset: f32,
     ) {
-        let content = self.content_height();
+        let content = self.content_height_at(bounds.width);
         if content <= bounds.height {
             return;
         }
@@ -635,7 +924,7 @@ impl<Message> FileList<'_, Message> {
         // so it stops at a size a pointer can find.
         let height = (bounds.height * visible).max(24.0);
         let travel = bounds.height - height;
-        let progress = offset / self.max_offset(bounds.height).max(1.0);
+        let progress = offset / self.max_offset_at(bounds).max(1.0);
 
         renderer.fill_quad(
             renderer::Quad {
@@ -684,6 +973,80 @@ fn one_line(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_control() { '\u{fffd}' } else { c })
         .collect()
+}
+
+/// When an entry was last written, short enough for a column.
+///
+/// A date this year is a day and a month; an older one gains the year. That is
+/// what `ls -l` does, and for the same reason: the year is noise on a file
+/// somebody saved this morning.
+fn when(entry: &Entry) -> String {
+    let Some(modified) = entry.modified else {
+        return String::new();
+    };
+
+    let Ok(stamp) = jiff::Timestamp::try_from(modified) else {
+        return String::new();
+    };
+    let at = stamp.to_zoned(jiff::tz::TimeZone::system());
+    let now = jiff::Zoned::now();
+
+    if at.year() == now.year() {
+        format!(
+            "{:>2} {} {:02}:{:02}",
+            at.day(),
+            month(at.month()),
+            at.hour(),
+            at.minute()
+        )
+    } else {
+        format!("{:>2} {}  {}", at.day(), month(at.month()), at.year())
+    }
+}
+
+fn month(number: i8) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    NAMES
+        .get((number as usize).saturating_sub(1))
+        .copied()
+        .unwrap_or("")
+}
+
+/// The mode as `drwxr-xr-x`.
+fn mode(entry: &Entry) -> String {
+    let bit = |shift: u32, letter: char| {
+        if entry.mode & (1 << shift) != 0 {
+            letter
+        } else {
+            '-'
+        }
+    };
+
+    let kind = match entry.kind {
+        Kind::Directory => 'd',
+        Kind::Link { .. } => 'l',
+        Kind::Other => '?',
+        Kind::File => '-',
+    };
+
+    let mut out = String::with_capacity(10);
+    out.push(kind);
+    for (shift, letter) in [
+        (8, 'r'),
+        (7, 'w'),
+        (6, 'x'),
+        (5, 'r'),
+        (4, 'w'),
+        (3, 'x'),
+        (2, 'r'),
+        (1, 'w'),
+        (0, 'x'),
+    ] {
+        out.push(bit(shift, letter));
+    }
+    out
 }
 
 /// A size a person can read at a glance.
@@ -756,6 +1119,38 @@ mod tests {
         // including the ones that make a name awkward for a shell.
         assert_eq!(one_line("zażółć-gęślą.txt"), "zażółć-gęślą.txt");
         assert_eq!(one_line("; rm -rf ~ #"), "; rm -rf ~ #");
+    }
+
+    /// The mode column is the one thing in a file manager people compare
+    /// against `ls -l`, so it has to read the same way.
+    #[test]
+    fn the_mode_reads_like_ls() {
+        let mut entry = Entry {
+            name: String::from("x"),
+            path: std::path::PathBuf::from("x"),
+            kind: Kind::File,
+            size: 0,
+            modified: None,
+            mode: 0o644,
+            target: None,
+            hidden: false,
+        };
+        assert_eq!(mode(&entry), "-rw-r--r--");
+
+        entry.mode = 0o755;
+        entry.kind = Kind::Directory;
+        assert_eq!(mode(&entry), "drwxr-xr-x");
+
+        entry.mode = 0o000;
+        entry.kind = Kind::File;
+        assert_eq!(mode(&entry), "----------");
+
+        entry.mode = 0o777;
+        entry.kind = Kind::Link {
+            directory: false,
+            broken: false,
+        };
+        assert_eq!(mode(&entry), "lrwxrwxrwx");
     }
 
     /// Sizes are read at a glance, so the units matter more than the digits.

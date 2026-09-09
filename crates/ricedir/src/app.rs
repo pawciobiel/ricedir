@@ -166,7 +166,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         // Every request becomes an `Action` and goes through the registry.
         // The widget says what happened; `action` says what it means.
         Message::List(index, found) => {
-            let Some(action) = translate(index, found) else {
+            let Some(action) = translate(index, found, app.config.list.layout) else {
                 return Task::none();
             };
             action::dispatch(app, action)
@@ -277,7 +277,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 ///
 /// The widget reports what happened to it; this says which action that is.
 /// Kept apart so the widget knows nothing about buffers or history.
-fn translate(buffer: usize, found: list::Action) -> Option<Action> {
+fn translate(buffer: usize, found: list::Action, current: crate::config::Layout) -> Option<Action> {
     Some(match found {
         list::Action::Select(row) => Action::Select { buffer, row },
         list::Action::Toggle(row) => Action::Toggle { buffer, row },
@@ -287,6 +287,8 @@ fn translate(buffer: usize, found: list::Action) -> Option<Action> {
         list::Action::Activate(row) => Action::Activate { buffer, row },
         list::Action::Leave => Action::Leave { buffer },
         list::Action::Filter => Action::Filtering(true),
+        list::Action::Layout(None) => Action::Layout(current.next()),
+        list::Action::Layout(Some(layout)) => Action::Layout(layout),
         list::Action::Escape => Action::Escape,
         // The menu is still to come. The click moves the cursor meanwhile, so
         // a right click does something rather than nothing.
@@ -392,6 +394,12 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             for found in &mut app.buffers {
                 found.rebuild(&list);
             }
+            Task::none()
+        }
+
+        Action::Layout(layout) => {
+            app.config.list.layout = layout;
+            app.notice = Some(format!("{} view", layout.name()));
             Task::none()
         }
 
@@ -962,6 +970,12 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
             "Show hidden files"
         }),
         Message::Act(Action::ShowHidden(!hidden)),
+    ));
+
+    let layout = app.config.list.layout;
+    items = items.push(item(
+        format!("View: {} \u{2192} {}", layout.name(), layout.next().name()),
+        Message::Act(Action::Layout(layout.next())),
     ));
 
     items = items.push(item(

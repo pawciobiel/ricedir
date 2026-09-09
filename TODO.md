@@ -410,8 +410,21 @@ landing before the list widget is even proven.
 - [ ] **Selection, the rest:** invert, and a rubber band from a drag on empty
       space. The rubber band needs a drag in the widget's own state and a
       rectangle drawn over the rows, neither of which exists yet.
-- [ ] **Layouts.** Detail rows, compact grid, large icons. One trait, chosen
-      per buffer, defaulting from the config.
+- [x] **Layouts: list, detail and icons.** `Ctrl+1`, `Ctrl+2`, `Ctrl+3` pick
+      one and the backtick cycles; the context menu names the next one.
+      `[list] layout` sets the one a window opens with.
+
+      Not a trait, in the end. The three differ in what a cell holds and how
+      many sit side by side, and a *list is a grid one cell wide* -- so
+      `grid(width)` returns how many are across and how tall a line is, and
+      the visible range, the hit test, the reveal and the scrollbar are each
+      written once instead of three times. A trait would have made three
+      copies of that arithmetic and one of them would have been wrong.
+
+      Chosen per window rather than per buffer, which is what the entry
+      originally said. Per buffer means the view changes as you move between
+      tiles, which is disorienting; nobody has asked for it and it is one
+      field away if somebody does.
 - [ ] **Tiles and buffers.** `pane_grid` for the tiles, a flat `Vec<Buffer>`
       addressed by index, split/close/focus, and a buffer list to point a tile
       somewhere else. Closing the last tile of a buffer keeps the buffer.
@@ -801,6 +814,28 @@ Two things the run found that no test had:
       directory was drawn as a plain folder, hiding the one thing its name
       cannot tell you. Caught by a test that was written before the code was
       read back. `lsd` shows the link glyph too.
+
+## M1 stage 3: three layouts from one piece of arithmetic
+
+- [x] **A list is a grid one cell wide.** Saying that once turned three
+      layouts into one set of sums. `grid(width) -> (across, line_height)` is
+      the whole difference between them, and the visible range, the hit test,
+      the reveal and the scrollbar all read it. The alternative -- a trait with
+      an implementation each -- would have been three copies of the same
+      arithmetic with three chances to get the scroll clamp wrong.
+
+- [x] **The grid hit test was checked by clicking, not by reading.** A click
+      at (574, 346) selected `file.patch` and nothing else, which is the cell
+      that was under the pointer. A hit test that is off by one column is
+      invisible in a screenshot of a selection.
+
+- [x] **The mode column has to read like `ls -l`.** It is the one field people
+      compare against another tool, so `drwxr-xr-x` and `lrwxrwxrwx` are unit
+      tested rather than eyeballed.
+
+- [x] **A date this year drops the year.** `9 Sep 09:19` against
+      `9 Sep  2025`, which is what `ls -l` does and for the same reason: the
+      year is noise on a file saved this morning.
 
 ## M2 — the job engine
 
