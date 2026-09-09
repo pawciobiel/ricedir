@@ -506,10 +506,48 @@ landing before the list widget is even proven.
       geometry, so the cursor position has to come from
       `iced::event::listen_with` tracking `Mouse(CursorMoved)`; the menu is
       then a `Stack` over the list rather than a real popup.
-- [x] **Watching.** `notify` on the visible buffers only, debounced ~100 ms and
+- [x] **Watching.** `notify` on the visible buffers only, debounced 120 ms and
       coalesced into "relist this directory". Beware the rename dance ricebar
       documents: editors and `mv` replace a file rather than writing it, and a
       watch on the old inode misses that entirely.
+
+      Confirmed live: a file made in a terminal appears with no refresh.
+- [ ] **Change the list, do not rebuild it.** Watching works, and what it does
+      with a change is blunt: `src/watch.rs` throws the event away and asks for
+      a whole new listing. `Relist` in the menu does the same thing by hand.
+      Fine for a directory of thirty. For one of 100,000 it is a full
+      `read_dir`, 100,000 `symlink_metadata` calls and a full sort because one
+      file was touched — a measured 114 CPU ticks each time somebody saves.
+
+      The event already says what happened. Using it means an insert or a
+      remove at a position found by binary search, and a re-`stat` of one path.
+
+      **Four things that make this harder than it sounds:**
+
+      - **A rename is two events**, `From` then `To`, and they have to be
+        paired to avoid a row vanishing and reappearing at the bottom. notify
+        pairs them on some backends and not on others; check which.
+      - **inotify can overflow.** When the queue fills, the kernel sends
+        `IN_Q_OVERFLOW` and *drops* events. That case must fall back to a full
+        relist, or the listing quietly stops matching the disk. This is the one
+        that turns a clever optimisation into a bug people cannot reproduce.
+      - **A metadata change is not a listing change.** Touching a size or a
+        mtime needs one `stat` of one row, not a resort — unless the sort is
+        by size or by date, in which case the row moves.
+      - **The sort order decides where a new row goes.** Natural sort by name
+        is a binary search; sort by mtime means the insert point moves as
+        clocks tick.
+
+      Keep the full relist as the fallback for overflow, for an unreadable
+      event, and for `Relist` in the menu, which is what somebody reaches for
+      when they think the listing is wrong.
+- [ ] **A buffer nobody is looking at goes stale.** Only visible buffers are
+      watched, on purpose: inotify allows 128 instances here. But nothing
+      relists a buffer when it becomes visible again, so with tiles a hidden
+      one will show what the directory held some minutes ago. The fix is a
+      relist on becoming visible; the cost is that switching tiles is no
+      longer instant on a huge directory, which argues for doing it in the
+      background and painting the old listing until the new one lands.
 - [x] **MIME resolution.** Parse `/usr/share/mime/globs2` (`weight:type:glob`,
       one per line, already sorted by weight) plus `aliases`, and fall back to
       a small hand-written magic sniffer for the couple of dozen signatures
