@@ -420,23 +420,19 @@ landing before the list widget is even proven.
       `/proc/self/mountinfo` (filtered: no `sysfs`, `proc`, `cgroup`, `tmpfs`
       under `/run`), and bookmarks in ricedir's own file so nothing is written
       into GTK's.
-- [ ] **Add to favourite places.** Nothing can make a bookmark yet. The panel
-      reads them and `places::bookmark` writes one, but no button, key or menu
-      item calls it, so the fourth group in the panel is always empty.
+- [x] **Add to favourite places, from the menu.** `Action::Bookmark { path }`,
+      offered on a directory by name and on the current directory otherwise.
+      The panel refreshes and the notice line says which path went in.
+- [ ] **Add to favourite places, the other three ways in**, and taking one
+      out again:
 
-      Four ways in, and all four are the same action:
-
-      - the context menu on a directory, once there is one
       - a keystroke on the row the cursor is on
       - dragging a directory onto the panel
       - `Ctrl+D`, which is what a browser taught everybody
 
-      Removing one has to come with it, or a mistake is permanent. A right
-      click on a bookmark is the obvious place for that.
-
-      It needs an `Action::Bookmark { path }` and an `Action::Unbookmark`, so
-      an agent can ask for it later through the same door. Both are `View`:
-      they change a file that belongs to ricedir, not one of the person's.
+      Removal matters more than any of them: without it a mistake is
+      permanent. A right click on a bookmark is where it belongs, which needs
+      the panel to have a menu of its own.
 - [x] **Path bar, the breadcrumbs half.** Each component is a button, built
       from `Path::components` rather than by splitting the string, so a name
       with a slash-looking character in it cannot fool them. Back, forward and
@@ -499,7 +495,13 @@ landing before the list widget is even proven.
       anything. The rest can be read from the config as soon as somebody wants
       to change one.
 
-- [ ] **Context menu and toolbar.** Right click on an entry, on the selection,
+- [x] **The context menu.** Right click opens it where the click landed, with
+      Open, Copy path, Add to places, Show hidden files and Relist. A click
+      anywhere else puts it away, and so does Escape.
+- [ ] **A toolbar**, and a menu on the places panel. The path bar has back and
+      forward; a toolbar would carry the layout switch and the sort menu, and
+      neither exists yet.
+- [ ] **The old entry, for reference.** Right click on an entry, on the selection,
       and on empty space, each with its own items. iced hands `update` no
       geometry, so the cursor position has to come from
       `iced::event::listen_with` tracking `Mouse(CursorMoved)`; the menu is

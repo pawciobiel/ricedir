@@ -18,6 +18,17 @@ use crate::open::{self, Plan, scan};
 use crate::places::{self, Place};
 use crate::widget::list::{self, FileList};
 
+/// A context menu, and where it was asked for.
+#[derive(Debug, Clone)]
+pub struct Menu {
+    pub buffer: usize,
+    pub row: usize,
+    /// Window coordinates. The list widget knows where the click landed, so
+    /// nothing has to track the cursor separately -- which is the usual answer
+    /// when iced tells `update` no geometry.
+    pub at: (f32, f32),
+}
+
 pub struct App {
     config: Config,
     /// Every open directory. Tiles will hold indices into this, exactly as
@@ -36,6 +47,8 @@ pub struct App {
     /// Whether the filter box is on screen. Hidden until asked for, because a
     /// box that is always there is a box that is always in the way.
     filtering: bool,
+    /// The context menu, when one is open.
+    menu: Option<Menu>,
     /// Home, the user directories, the mounts and the bookmarks.
     ///
     /// Read once at startup and after a bookmark is added. A disk appearing is
@@ -87,6 +100,7 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
         dialogue: None,
         typed: String::new(),
         filtering: false,
+        menu: None,
         places: places::list(),
     };
 
@@ -269,8 +283,17 @@ fn translate(buffer: usize, found: list::Action) -> Option<Action> {
         list::Action::Escape => Action::Escape,
         // The menu is still to come. The click moves the cursor meanwhile, so
         // a right click does something rather than nothing.
-        list::Action::Menu { row, .. } => Action::Select { buffer, row },
+        list::Action::Menu { row, at } => Action::Menu {
+            buffer,
+            row,
+            at: (at.x, at.y),
+        },
     })
+}
+
+/// Put away the context menu, if one is open.
+pub fn close_menu(app: &mut App) {
+    app.menu = None;
 }
 
 /// Say no, and say why.
@@ -296,9 +319,76 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
 
         Action::Filtering(showing) => Task::done(Message::Filtering(showing)),
 
+        Action::Menu { buffer, row, at } => {
+            // The click already moved the cursor. The menu acts on whatever
+            // is selected, so what it will do is on screen before it opens.
+            with(app, buffer, |found| {
+                if !found.is_selected(row) {
+                    found.select_only(row);
+                } else {
+                    found.move_to(row);
+                }
+            });
+            app.menu = Some(Menu { buffer, row, at });
+            Task::none()
+        }
+
+        Action::CopyPath { buffer } => {
+            let Some(found) = app.buffers.get(buffer) else {
+                return Task::none();
+            };
+
+            // Every selected path, one per line, so pasting several into a
+            // terminal or an editor gives a list rather than a run-on.
+            let mut paths: Vec<String> = found
+                .selected()
+                .map(|entry| entry.path.display().to_string())
+                .collect();
+
+            // Nothing selected means the directory itself, which is what
+            // somebody asking for "the path" from an empty patch of window
+            // means.
+            if paths.is_empty() {
+                paths.push(found.path.display().to_string());
+            }
+
+            app.notice = Some(match paths.len() {
+                1 => format!("copied {}", paths[0]),
+                many => format!("copied {many} paths"),
+            });
+            iced::clipboard::write(paths.join("\n"))
+        }
+
+        Action::Bookmark { path } => {
+            match crate::places::bookmark(&path) {
+                Ok(()) => {
+                    app.places = places::list();
+                    app.notice = Some(format!("{} is in your places", path.display()));
+                }
+                Err(error) => {
+                    app.notice = Some(format!("could not write the bookmark: {error}"));
+                }
+            }
+            Task::none()
+        }
+
+        Action::ShowHidden(showing) => {
+            app.config.list.show_hidden = showing;
+            let list = app.config.list.clone();
+            for found in &mut app.buffers {
+                found.rebuild(&list);
+            }
+            Task::none()
+        }
+
+        Action::Relist { buffer } => relist(app, buffer),
+
         Action::Escape => {
             // One key for "put away whatever is in front of me", in the order
             // things are stacked.
+            if app.menu.take().is_some() {
+                return Task::none();
+            }
             if app.dialogue.is_some() {
                 return Task::done(Message::Dialogue(Choice::Dismiss));
             }
@@ -622,8 +712,14 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
     .width(Length::Fill)
     .height(Length::Fill);
 
+    // A menu sits over the page, and under a dialogue.
+    let page: Element<'_, Message> = match &app.menu {
+        Some(menu) => iced::widget::stack![page, context_menu(app, menu)].into(),
+        None => page.into(),
+    };
+
     let Some(dialogue) = &app.dialogue else {
-        return page.into();
+        return page;
     };
 
     // A `Stack` rather than a second surface: iced's own popups take a grab,
@@ -777,6 +873,122 @@ fn status<'a>(app: &'a App, buffer: &'a Buffer) -> Element<'a, Message> {
         .into()
 }
 
+/// The menu a right click opens, where the right click happened.
+///
+/// Placed with `pin`, because the list widget already knew where the pointer
+/// was: iced tells `update` no geometry, but a `Widget` is handed the cursor,
+/// so the position travels with the action instead of being tracked apart.
+fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
+    use iced::widget::{button, mouse_area, pin};
+
+    let theme = &app.config.theme;
+    let foreground = theme.foreground.color();
+    let background = theme.background.color();
+    let accent = theme.accent.color();
+
+    let buffer = app.buffers.get(menu.buffer);
+    let entry = buffer.and_then(|found| found.at(menu.row));
+    let directory = entry.filter(|entry| entry.kind.is_directory());
+
+    let item = move |label: String, message: Message| {
+        button(text(label).size(13))
+            .width(Length::Fill)
+            .padding([4, 12])
+            .style(move |_: &iced::Theme, status| button::Style {
+                background: matches!(status, button::Status::Hovered).then(|| accent.into()),
+                text_color: if matches!(status, button::Status::Hovered) {
+                    background
+                } else {
+                    foreground
+                },
+                ..button::Style::default()
+            })
+            .on_press(message)
+    };
+
+    let mut items = column![].width(Length::Fill);
+
+    if entry.is_some() {
+        items = items.push(item(
+            String::from("Open"),
+            Message::Act(Action::Activate {
+                buffer: menu.buffer,
+                row: menu.row,
+            }),
+        ));
+    }
+
+    items = items.push(item(
+        String::from("Copy path"),
+        Message::Act(Action::CopyPath {
+            buffer: menu.buffer,
+        }),
+    ));
+
+    // Only a directory can be a place, and the current one is offered when
+    // the click landed on a file, since that is still a useful thing to want.
+    let bookmarkable = directory
+        .map(|entry| entry.path.clone())
+        .or_else(|| buffer.map(|found| found.path.clone()));
+
+    if let Some(path) = bookmarkable {
+        let label = match directory {
+            Some(entry) => format!("Add {} to places", entry.name),
+            None => String::from("Add this directory to places"),
+        };
+        items = items.push(item(label, Message::Act(Action::Bookmark { path })));
+    }
+
+    let hidden = app.config.list.show_hidden;
+    items = items.push(item(
+        String::from(if hidden {
+            "Hide hidden files"
+        } else {
+            "Show hidden files"
+        }),
+        Message::Act(Action::ShowHidden(!hidden)),
+    ));
+
+    items = items.push(item(
+        String::from("Relist"),
+        Message::Act(Action::Relist {
+            buffer: menu.buffer,
+        }),
+    ));
+
+    let panel = container(items)
+        .width(Length::Fixed(230.0))
+        .padding(4)
+        .style(move |_: &iced::Theme| container::Style {
+            background: Some(background.into()),
+            border: iced::Border {
+                color: theme.muted.color(),
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            shadow: iced::Shadow {
+                color: iced::Color {
+                    a: 0.4,
+                    ..iced::Color::BLACK
+                },
+                offset: iced::Vector::new(0.0, 2.0),
+                blur_radius: 8.0,
+            },
+            ..container::Style::default()
+        });
+
+    // A click anywhere else puts the menu away, which is what every menu on
+    // every desktop does. The catcher fills the window under the panel.
+    mouse_area(
+        container(pin(panel).x(menu.at.0).y(menu.at.1))
+            .width(Length::Fill)
+            .height(Length::Fill),
+    )
+    .on_press(Message::Act(Action::Escape))
+    .on_right_press(Message::Act(Action::Escape))
+    .into()
+}
+
 /// The panel down the left: places at the top, jobs at the bottom.
 fn sidebar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
     use iced::widget::{button, scrollable};
@@ -905,6 +1117,7 @@ mod tests {
             dialogue: None,
             typed: String::new(),
             filtering: false,
+            menu: None,
             places: Vec::new(),
         }
     }
@@ -918,7 +1131,10 @@ mod tests {
             modified: None,
             mode: 0o644,
             target: None,
-            hidden: false,
+            // Derived, not hardcoded: a fixture that says `.hidden` is not
+            // hidden makes a test about hidden files pass for the wrong
+            // reason, or fail for one.
+            hidden: name.starts_with('.'),
         }
     }
 
@@ -1079,6 +1295,121 @@ mod tests {
 
         tell(&mut app, Message::Dialogue(Choice::Named));
         assert!(app.dialogue.is_some(), "the dialogue should stay up");
+    }
+
+    /// A right click puts the cursor on the row it landed on, so what the
+    /// menu will act on is on screen before it opens.
+    #[test]
+    fn a_menu_selects_what_it_will_act_on() {
+        let mut app = app();
+        let list = Config::default().list;
+        app.buffers[0].extend(
+            vec![entry("a.txt", Kind::File), entry("b.txt", Kind::File)],
+            &list,
+        );
+        app.buffers[0].finish(&list);
+
+        tell(
+            &mut app,
+            Message::List(
+                0,
+                list::Action::Menu {
+                    row: 1,
+                    at: iced::Point::new(40.0, 90.0),
+                },
+            ),
+        );
+
+        assert!(app.menu.is_some(), "the menu should be open");
+        let selected: Vec<&str> = app.buffers[0]
+            .selected()
+            .map(|found| found.name.as_str())
+            .collect();
+        assert_eq!(selected, ["b.txt"]);
+    }
+
+    /// A right click inside an existing selection must not throw it away.
+    /// Somebody who picked five files and right-clicked one of them means all
+    /// five, which is what every file manager does.
+    #[test]
+    fn a_menu_inside_a_selection_keeps_it() {
+        let mut app = app();
+        let list = Config::default().list;
+        app.buffers[0].extend(
+            vec![
+                entry("a.txt", Kind::File),
+                entry("b.txt", Kind::File),
+                entry("c.txt", Kind::File),
+            ],
+            &list,
+        );
+        app.buffers[0].finish(&list);
+        app.buffers[0].select_all();
+
+        tell(
+            &mut app,
+            Message::Act(Action::Menu {
+                buffer: 0,
+                row: 1,
+                at: (0.0, 0.0),
+            }),
+        );
+
+        assert_eq!(app.buffers[0].selected().count(), 3, "all three still");
+    }
+
+    /// A menu that outlives the thing it was about acts on the wrong file, so
+    /// every other action closes it.
+    #[test]
+    fn any_other_action_closes_the_menu() {
+        let mut app = app();
+        app.menu = Some(Menu {
+            buffer: 0,
+            row: 0,
+            at: (0.0, 0.0),
+        });
+
+        tell(&mut app, Message::Act(Action::SelectAll { buffer: 0 }));
+        assert!(app.menu.is_none());
+    }
+
+    /// Escape closes the menu before it closes anything else, because the
+    /// menu is the thing in front.
+    #[test]
+    fn escape_closes_the_menu_first() {
+        let mut app = app();
+        app.filtering = true;
+        app.menu = Some(Menu {
+            buffer: 0,
+            row: 0,
+            at: (0.0, 0.0),
+        });
+
+        tell(&mut app, Message::Act(Action::Escape));
+        assert!(app.menu.is_none(), "the menu went");
+        assert!(app.filtering, "and the filter box stayed");
+    }
+
+    /// Hiding hidden files must rebuild every buffer, not only the one in
+    /// front, or a second tile keeps showing them.
+    #[test]
+    fn showing_hidden_files_reaches_every_buffer() {
+        let mut app = app();
+        let list = Config::default().list;
+        app.buffers.push(Buffer::new(PathBuf::from("/tmp/two")));
+
+        for buffer in &mut app.buffers {
+            buffer.extend(
+                vec![entry("plain", Kind::File), entry(".hidden", Kind::File)],
+                &list,
+            );
+            buffer.finish(&list);
+        }
+        assert_eq!(app.buffers[1].rows(), 1);
+
+        tell(&mut app, Message::Act(Action::ShowHidden(true)));
+        assert_eq!(app.buffers[0].rows(), 2);
+        assert_eq!(app.buffers[1].rows(), 2, "the buffer behind too");
     }
 
     /// A message naming a buffer that is gone must not panic.

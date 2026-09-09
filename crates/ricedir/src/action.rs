@@ -69,6 +69,30 @@ pub enum Action {
     Filtering(bool),
     /// Put away whatever is in front. A person only.
     Escape,
+    /// Show the menu for a row, at a point on screen. A person only: a
+    /// pointer is the only thing that has a point.
+    Menu {
+        buffer: usize,
+        row: usize,
+        at: (f32, f32),
+    },
+    /// Put the path of what is selected on the clipboard.
+    ///
+    /// The thing people want a path bar for, and a menu is where it lives
+    /// until the path bar grows its text face in M6.
+    CopyPath {
+        buffer: usize,
+    },
+    /// Add a directory to the favourite places.
+    Bookmark {
+        path: PathBuf,
+    },
+    /// Show or hide the files whose names start with a dot.
+    ShowHidden(bool),
+    /// Read the directory again.
+    Relist {
+        buffer: usize,
+    },
 
     // --- opening ----------------------------------------------------------
     /// Enter a directory, or open a file through the scan chain and the
@@ -98,7 +122,16 @@ impl Action {
             | Self::Leave { .. }
             | Self::Filter { .. }
             | Self::Filtering(_)
-            | Self::Escape => Kind::View,
+            | Self::Escape
+            | Self::Menu { .. }
+            | Self::CopyPath { .. }
+            | Self::ShowHidden(_)
+            | Self::Relist { .. } => Kind::View,
+
+            // A bookmark writes a file, but ricedir's own, not one of the
+            // person's. Nothing in the plan mechanism is about protecting
+            // ricedir from itself, so it acts at once like any other view.
+            Self::Bookmark { .. } => Kind::View,
 
             // Opening runs a program. It is not a file *write*, so it is not
             // `Kind::File`, but it is the one view-shaped action with a scan
@@ -159,6 +192,12 @@ pub fn dispatch(app: &mut App, action: Action) -> Task<Message> {
         );
     }
 
+    // Any action but opening a menu closes the one that is open. A menu that
+    // outlives the thing it was about is a menu that acts on the wrong file.
+    if !matches!(action, Action::Menu { .. }) {
+        crate::app::close_menu(app);
+    }
+
     crate::app::carry_out(app, action)
 }
 
@@ -192,6 +231,17 @@ mod tests {
             },
             Action::Filtering(true),
             Action::Escape,
+            Action::Menu {
+                buffer: 0,
+                row: 0,
+                at: (0.0, 0.0),
+            },
+            Action::CopyPath { buffer: 0 },
+            Action::Bookmark {
+                path: PathBuf::from("/tmp"),
+            },
+            Action::ShowHidden(true),
+            Action::Relist { buffer: 0 },
             Action::Activate { buffer: 0, row: 0 },
         ];
 
