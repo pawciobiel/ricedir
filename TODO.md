@@ -772,6 +772,36 @@ Two things the run found that no test had:
       is not there. Confirmed the fix by counting pixels rather than looking:
       one column of `#45475a` at x=180.
 
+## M1 stage 3: the icons
+
+- [x] **The codepoints were harvested, not looked up.** `lsd --icon always`
+      was run over a directory holding one file per extension, and the glyphs
+      it printed were read back with a script. `CLAUDE.md` says to verify a
+      codepoint by rendering it rather than from memory, and this is the
+      cheapest way to obey that: the table now matches the tool the user
+      already looks at every day.
+
+      The pasted listing that started this work arrived with every glyph
+      missing, which is the same rule from the other side. Private-use
+      codepoints do not survive a copy and paste.
+
+- [x] **The glyphs have their own font.** `[list] icon-font`, defaulting to
+      `Symbols Nerd Font`, which is glyphs and nothing else. The names keep
+      the window's family, so a readable face and a face that has the icons
+      can be two different things. Setting `icons = false` draws none at all,
+      which is what a machine with no Nerd Font wants rather than a column of
+      empty boxes.
+
+      This needed the widget's renderer bound to be
+      `text::Renderer<Font = iced::Font>` rather than left open. The first
+      attempt downcast an `Any` to reach the concrete type and did not
+      compile; naming the type is both shorter and true.
+
+- [x] **A link is a link before it is a directory.** A working symlink to a
+      directory was drawn as a plain folder, hiding the one thing its name
+      cannot tell you. Caught by a test that was written before the code was
+      read back. `lsd` shows the link glyph too.
+
 ## M2 — the job engine
 
 - [ ] **The queue.** A job is a plan built before any byte moves: the full

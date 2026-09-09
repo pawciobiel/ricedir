@@ -279,6 +279,14 @@ pub struct List {
     pub sort_reversed: bool,
     /// Whether `Apple` and `apple` sort together.
     pub ignore_case: bool,
+    /// Whether a glyph is drawn before each name.
+    pub icons: bool,
+    /// The family the glyphs come from.
+    ///
+    /// Its own family rather than the window's, so the names can be set in a
+    /// readable face while the icons come from one that has them. `Symbols
+    /// Nerd Font` is glyphs and nothing else, which is exactly the job.
+    pub icon_font: Option<String>,
 }
 
 impl Default for List {
@@ -290,6 +298,8 @@ impl Default for List {
             sort: Sort::Name,
             sort_reversed: false,
             ignore_case: true,
+            icons: true,
+            icon_font: Some(String::from("Symbols Nerd Font")),
         }
     }
 }

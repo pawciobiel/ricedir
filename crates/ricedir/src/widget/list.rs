@@ -33,6 +33,9 @@ const BAR: f32 = 6.0;
 /// Gap between the left edge and the name.
 const PADDING: f32 = 8.0;
 
+/// Width kept for the glyph, and the gap after it.
+const ICON: f32 = 22.0;
+
 /// Width reserved for the size column.
 const SIZE_COLUMN: f32 = 90.0;
 
@@ -93,6 +96,9 @@ pub struct FileList<'a, Message> {
     theme: &'a config::Theme,
     row_height: f32,
     text_size: f32,
+    /// The glyph font, when there is one. `None` draws no icons at all: a
+    /// machine with no Nerd Font would otherwise show a column of boxes.
+    icons: Option<iced::Font>,
     /// Whether this list has the keyboard. The application decides, from which
     /// tile is focused: iced's own focus machinery is not needed, and
     /// `text_input` never captures the vertical arrows anyway, so a filter box
@@ -107,6 +113,7 @@ impl<'a, Message> FileList<'a, Message> {
         theme: &'a config::Theme,
         list: &config::List,
         text_size: f32,
+        icons: Option<iced::Font>,
         focused: bool,
         on_action: impl Fn(Action) -> Message + 'a,
     ) -> Self {
@@ -115,6 +122,7 @@ impl<'a, Message> FileList<'a, Message> {
             theme,
             row_height: list.row_height.max(1.0),
             text_size,
+            icons: list.icons.then_some(icons).flatten(),
             focused,
             on_action: Box::new(on_action),
         }
@@ -177,9 +185,12 @@ impl<'a, Message> FileList<'a, Message> {
     }
 }
 
+// `Font = iced::Font` rather than the associated type left open. The list is
+// only ever drawn by the application's own renderer, and saying so is what
+// lets a glyph be drawn in a different face from the name beside it.
 impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer> for FileList<'_, Message>
 where
-    Renderer: text::Renderer,
+    Renderer: text::Renderer<Font = iced::Font>,
 {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State>()
@@ -435,7 +446,7 @@ where
 }
 
 impl<Message> FileList<'_, Message> {
-    fn draw_row<Renderer: text::Renderer>(
+    fn draw_row<Renderer: text::Renderer<Font = iced::Font>>(
         &self,
         renderer: &mut Renderer,
         entry: &Entry,
@@ -484,12 +495,32 @@ impl<Message> FileList<'_, Message> {
             one_line(&entry.name)
         };
 
+        // The glyph, in its own face. The name keeps the window's font, so a
+        // readable face and a face that has the icons can be two things.
+        let indent = match self.icons {
+            Some(font) => {
+                self.draw_glyph(
+                    renderer,
+                    crate::icon::of(entry),
+                    Rectangle {
+                        x: bounds.x + PADDING,
+                        width: ICON,
+                        ..bounds
+                    },
+                    colour,
+                    font,
+                );
+                ICON
+            }
+            None => 0.0,
+        };
+
         self.draw_text(
             renderer,
             name,
             Rectangle {
-                x: bounds.x + PADDING,
-                width: (bounds.width - SIZE_COLUMN - BAR - PADDING * 2.0).max(0.0),
+                x: bounds.x + PADDING + indent,
+                width: (bounds.width - SIZE_COLUMN - BAR - PADDING * 2.0 - indent).max(0.0),
                 ..bounds
             },
             colour,
@@ -561,6 +592,33 @@ impl<Message> FileList<'_, Message> {
         );
     }
 
+    /// Draw one glyph, in the icon face rather than the window's.
+    fn draw_glyph<Renderer: text::Renderer<Font = iced::Font>>(
+        &self,
+        renderer: &mut Renderer,
+        glyph: char,
+        bounds: Rectangle,
+        colour: Color,
+        font: iced::Font,
+    ) {
+        renderer.fill_text(
+            text::Text {
+                content: glyph.to_string(),
+                bounds: Size::new(bounds.width, bounds.height),
+                size: Pixels(self.text_size),
+                line_height: text::LineHeight::default(),
+                font,
+                align_x: text::Alignment::Left,
+                align_y: alignment::Vertical::Center,
+                shaping: text::Shaping::Advanced,
+                wrapping: text::Wrapping::None,
+            },
+            Point::new(bounds.x, bounds.center_y()),
+            colour,
+            bounds,
+        );
+    }
+
     fn draw_scrollbar<Renderer: renderer::Renderer>(
         &self,
         renderer: &mut Renderer,
@@ -603,7 +661,7 @@ impl<'a, Message, Theme, Renderer> From<FileList<'a, Message>>
 where
     Message: 'a,
     Theme: 'a,
-    Renderer: text::Renderer + 'a,
+    Renderer: text::Renderer<Font = iced::Font> + 'a,
 {
     fn from(list: FileList<'a, Message>) -> Self {
         Self::new(list)

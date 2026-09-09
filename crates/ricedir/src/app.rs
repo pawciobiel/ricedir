@@ -47,6 +47,11 @@ pub struct App {
     /// Whether the filter box is on screen. Hidden until asked for, because a
     /// box that is always there is a box that is always in the way.
     filtering: bool,
+    /// The face the glyphs come from, resolved once at startup.
+    ///
+    /// `Font::with_name` wants a `&'static str` and the family comes from a
+    /// config file, so the name is leaked -- once, not once per frame.
+    icon_font: Option<iced::Font>,
     /// The context menu, when one is open.
     menu: Option<Menu>,
     /// Home, the user directories, the mounts and the bookmarks.
@@ -92,6 +97,7 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
     });
 
     let notice = config.problem.clone();
+    let config_font = config.list.icon_font.clone();
     let mut app = App {
         config,
         buffers: vec![Buffer::new(start.clone())],
@@ -100,6 +106,7 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
         dialogue: None,
         typed: String::new(),
         filtering: false,
+        icon_font: icon_font(&config_font),
         menu: None,
         places: places::list(),
     };
@@ -289,6 +296,13 @@ fn translate(buffer: usize, found: list::Action) -> Option<Action> {
             at: (at.x, at.y),
         },
     })
+}
+
+/// Resolve the icon family, once.
+fn icon_font(family: &Option<String>) -> Option<iced::Font> {
+    family
+        .clone()
+        .map(|family| iced::Font::with_name(String::leak(family)))
 }
 
 /// Put away the context menu, if one is open.
@@ -662,6 +676,7 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
         &app.config.theme,
         &app.config.list,
         app.config.window.font_size,
+        app.icon_font,
         // Not focused while a dialogue is up: otherwise Escape would close
         // the dialogue and clear the filter in the same keystroke, and arrows
         // would move a cursor nobody can see.
@@ -1117,6 +1132,7 @@ mod tests {
             dialogue: None,
             typed: String::new(),
             filtering: false,
+            icon_font: None,
             menu: None,
             places: Vec::new(),
         }

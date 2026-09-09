@@ -11,6 +11,7 @@ mod buffer;
 mod config;
 mod dialogue;
 mod entry;
+mod icon;
 mod open;
 mod places;
 mod watch;
