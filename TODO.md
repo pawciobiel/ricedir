@@ -419,7 +419,24 @@ landing before the list widget is even proven.
       `~/.config/user-dirs.dirs`, mounted filesystems from
       `/proc/self/mountinfo` (filtered: no `sysfs`, `proc`, `cgroup`, `tmpfs`
       under `/run`), and bookmarks in ricedir's own file so nothing is written
-      into GTK's. Drag a directory onto the panel to bookmark it.
+      into GTK's.
+- [ ] **Add to favourite places.** Nothing can make a bookmark yet. The panel
+      reads them and `places::bookmark` writes one, but no button, key or menu
+      item calls it, so the fourth group in the panel is always empty.
+
+      Four ways in, and all four are the same action:
+
+      - the context menu on a directory, once there is one
+      - a keystroke on the row the cursor is on
+      - dragging a directory onto the panel
+      - `Ctrl+D`, which is what a browser taught everybody
+
+      Removing one has to come with it, or a mistake is permanent. A right
+      click on a bookmark is the obvious place for that.
+
+      It needs an `Action::Bookmark { path }` and an `Action::Unbookmark`, so
+      an agent can ask for it later through the same door. Both are `View`:
+      they change a file that belongs to ricedir, not one of the person's.
 - [x] **Path bar.** Breadcrumbs that are buttons, an editable path with
       completion, and back/forward/up with a per-buffer history.
 - [x] **Filter and sort.** A filter box that narrows as you type (substring by
