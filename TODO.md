@@ -437,8 +437,14 @@ landing before the list widget is even proven.
       It needs an `Action::Bookmark { path }` and an `Action::Unbookmark`, so
       an agent can ask for it later through the same door. Both are `View`:
       they change a file that belongs to ricedir, not one of the person's.
-- [x] **Path bar.** Breadcrumbs that are buttons, an editable path with
-      completion, and back/forward/up with a per-buffer history.
+- [x] **Path bar, the breadcrumbs half.** Each component is a button, built
+      from `Path::components` rather than by splitting the string, so a name
+      with a slash-looking character in it cannot fool them. Back, forward and
+      up work off a per-buffer history.
+- [ ] **Path bar, the text half.** Not built, and this entry was ticked once
+      claiming it was. There is no way to edit the path and no completion.
+      Wanted, and the design for it is in `## M6`: one click turns the
+      breadcrumbs into plain text you can select part of and copy.
 - [x] **Filter and sort.** A filter box that narrows as you type (substring by
       default, glob with a leading `:`), a hidden-files toggle, and a sort menu
       over name, size, modified, type and extension.
@@ -923,6 +929,45 @@ than the one already installed is partly that it looks good.
       a titlebar we draw with the path in it, rounded corners and a shadow.
       Check on all three compositors: sway and niri prefer server-side, so the
       switch has to be a config key rather than an assumption.
+- [ ] **A path bar with two faces.** Breadcrumbs to look at, plain text to
+      take a piece of. One click turns it from one into the other.
+
+      Today it is buttons and only buttons, so there is no way to copy half a
+      path. That is a thing people do constantly: they want
+      `/home/someone/workspace/rust` out of a longer path to paste into a
+      terminal, and a row of buttons gives them nothing to drag across.
+
+      **The two faces:**
+
+      - *Resting.* Breadcrumbs, drawn as nicely as the rest of the eye candy
+        allows: a separator that is a shape rather than a slash, the last
+        component brighter than its parents, a fade on the left when the path
+        is too long for the bar.
+      - *Touched.* The same path as one line of selectable text. Drag across
+        any part of it, `Ctrl+C`, done. Editable too, with completion, which
+        is the half `## M1` claimed and never had.
+
+      **What turns it over.** A click on the bar but *not* on a crumb, because
+      a click on a crumb already means "go there" and must keep meaning it.
+      `Ctrl+L` goes straight to text, which is what a browser taught everyone.
+      `Escape` and losing focus go back.
+
+      That split is the whole risk in this item: two meanings for one click,
+      told apart only by where it lands. The gap after the last crumb is the
+      obvious target, and it is small on a short path. Worth trying a small
+      dedicated button at the right-hand end as well, so there is a place to
+      click that is never ambiguous.
+
+      **The animation is the point of putting this in M6.** Turning over
+      should be a movement, not a swap: the crumb text is in the same place in
+      both faces, so it can slide rather than blink. `iced::animation` on the
+      separators fading out and the background of the text field fading in.
+
+      **To check before building.** Whether `text_input` can be made
+      selectable without being editable, for the case where somebody wants to
+      copy a path but not change it. If it cannot, the answer is that the text
+      face is simply always editable, which is no loss.
+
 - [ ] **Theme presets shipped.** Catppuccin, Gruvbox, Nord and Rosé Pine as
       commented blocks in the example config, the way ricebar proves theming by
       giving its two recorded bars different palettes.
