@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use iced::Task;
+use iced::widget::pane_grid::Axis;
 use ricedir_protocol::{Kind, Request};
 
 use crate::app::{App, Message};
@@ -91,6 +92,13 @@ pub enum Action {
     ShowHidden(bool),
     /// Arrange the entries a different way.
     Layout(crate::config::Layout),
+    /// Split the focused tile in two.
+    Split(Axis),
+    /// Close the focused tile. The buffer it showed stays open.
+    CloseTile,
+    /// Move the keyboard to the next tile, or the one before.
+    NextTile,
+    PreviousTile,
     /// Read the directory again.
     Relist {
         buffer: usize,
@@ -129,6 +137,10 @@ impl Action {
             | Self::CopyPath { .. }
             | Self::ShowHidden(_)
             | Self::Layout(_)
+            | Self::Split(_)
+            | Self::CloseTile
+            | Self::NextTile
+            | Self::PreviousTile
             | Self::Relist { .. } => Kind::View,
 
             // A bookmark writes a file, but ricedir's own, not one of the
@@ -245,6 +257,10 @@ mod tests {
             },
             Action::ShowHidden(true),
             Action::Layout(crate::config::Layout::Icons),
+            Action::Split(Axis::Vertical),
+            Action::CloseTile,
+            Action::NextTile,
+            Action::PreviousTile,
             Action::Relist { buffer: 0 },
             Action::Activate { buffer: 0, row: 0 },
         ];

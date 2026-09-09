@@ -71,6 +71,14 @@ fn code(name: &str) -> Option<u32> {
         "Insert" => 110,
         "Delete" => 111,
         "Slash" => 53,
+        "Backslash" | "backslash" => 43,
+        "Grave" | "Backtick" => 41,
+        "Equal" => 13,
+        "LeftBracket" => 26,
+        "RightBracket" => 27,
+        "Semicolon" => 39,
+        "Apostrophe" => 40,
+        "Comma" => 51,
         "Period" => 52,
         "Minus" => 12,
         // Letters and digits, so `type` can spell a path.
@@ -99,6 +107,9 @@ fn typed(character: char) -> Option<(u32, bool)> {
         '.' => Some((52, false)),
         '-' => Some((12, false)),
         '_' => Some((12, true)),
+        '\\' => Some((43, false)),
+        '`' => Some((41, false)),
+        ',' => Some((51, false)),
         _ => code(&character.to_string()).map(|found| (found, false)),
     }
 }

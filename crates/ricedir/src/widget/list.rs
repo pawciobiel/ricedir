@@ -72,6 +72,13 @@ pub enum Action {
     Filter,
     /// Ctrl-1, Ctrl-2, Ctrl-3, or the backtick to cycle.
     Layout(Option<config::Layout>),
+    /// Split the tile: right with Ctrl-\, down with Ctrl--.
+    SplitRight,
+    SplitDown,
+    /// Ctrl-w closes the tile, Tab moves between them.
+    CloseTile,
+    NextTile,
+    PreviousTile,
     /// Escape: put away whatever is showing.
     Escape,
     /// Right click, with where it happened, so a menu can be put there.
@@ -459,11 +466,25 @@ where
                     {
                         Some(Action::Layout(None))
                     }
+                    // Tab between tiles, the way every pane in every editor
+                    // moves. `text_input` does not capture it, so the filter
+                    // box being open makes no difference.
+                    keyboard::Key::Named(key::Named::Tab) if modifiers.shift() => {
+                        Some(Action::PreviousTile)
+                    }
+                    keyboard::Key::Named(key::Named::Tab) => Some(Action::NextTile),
+
                     keyboard::Key::Character(character) if modifiers.command() => {
                         match character.as_str() {
                             "1" => Some(Action::Layout(Some(config::Layout::List))),
                             "2" => Some(Action::Layout(Some(config::Layout::Detail))),
                             "3" => Some(Action::Layout(Some(config::Layout::Icons))),
+                            // The two that look like what they do: a
+                            // backslash leans the way a vertical split does,
+                            // and a minus lies the way a horizontal one does.
+                            "\\" => Some(Action::SplitRight),
+                            "-" => Some(Action::SplitDown),
+                            "w" => Some(Action::CloseTile),
                             _ => None,
                         }
                     }

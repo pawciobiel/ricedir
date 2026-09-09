@@ -425,9 +425,15 @@ landing before the list widget is even proven.
       originally said. Per buffer means the view changes as you move between
       tiles, which is disorienting; nobody has asked for it and it is one
       field away if somebody does.
-- [ ] **Tiles and buffers.** `pane_grid` for the tiles, a flat `Vec<Buffer>`
-      addressed by index, split/close/focus, and a buffer list to point a tile
-      somewhere else. Closing the last tile of a buffer keeps the buffer.
+- [x] **Tiles and buffers.** `pane_grid` for the tiles, a flat `Vec<Buffer>`
+      addressed by index. `Ctrl+\\` splits right, `Ctrl+-` splits down,
+      `Ctrl+W` closes a tile, Tab and Shift-Tab move between them, and the
+      focused tile is edged in the accent. Closing a tile keeps its buffer.
+- [ ] **A buffer list, to point a tile at a directory that is already open.**
+      The half of the emacs model that is not built. Splitting gives the new
+      tile a buffer of its own, which is what a file manager wants: two
+      independent panes. Sharing a listing between two tiles is the *other*
+      move, and there is no way to ask for it yet.
 - [x] **Places.** Home and the XDG user directories from
       `~/.config/user-dirs.dirs`, mounted filesystems from
       `/proc/self/mountinfo` (filtered: no `sysfs`, `proc`, `cgroup`, `tmpfs`
@@ -836,6 +842,28 @@ Two things the run found that no test had:
 - [x] **A date this year drops the year.** `9 Sep 09:19` against
       `9 Sep  2025`, which is what `ls -l` does and for the same reason: the
       year is noise on a file saved this morning.
+
+## M1 stage 3: tiles
+
+- [x] **A split makes a new buffer, not a shared one.** The decided item says
+      two tiles on one directory share a listing and a watcher, and they do --
+      but that is what happens when a tile is *pointed at* an existing buffer,
+      not what a split should do. A file manager splits to get two directories
+      side by side, and a split that moved both panes together would be
+      useless. The sharing move needs a buffer list, which is not built.
+
+- [x] **The last tile cannot be closed.** A window with no tiles shows nothing
+      and offers no way back.
+
+- [x] **The focused tile is edged in the accent.** With two tiles and no mark,
+      nothing on screen says which one the keyboard will reach.
+
+- [ ] **The rig's display number is not `wayland-2`.** Restarting sway while
+      an old socket is still on disk gives the new one `wayland-3`, and a
+      client sent at the old number looks exactly like a client that will not
+      start -- which cost a few minutes. `dev/rig.sh` now asks the compositor
+      which display it is on and prints the environment to `eval`. Use it
+      rather than writing a display name by hand.
 
 ## M2 — the job engine
 

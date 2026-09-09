@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use iced::widget::{column, container, row, text};
+use iced::widget::{column, container, pane_grid, row, text};
 use iced::{Element, Length, Task, window};
 
 use crate::action::{self, Action};
@@ -17,6 +17,32 @@ use crate::dialogue::{self, Choice, Dialogue};
 use crate::open::{self, Plan, scan};
 use crate::places::{self, Place};
 use crate::widget::list::{self, FileList};
+
+/// The tiles in one window, and which of them has the keyboard.
+///
+/// A tile holds a `usize` into `App.buffers`, exactly as ricebar's bars hold
+/// indices into one module list. Two tiles pointed at the same buffer share
+/// its listing, its watcher and its selection -- which is the emacs move, and
+/// the reason buffers and tiles are separate things.
+pub struct Tiles {
+    pub panes: pane_grid::State<usize>,
+    pub focus: pane_grid::Pane,
+}
+
+impl Tiles {
+    fn new(buffer: usize) -> Self {
+        let (panes, first) = pane_grid::State::new(buffer);
+        Self {
+            panes,
+            focus: first,
+        }
+    }
+
+    /// The buffer the focused tile is showing.
+    fn buffer(&self) -> usize {
+        self.panes.get(self.focus).copied().unwrap_or(0)
+    }
+}
 
 /// A context menu, and where it was asked for.
 #[derive(Debug, Clone)]
@@ -35,8 +61,8 @@ pub struct App {
     /// ricebar's bars hold indices into one module list, so a directory open
     /// twice is listed once and watched once.
     buffers: Vec<Buffer>,
-    /// Which buffer each window is showing. One entry until tiles land.
-    windows: HashMap<window::Id, usize>,
+    /// The tiles in each window.
+    windows: HashMap<window::Id, Tiles>,
     /// Anything the person needs to be told, since a file manager started from
     /// a launcher has no terminal to print to.
     notice: Option<String>,
@@ -87,6 +113,10 @@ pub enum Message {
     /// A handler was started, or would not start.
     Spawned(Result<(), String>),
     Dialogue(Choice),
+    /// A tile was clicked, dragged onto another, or its divider moved.
+    TileClicked(pane_grid::Pane),
+    TileDragged(pane_grid::DragEvent),
+    TileResized(pane_grid::ResizeEvent),
 }
 
 pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
@@ -111,9 +141,9 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
         places: places::list(),
     };
 
-    // The id comes back before the window exists, so the buffer can be tied to
+    // The id comes back before the window exists, so the tiles can be tied to
     // it now rather than in a later message.
-    app.windows.insert(id, 0);
+    app.windows.insert(id, Tiles::new(0));
 
     let listing = relist(&mut app, 0);
     (app, Task::batch([opened.map(Message::Opened), listing]))
@@ -225,6 +255,26 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 
         Message::Dialogue(choice) => chose(app, choice),
 
+        Message::TileClicked(pane) => {
+            focus_tile(app, pane);
+            Task::none()
+        }
+
+        Message::TileDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
+            for tiles in app.windows.values_mut() {
+                tiles.panes.drop(pane, target);
+            }
+            Task::none()
+        }
+        Message::TileDragged(_) => Task::none(),
+
+        Message::TileResized(pane_grid::ResizeEvent { split, ratio }) => {
+            for tiles in app.windows.values_mut() {
+                tiles.panes.resize(split, ratio);
+            }
+            Task::none()
+        }
+
         Message::Changed(index) => relist(app, index),
 
         Message::Filter(index, text) => action::dispatch(
@@ -289,6 +339,11 @@ fn translate(buffer: usize, found: list::Action, current: crate::config::Layout)
         list::Action::Filter => Action::Filtering(true),
         list::Action::Layout(None) => Action::Layout(current.next()),
         list::Action::Layout(Some(layout)) => Action::Layout(layout),
+        list::Action::SplitRight => Action::Split(pane_grid::Axis::Vertical),
+        list::Action::SplitDown => Action::Split(pane_grid::Axis::Horizontal),
+        list::Action::CloseTile => Action::CloseTile,
+        list::Action::NextTile => Action::NextTile,
+        list::Action::PreviousTile => Action::PreviousTile,
         list::Action::Escape => Action::Escape,
         // The menu is still to come. The click moves the cursor meanwhile, so
         // a right click does something rather than nothing.
@@ -305,6 +360,18 @@ fn icon_font(family: &Option<String>) -> Option<iced::Font> {
     family
         .clone()
         .map(|family| iced::Font::with_name(String::leak(family)))
+}
+
+/// Give one tile the keyboard.
+///
+/// Every window is asked, because a `Pane` belongs to exactly one of them and
+/// there is no cheaper way to say which from a click alone.
+fn focus_tile(app: &mut App, pane: pane_grid::Pane) {
+    for tiles in app.windows.values_mut() {
+        if tiles.panes.get(pane).is_some() {
+            tiles.focus = pane;
+        }
+    }
 }
 
 /// Put away the context menu, if one is open.
@@ -400,6 +467,78 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
         Action::Layout(layout) => {
             app.config.list.layout = layout;
             app.notice = Some(format!("{} view", layout.name()));
+            Task::none()
+        }
+
+        Action::Split(axis) => {
+            // The new tile gets a buffer of its own on the same directory, so
+            // the two are independent. Pointing a tile at a buffer another
+            // one already shows is the other move, and that is what shares a
+            // listing -- see `Tiles`.
+            let Some(window) = app.windows.values_mut().next() else {
+                return Task::none();
+            };
+            let Some(showing) = window.panes.get(window.focus).copied() else {
+                return Task::none();
+            };
+            let Some(path) = app.buffers.get(showing).map(|found| found.path.clone()) else {
+                return Task::none();
+            };
+
+            let fresh = app.buffers.len();
+            app.buffers.push(Buffer::new(path));
+
+            let Some(window) = app.windows.values_mut().next() else {
+                return Task::none();
+            };
+            let Some((pane, _)) = window.panes.split(axis, window.focus, fresh) else {
+                // `pane_grid` refuses a split it cannot fit. Saying so beats
+                // a keystroke that does nothing.
+                app.buffers.pop();
+                return refuse(app, String::from("no room to split"));
+            };
+            window.focus = pane;
+
+            relist(app, fresh)
+        }
+
+        Action::CloseTile => {
+            let Some(window) = app.windows.values_mut().next() else {
+                return Task::none();
+            };
+
+            // The last tile stays. A window with none in it shows nothing and
+            // gives nobody a way back.
+            if window.panes.len() <= 1 {
+                return refuse(app, String::from("that is the only tile"));
+            }
+
+            if let Some((_, sibling)) = window.panes.close(window.focus) {
+                window.focus = sibling;
+            }
+
+            // The buffer stays open. That is the point of buffers: closing a
+            // tile costs nothing and reopening the directory is instant.
+            Task::none()
+        }
+
+        Action::NextTile | Action::PreviousTile => {
+            let backwards = matches!(action, Action::PreviousTile);
+            let Some(window) = app.windows.values_mut().next() else {
+                return Task::none();
+            };
+
+            let order: Vec<_> = window.panes.iter().map(|(pane, _)| *pane).collect();
+            let Some(at) = order.iter().position(|pane| *pane == window.focus) else {
+                return Task::none();
+            };
+
+            let next = if backwards {
+                (at + order.len() - 1) % order.len()
+            } else {
+                (at + 1) % order.len()
+            };
+            window.focus = order[next];
             Task::none()
         }
 
@@ -672,54 +811,46 @@ fn remember(app: &mut App, path: &Path, mime: Option<&str>, run: &[String]) {
 }
 
 pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
-    let Some(index) = app.windows.get(&window).copied() else {
-        return text("no buffer").into();
-    };
-    let Some(buffer) = app.buffers.get(index) else {
-        return text("no buffer").into();
+    let Some(tiles) = app.windows.get(&window) else {
+        return text("no window").into();
     };
 
-    let list = FileList::new(
-        buffer,
-        &app.config.theme,
-        &app.config.list,
-        app.config.window.font_size,
-        app.icon_font,
-        // Not focused while a dialogue is up: otherwise Escape would close
-        // the dialogue and clear the filter in the same keystroke, and arrows
-        // would move a cursor nobody can see.
-        app.dialogue.is_none(),
-        move |action| Message::List(index, action),
-    );
+    let focused = tiles.buffer();
 
-    let body = container(list).width(Length::Fill).height(Length::Fill);
+    // One tile per pane, each showing whichever buffer it points at. The
+    // divider between two panes is draggable, which `pane_grid` gives free.
+    let grid = pane_grid(&tiles.panes, |pane, index, _maximised| {
+        let Some(buffer) = app.buffers.get(*index) else {
+            return pane_grid::Content::new(text("no buffer"));
+        };
 
-    let mut page = column![path_bar(app, index, buffer)];
-
-    if app.filtering {
-        page = page.push(
-            container(
-                iced::widget::text_input("filter, or :glob", &buffer.filter)
-                    .id(filter_id())
-                    .on_input(move |text| Message::Filter(index, text))
-                    .on_submit(Message::Filtering(false))
-                    .size(14)
-                    .padding(6),
-            )
-            .padding([0, 4]),
-        );
-    }
-
-    let page = page
-        .push(body)
-        .push(status(app, buffer))
-        .width(Length::Fill)
-        .height(Length::Fill);
+        pane_grid::Content::new(tile(app, *index, buffer, pane == tiles.focus))
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .spacing(1)
+    .on_click(Message::TileClicked)
+    .on_drag(Message::TileDragged)
+    .on_resize(6, Message::TileResized)
+    .style(move |_: &iced::Theme| pane_grid::Style {
+        hovered_region: pane_grid::Highlight {
+            background: app.config.theme.accent.color().into(),
+            border: iced::Border::default(),
+        },
+        picked_split: pane_grid::Line {
+            color: app.config.theme.accent.color(),
+            width: 2.0,
+        },
+        hovered_split: pane_grid::Line {
+            color: app.config.theme.accent.color(),
+            width: 2.0,
+        },
+    });
 
     // Places above, jobs below, the tiles in the rest. Fixed furniture: a file
     // manager whose panels move around is one nobody can be shown how to use.
     let page = row![
-        sidebar(app, index),
+        sidebar(app, focused),
         // One pixel of `muted`, full height. A `Space` with no height makes
         // the container collapse to nothing, which is a divider you cannot
         // see -- it was written that way once.
@@ -730,7 +861,7 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
                 background: Some(app.config.theme.muted.color().into()),
                 ..container::Style::default()
             }),
-        page
+        grid,
     ]
     .width(Length::Fill)
     .height(Length::Fill);
@@ -755,6 +886,58 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
     .into()
 }
 
+/// One tile: a path bar, the list, and the counts underneath.
+fn tile<'a>(app: &'a App, index: usize, buffer: &'a Buffer, focused: bool) -> Element<'a, Message> {
+    let list = FileList::new(
+        buffer,
+        &app.config.theme,
+        &app.config.list,
+        app.config.window.font_size,
+        app.icon_font,
+        // Only the focused tile takes the keyboard, and not while a dialogue
+        // is up: otherwise Escape would close the dialogue and clear the
+        // filter in one keystroke, and arrows would move an unseen cursor.
+        focused && app.dialogue.is_none(),
+        move |action| Message::List(index, action),
+    );
+
+    let mut page = column![path_bar(app, index, buffer)];
+
+    if app.filtering && focused {
+        page = page.push(
+            container(
+                iced::widget::text_input("filter, or :glob", &buffer.filter)
+                    .id(filter_id())
+                    .on_input(move |text| Message::Filter(index, text))
+                    .on_submit(Message::Filtering(false))
+                    .size(14)
+                    .padding(6),
+            )
+            .padding([0, 4]),
+        );
+    }
+
+    page = page
+        .push(container(list).width(Length::Fill).height(Length::Fill))
+        .push(status(app, buffer));
+
+    // The focused tile is edged in the accent. With two tiles and no mark,
+    // nothing on screen says which one the keyboard will reach.
+    let accent = app.config.theme.accent.color();
+    let muted = app.config.theme.muted.color();
+
+    container(page.width(Length::Fill).height(Length::Fill))
+        .style(move |_: &iced::Theme| container::Style {
+            border: iced::Border {
+                color: if focused { accent } else { muted },
+                width: if focused { 1.0 } else { 0.0 },
+                ..iced::Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 pub fn theme(app: &App, _window: window::Id) -> iced::Theme {
     // A palette of our own, rather than one of iced's: the config names six
     // semantic colours and every widget here takes them directly.
@@ -773,14 +956,16 @@ pub fn theme(app: &App, _window: window::Id) -> iced::Theme {
 
 pub fn subscription(app: &App) -> iced::Subscription<Message> {
     // Only the buffers on screen are watched. inotify allows 128 instances
-    // here, and a long session opens more directories than that.
-    let watching = app
+    // here, and a long session opens more directories than that. A buffer in
+    // two tiles is watched once, which is what the set is for.
+    let watching: std::collections::HashSet<usize> = app
         .windows
         .values()
-        .collect::<std::collections::HashSet<_>>();
+        .flat_map(|tiles| tiles.panes.iter().map(|(_, index)| *index))
+        .collect();
 
     let watches = watching.into_iter().filter_map(|index| {
-        let buffer = app.buffers.get(*index)?;
+        let buffer = app.buffers.get(index)?;
         if buffer.listing == Listing::Loading {
             // Watching a directory still being read would ask for a relist
             // before the first one had finished.
@@ -793,7 +978,7 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
         // recipe collapse into one stream without it.
         Some(
             crate::watch::directory(buffer.path.clone(), buffer.generation)
-                .with(*index)
+                .with(index)
                 .map(|(index, ())| Message::Changed(index)),
         )
     });
@@ -972,6 +1157,19 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
         Message::Act(Action::ShowHidden(!hidden)),
     ));
 
+    items = items.push(item(
+        String::from("Split right"),
+        Message::Act(Action::Split(pane_grid::Axis::Vertical)),
+    ));
+    items = items.push(item(
+        String::from("Split down"),
+        Message::Act(Action::Split(pane_grid::Axis::Horizontal)),
+    ));
+    items = items.push(item(
+        String::from("Close this tile"),
+        Message::Act(Action::CloseTile),
+    ));
+
     let layout = app.config.list.layout;
     items = items.push(item(
         format!("View: {} \u{2192} {}", layout.name(), layout.next().name()),
@@ -1098,7 +1296,7 @@ fn filter_id() -> iced::widget::Id {
 fn buffer_of(app: &App, window: window::Id) -> Option<&Buffer> {
     app.windows
         .get(&window)
-        .and_then(|index| app.buffers.get(*index))
+        .and_then(|tiles| app.buffers.get(tiles.buffer()))
 }
 
 /// Start reading a buffer's directory again, abandoning whatever was running.
@@ -1440,6 +1638,82 @@ mod tests {
         tell(&mut app, Message::Act(Action::ShowHidden(true)));
         assert_eq!(app.buffers[0].rows(), 2);
         assert_eq!(app.buffers[1].rows(), 2, "the buffer behind too");
+    }
+
+    /// Splitting gives the new tile a buffer of its own, so the two are
+    /// independent. Sharing is what pointing a tile at an existing buffer
+    /// does, and that is a different move.
+    #[test]
+    fn a_split_makes_a_second_buffer_on_the_same_directory() {
+        let mut app = app();
+        app.windows.insert(window::Id::unique(), Tiles::new(0));
+        assert_eq!(app.buffers.len(), 1);
+
+        tell(
+            &mut app,
+            Message::Act(Action::Split(pane_grid::Axis::Vertical)),
+        );
+
+        assert_eq!(app.buffers.len(), 2, "a buffer of its own");
+        assert_eq!(app.buffers[1].path, app.buffers[0].path, "same directory");
+
+        let tiles = app.windows.values().next().expect("one window");
+        assert_eq!(tiles.panes.len(), 2);
+        assert_eq!(tiles.buffer(), 1, "the new tile has the keyboard");
+    }
+
+    /// Closing a tile keeps the buffer. That is what buffers are for: closing
+    /// costs nothing and reopening the directory is instant.
+    #[test]
+    fn closing_a_tile_keeps_its_buffer() {
+        let mut app = app();
+        app.windows.insert(window::Id::unique(), Tiles::new(0));
+        tell(
+            &mut app,
+            Message::Act(Action::Split(pane_grid::Axis::Vertical)),
+        );
+        assert_eq!(app.buffers.len(), 2);
+
+        tell(&mut app, Message::Act(Action::CloseTile));
+
+        let tiles = app.windows.values().next().expect("one window");
+        assert_eq!(tiles.panes.len(), 1, "one tile left");
+        assert_eq!(app.buffers.len(), 2, "both buffers still open");
+    }
+
+    /// The last tile stays. A window with none in it shows nothing and gives
+    /// nobody a way back.
+    #[test]
+    fn the_last_tile_cannot_be_closed() {
+        let mut app = app();
+        app.windows.insert(window::Id::unique(), Tiles::new(0));
+
+        tell(&mut app, Message::Act(Action::CloseTile));
+
+        let tiles = app.windows.values().next().expect("one window");
+        assert_eq!(tiles.panes.len(), 1);
+        assert!(app.notice.is_some(), "and it says why");
+    }
+
+    /// Tab goes round the tiles and comes back, rather than stopping at the
+    /// end and leaving somebody stuck.
+    #[test]
+    fn tab_wraps_round_the_tiles() {
+        let mut app = app();
+        app.windows.insert(window::Id::unique(), Tiles::new(0));
+        tell(
+            &mut app,
+            Message::Act(Action::Split(pane_grid::Axis::Vertical)),
+        );
+
+        let first = app.windows.values().next().expect("one window").focus;
+        tell(&mut app, Message::Act(Action::NextTile));
+        let second = app.windows.values().next().expect("one window").focus;
+        assert_ne!(first, second);
+
+        tell(&mut app, Message::Act(Action::NextTile));
+        let third = app.windows.values().next().expect("one window").focus;
+        assert_eq!(first, third, "round again");
     }
 
     /// A message naming a buffer that is gone must not panic.
