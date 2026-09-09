@@ -1022,6 +1022,29 @@ what the person is looking at.
       uid checked through `SO_PEERCRED` and a mismatch refused. Requests
       invoke actions from M1's registry; that is the whole protocol. Everything
       else in M3 and M4 is a shape on top of this.
+- [ ] **The socket is also the single-instance guard.** One process per
+      display, as many windows as you like. `ricedir /some/path` with one
+      already running hands the path over and exits, and a window opens there
+      -- the way a browser opens a URL in the browser you already have.
+
+      No lock file: the socket is the lock. Starting up is
+      - [ ] try to connect
+      - [ ] connected: send the path, exit 0
+      - [ ] refused: unlink the stale socket, bind, become the instance
+      - [ ] `--separate` to force a second process anyway, for testing
+
+      The race is two starting at once, both failing to connect and both
+      binding. Bind decides it: the loser connects to the winner instead.
+
+      **Why one process and not many.** The socket is one per display and an
+      agent asks it to act on "the selection" -- with two processes there are
+      two answers and no way to say which was meant. `iced::daemon` was chosen
+      in M1 for this: a second window is a second window, not a second
+      program. Copying between windows then works because there is one
+      clipboard and one set of buffers, which two processes would not have.
+
+      Two displays stay separate, which is right: a nested or headless session
+      is a different session, and the rig already relies on that.
 - [ ] **`ricedir --mcp`.** An MCP server over stdio that forwards to the
       socket, so `claude mcp add ricedir -- ricedir --mcp` works and any MCP
       client gets the tool list. It is a translator, not a second
