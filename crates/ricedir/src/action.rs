@@ -84,13 +84,16 @@ pub enum Action {
     Filtering(bool),
     /// Put away whatever is in front. A person only.
     Escape,
-    /// Show the menu for a row, at a point on screen. A person only: a
-    /// pointer is the only thing that has a point.
+    /// Show a menu at a point on screen. A person only: a pointer and a
+    /// button are the only things that have a point.
     Menu {
+        kind: crate::app::MenuKind,
         buffer: usize,
-        row: usize,
         at: (f32, f32),
     },
+    /// Sort by this field, or turn the order round when it is already the one.
+    SortBy(crate::config::Sort),
+    ReverseSort,
     /// Put the path of what is selected on the clipboard.
     ///
     /// The thing people want a path bar for, and a menu is where it lives
@@ -150,6 +153,8 @@ impl Action {
             | Self::Filtering(_)
             | Self::Escape
             | Self::Menu { .. }
+            | Self::SortBy(_)
+            | Self::ReverseSort
             | Self::CopyPath { .. }
             | Self::ShowHidden(_)
             | Self::Layout(_)
@@ -271,10 +276,12 @@ mod tests {
             Action::Filtering(true),
             Action::Escape,
             Action::Menu {
+                kind: crate::app::MenuKind::Context { row: 0 },
                 buffer: 0,
-                row: 0,
                 at: (0.0, 0.0),
             },
+            Action::SortBy(crate::config::Sort::Size),
+            Action::ReverseSort,
             Action::CopyPath { buffer: 0 },
             Action::Bookmark {
                 path: PathBuf::from("/tmp"),

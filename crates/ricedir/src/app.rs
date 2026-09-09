@@ -44,15 +44,25 @@ impl Tiles {
     }
 }
 
-/// A context menu, and where it was asked for.
+/// A menu, and where it was asked for.
 #[derive(Debug, Clone)]
 pub struct Menu {
+    pub kind: MenuKind,
     pub buffer: usize,
-    pub row: usize,
-    /// Window coordinates. The list widget knows where the click landed, so
-    /// nothing has to track the cursor separately -- which is the usual answer
-    /// when iced tells `update` no geometry.
+    /// Window coordinates. The list widget knows where the click landed and a
+    /// toolbar button knows where it is, so nothing has to track the cursor
+    /// separately -- which is the usual answer when iced tells `update` no
+    /// geometry.
     pub at: (f32, f32),
+}
+
+/// Which menu, and so what is in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuKind {
+    /// A right click on a row.
+    Context { row: usize },
+    /// The toolbar's sort button.
+    Sort,
 }
 
 pub struct App {
@@ -80,6 +90,19 @@ pub struct App {
     icon_font: Option<iced::Font>,
     /// The context menu, when one is open.
     menu: Option<Menu>,
+    /// Where the pointer was last seen, in window coordinates.
+    ///
+    /// The list widget is handed the cursor and can say where a right click
+    /// landed, but a toolbar button cannot: iced tells `update` no geometry,
+    /// so a button has no idea where on screen it is. Tracking the pointer is
+    /// the documented answer, and a menu opened from a button belongs under
+    /// the pointer that opened it anyway.
+    pointer: (f32, f32),
+    /// How big the window is now, so a menu can be kept inside it.
+    ///
+    /// `config.window` is the size it *opened* at. Anything that has to fit on
+    /// screen needs the size it is, which only `resize_events` reports.
+    size: iced::Size,
     /// Home, the user directories, the mounts and the bookmarks.
     ///
     /// Read once at startup and after a bookmark is added. A disk appearing is
@@ -117,6 +140,10 @@ pub enum Message {
     TileClicked(pane_grid::Pane),
     TileDragged(pane_grid::DragEvent),
     TileResized(pane_grid::ResizeEvent),
+    /// The pointer moved. Only recorded, never acted on.
+    Pointer(f32, f32),
+    /// The window changed size.
+    Resized(iced::Size),
 }
 
 pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
@@ -128,6 +155,7 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
 
     let notice = config.problem.clone();
     let config_font = config.list.icon_font.clone();
+    let (config_width, config_height) = (config.window.width, config.window.height);
     let mut app = App {
         config,
         buffers: vec![Buffer::new(start.clone())],
@@ -138,6 +166,8 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
         filtering: false,
         icon_font: icon_font(&config_font),
         menu: None,
+        pointer: (0.0, 0.0),
+        size: iced::Size::new(config_width, config_height),
         places: places::list(),
     };
 
@@ -262,6 +292,16 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 
         Message::Dialogue(choice) => chose(app, choice),
 
+        Message::Pointer(x, y) => {
+            app.pointer = (x, y);
+            Task::none()
+        }
+
+        Message::Resized(size) => {
+            app.size = size;
+            Task::none()
+        }
+
         Message::TileClicked(pane) => {
             focus_tile(app, pane);
             Task::none()
@@ -365,11 +405,9 @@ fn translate(buffer: usize, found: list::Action, current: crate::config::Layout)
         list::Action::NextTile => Action::NextTile,
         list::Action::PreviousTile => Action::PreviousTile,
         list::Action::Escape => Action::Escape,
-        // The menu is still to come. The click moves the cursor meanwhile, so
-        // a right click does something rather than nothing.
         list::Action::Menu { row, at } => Action::Menu {
+            kind: MenuKind::Context { row },
             buffer,
-            row,
             at: (at.x, at.y),
         },
     })
@@ -441,17 +479,40 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
 
         Action::Filtering(showing) => Task::done(Message::Filtering(showing)),
 
-        Action::Menu { buffer, row, at } => {
-            // The click already moved the cursor. The menu acts on whatever
-            // is selected, so what it will do is on screen before it opens.
-            with(app, buffer, |found| {
-                if !found.is_selected(row) {
-                    found.select_only(row);
-                } else {
-                    found.move_to(row);
-                }
-            });
-            app.menu = Some(Menu { buffer, row, at });
+        Action::Menu { kind, buffer, at } => {
+            // A right click already moved the cursor. The menu acts on
+            // whatever is selected, so what it will do is on screen before it
+            // opens. A toolbar menu changes no selection at all.
+            if let MenuKind::Context { row } = kind {
+                with(app, buffer, |found| {
+                    if found.is_selected(row) {
+                        found.move_to(row);
+                    } else {
+                        found.select_only(row);
+                    }
+                });
+            }
+
+            app.menu = Some(Menu { kind, buffer, at });
+            Task::none()
+        }
+
+        Action::SortBy(field) => {
+            // Picking the field that is already sorted turns the order round,
+            // which is what a column heading does everywhere else.
+            if app.config.list.sort == field {
+                app.config.list.sort_reversed = !app.config.list.sort_reversed;
+            } else {
+                app.config.list.sort = field;
+                app.config.list.sort_reversed = false;
+            }
+            resort(app);
+            Task::none()
+        }
+
+        Action::ReverseSort => {
+            app.config.list.sort_reversed = !app.config.list.sort_reversed;
+            resort(app);
             Task::none()
         }
 
@@ -716,6 +777,17 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             found.future.clear();
             relist(app, buffer)
         }
+    }
+}
+
+/// Rebuild every buffer after a setting that changes the order.
+///
+/// Every one, not only the focused tile: the sort is a window-wide setting,
+/// and a second tile left in the old order would look like a bug.
+fn resort(app: &mut App) {
+    let list = app.config.list.clone();
+    for buffer in &mut app.buffers {
+        buffer.rebuild(&list);
     }
 }
 
@@ -1044,9 +1116,26 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
         )
     });
 
-    iced::Subscription::batch(
-        watches.chain(std::iter::once(window::close_events().map(Message::Closed))),
-    )
+    // A bare `fn`, not a closure: iced hashes the function to identify the
+    // subscription and rejects one that captures anything.
+    fn moved(
+        event: iced::Event,
+        _status: iced::event::Status,
+        _window: window::Id,
+    ) -> Option<Message> {
+        match event {
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                Some(Message::Pointer(position.x, position.y))
+            }
+            _ => None,
+        }
+    }
+
+    iced::Subscription::batch(watches.chain([
+        window::close_events().map(Message::Closed),
+        window::resize_events().map(|(_, size)| Message::Resized(size)),
+        iced::event::listen_with(moved),
+    ]))
 }
 
 /// Breadcrumbs, and the two arrows.
@@ -1105,7 +1194,155 @@ fn path_bar<'a>(app: &'a App, index: usize, buffer: &'a Buffer) -> Element<'a, M
         crumbs = crumbs.push(quiet(label, Some(Message::Go(index, walked.clone()))));
     }
 
-    container(crumbs).padding([4, 4]).width(Length::Fill).into()
+    // The crumbs take what is left, so the toolbar stays pinned to the right
+    // however long the path is.
+    row![container(crumbs).width(Length::Fill), toolbar(app, index)]
+        .align_y(iced::Alignment::Center)
+        .padding([4, 4])
+        .width(Length::Fill)
+        .into()
+}
+
+/// The buttons at the right of a tile's path bar.
+///
+/// Per tile rather than one bar across the window. A single bar would have to
+/// answer "which tile does this act on", and the honest answer is whichever
+/// has the keyboard -- which is one more thing to know before pressing a
+/// button. Beside the path it is already unambiguous.
+fn toolbar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
+    let list = &app.config.list;
+
+    // Every codepoint checked against the installed font before use, the way
+    // `icon.rs` was built. A guessed one draws an empty box.
+    let layout_glyph = match list.layout {
+        crate::config::Layout::List => '\u{f0c9}',
+        crate::config::Layout::Detail => '\u{f00b}',
+        crate::config::Layout::Icons => '\u{f009}',
+    };
+
+    let sort_glyph = if list.sort_reversed {
+        '\u{f0de}'
+    } else {
+        '\u{f0dd}'
+    };
+
+    let hidden_glyph = if list.show_hidden {
+        '\u{f06e}'
+    } else {
+        '\u{f070}'
+    };
+
+    row![
+        tool(
+            app,
+            layout_glyph,
+            format!(
+                "View: {} \u{2192} {}",
+                list.layout.name(),
+                list.layout.next().name()
+            ),
+            false,
+            Message::Act(Action::Layout(list.layout.next())),
+        ),
+        tool(
+            app,
+            sort_glyph,
+            format!("Sort: {:?}", list.sort),
+            false,
+            // A menu needs a point, and a button knows where it is only
+            // approximately. Pinned under the right-hand end of the bar,
+            // which is where the button is.
+            // Under the pointer that clicked it. A button cannot say where
+            // it is, so the menu goes where the hand already was.
+            Message::Act(Action::Menu {
+                kind: MenuKind::Sort,
+                buffer: index,
+                at: app.pointer,
+            }),
+        ),
+        tool(
+            app,
+            hidden_glyph,
+            String::from("Hidden files"),
+            list.show_hidden,
+            Message::Act(Action::ShowHidden(!list.show_hidden)),
+        ),
+        tool(
+            app,
+            '\u{f021}',
+            String::from("Relist"),
+            false,
+            Message::Act(Action::Relist { buffer: index }),
+        ),
+        tool(
+            app,
+            '\u{f0db}',
+            String::from("Split"),
+            false,
+            Message::Act(Action::Split(pane_grid::Axis::Vertical)),
+        ),
+        tool(
+            app,
+            '\u{f00d}',
+            String::from("Close this tile"),
+            false,
+            Message::Act(Action::CloseTile),
+        ),
+    ]
+    .spacing(2)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+/// One toolbar button: a glyph, and a tooltip saying what it does.
+fn tool<'a>(
+    app: &'a App,
+    glyph: char,
+    says: String,
+    lit: bool,
+    message: Message,
+) -> Element<'a, Message> {
+    use iced::widget::{button, tooltip};
+
+    let theme = &app.config.theme;
+    let dim = theme.dim.color();
+    let accent = theme.accent.color();
+    let muted = theme.muted.color();
+
+    let face = app.icon_font.unwrap_or_default();
+
+    let pressed = button(text(glyph.to_string()).font(face).size(14))
+        .padding([3, 7])
+        .style(move |_: &iced::Theme, status| button::Style {
+            // Lit means the thing is on -- hidden files showing -- which a
+            // toolbar has to say without being asked.
+            background: (lit || matches!(status, button::Status::Hovered))
+                .then(|| if lit { accent.into() } else { muted.into() }),
+            text_color: if lit { theme.background.color() } else { dim },
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..iced::Border::default()
+            },
+            ..button::Style::default()
+        })
+        .on_press(message);
+
+    tooltip(
+        pressed,
+        container(text(says).size(12))
+            .padding([2, 6])
+            .style(move |_: &iced::Theme| container::Style {
+                background: Some(theme.background.color().into()),
+                border: iced::Border {
+                    color: muted,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..container::Style::default()
+            }),
+        tooltip::Position::Bottom,
+    )
+    .into()
 }
 
 fn status<'a>(app: &'a App, buffer: &'a Buffer) -> Element<'a, Message> {
@@ -1156,7 +1393,11 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
     let accent = theme.accent.color();
 
     let buffer = app.buffers.get(menu.buffer);
-    let entry = buffer.and_then(|found| found.at(menu.row));
+    let row = match menu.kind {
+        MenuKind::Context { row } => Some(row),
+        MenuKind::Sort => None,
+    };
+    let entry = row.and_then(|row| buffer.and_then(|found| found.at(row)));
     let directory = entry.filter(|entry| entry.kind.is_directory());
 
     let item = move |label: String, message: Message| {
@@ -1177,75 +1418,88 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
 
     let mut items = column![].width(Length::Fill);
 
-    if entry.is_some() {
+    // The sort menu is a short list of fields. The view-wide switches -- the
+    // layout, hidden files, relist, split, close -- moved to the toolbar,
+    // where a button can also *show* whether a thing is on. A context menu
+    // that carried them made every right click a list of settings rather than
+    // a list of things to do to the file under the pointer.
+    if menu.kind == MenuKind::Sort {
+        use crate::config::Sort;
+
+        for (field, label) in [
+            (Sort::Name, "Name"),
+            (Sort::Size, "Size"),
+            (Sort::Modified, "Modified"),
+            (Sort::Extension, "Type"),
+        ] {
+            let chosen = app.config.list.sort == field;
+            let arrow = if !chosen {
+                ""
+            } else if app.config.list.sort_reversed {
+                " \u{2191}"
+            } else {
+                " \u{2193}"
+            };
+
+            items = items.push(item(
+                format!("{label}{arrow}"),
+                Message::Act(Action::SortBy(field)),
+            ));
+        }
+
         items = items.push(item(
-            String::from("Open"),
-            Message::Act(Action::Activate {
+            String::from("Reverse the order"),
+            Message::Act(Action::ReverseSort),
+        ));
+    } else {
+        if let Some(row) = row
+            && entry.is_some()
+        {
+            items = items.push(item(
+                String::from("Open"),
+                Message::Act(Action::Activate {
+                    buffer: menu.buffer,
+                    row,
+                }),
+            ));
+        }
+
+        items = items.push(item(
+            String::from("Copy path"),
+            Message::Act(Action::CopyPath {
                 buffer: menu.buffer,
-                row: menu.row,
             }),
         ));
+
+        // Only a directory can be a place, and the current one is offered
+        // when the click landed on a file, since that is still useful.
+        let bookmarkable = directory
+            .map(|entry| entry.path.clone())
+            .or_else(|| buffer.map(|found| found.path.clone()));
+
+        if let Some(path) = bookmarkable {
+            let label = match directory {
+                Some(entry) => format!("Add {} to places", entry.name),
+                None => String::from("Add this directory to places"),
+            };
+            items = items.push(item(label, Message::Act(Action::Bookmark { path })));
+        }
     }
 
-    items = items.push(item(
-        String::from("Copy path"),
-        Message::Act(Action::CopyPath {
-            buffer: menu.buffer,
-        }),
-    ));
+    // Kept inside the window. A menu opened near the right edge would
+    // otherwise be clipped, and its longest line would wrap instead of the
+    // menu simply moving left -- which is what a sort menu on the toolbar did,
+    // since the toolbar lives at the right-hand end of the bar.
+    const WIDE: f32 = 230.0;
+    const TALL: f32 = 200.0;
 
-    // Only a directory can be a place, and the current one is offered when
-    // the click landed on a file, since that is still a useful thing to want.
-    let bookmarkable = directory
-        .map(|entry| entry.path.clone())
-        .or_else(|| buffer.map(|found| found.path.clone()));
-
-    if let Some(path) = bookmarkable {
-        let label = match directory {
-            Some(entry) => format!("Add {} to places", entry.name),
-            None => String::from("Add this directory to places"),
-        };
-        items = items.push(item(label, Message::Act(Action::Bookmark { path })));
-    }
-
-    let hidden = app.config.list.show_hidden;
-    items = items.push(item(
-        String::from(if hidden {
-            "Hide hidden files"
-        } else {
-            "Show hidden files"
-        }),
-        Message::Act(Action::ShowHidden(!hidden)),
-    ));
-
-    items = items.push(item(
-        String::from("Split right"),
-        Message::Act(Action::Split(pane_grid::Axis::Vertical)),
-    ));
-    items = items.push(item(
-        String::from("Split down"),
-        Message::Act(Action::Split(pane_grid::Axis::Horizontal)),
-    ));
-    items = items.push(item(
-        String::from("Close this tile"),
-        Message::Act(Action::CloseTile),
-    ));
-
-    let layout = app.config.list.layout;
-    items = items.push(item(
-        format!("View: {} \u{2192} {}", layout.name(), layout.next().name()),
-        Message::Act(Action::Layout(layout.next())),
-    ));
-
-    items = items.push(item(
-        String::from("Relist"),
-        Message::Act(Action::Relist {
-            buffer: menu.buffer,
-        }),
-    ));
+    let at = (
+        menu.at.0.min((app.size.width - WIDE).max(0.0)),
+        menu.at.1.min((app.size.height - TALL).max(0.0)),
+    );
 
     let panel = container(items)
-        .width(Length::Fixed(230.0))
+        .width(Length::Fixed(WIDE))
         .padding(4)
         .style(move |_: &iced::Theme| container::Style {
             background: Some(background.into()),
@@ -1268,7 +1522,7 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
     // A click anywhere else puts the menu away, which is what every menu on
     // every desktop does. The catcher fills the window under the panel.
     mouse_area(
-        container(pin(panel).x(menu.at.0).y(menu.at.1))
+        container(pin(panel).x(at.0).y(at.1))
             .width(Length::Fill)
             .height(Length::Fill),
     )
@@ -1407,6 +1661,8 @@ mod tests {
             filtering: false,
             icon_font: None,
             menu: None,
+            pointer: (0.0, 0.0),
+            size: iced::Size::new(1100.0, 700.0),
             places: Vec::new(),
         }
     }
@@ -1638,8 +1894,8 @@ mod tests {
         tell(
             &mut app,
             Message::Act(Action::Menu {
+                kind: MenuKind::Context { row: 1 },
                 buffer: 0,
-                row: 1,
                 at: (0.0, 0.0),
             }),
         );
@@ -1653,8 +1909,8 @@ mod tests {
     fn any_other_action_closes_the_menu() {
         let mut app = app();
         app.menu = Some(Menu {
+            kind: MenuKind::Context { row: 0 },
             buffer: 0,
-            row: 0,
             at: (0.0, 0.0),
         });
 
@@ -1669,8 +1925,8 @@ mod tests {
         let mut app = app();
         app.filtering = true;
         app.menu = Some(Menu {
+            kind: MenuKind::Context { row: 0 },
             buffer: 0,
-            row: 0,
             at: (0.0, 0.0),
         });
 

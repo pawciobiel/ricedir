@@ -542,16 +542,18 @@ landing before the list widget is even proven.
 - [x] **The context menu.** Right click opens it where the click landed, with
       Open, Copy path, Add to places, Show hidden files and Relist. A click
       anywhere else puts it away, and so does Escape.
-- [ ] **A toolbar.** The path bar has back and forward; everything else is a
-      key or a menu item, which is the wrong way round for a mouse-first
-      program. Small pieces, in the order they are worth having:
-      - [ ] a layout switch: three buttons, or one that cycles
-      - [ ] a sort menu: the field, and which way round
-      - [ ] a hidden-files toggle that shows its state
-      - [ ] a split button, and a close-tile button
-      - [ ] where it lives: one bar across the top, above the tiles, or one
-            per tile beside the path bar. One is less clutter; per tile is
-            honest about which tile a button acts on.
+- [x] **A toolbar**, at the right of each tile's path bar.
+      - [x] a layout switch, whose glyph is the layout it will give you
+      - [x] a sort menu: the field, and which way round
+      - [x] a hidden-files toggle that lights up when they are showing
+      - [x] a relist button
+      - [x] split, and close this tile
+      - [x] per tile rather than one bar across the window. A single bar has
+            to answer "which tile does this act on", and the honest answer --
+            whichever has the keyboard -- is one more thing to know before
+            pressing a button.
+      - [ ] a jobs button, once there are jobs
+
 - [ ] **The menu should differ by where the click landed.** One menu is drawn
       today whatever is under the pointer. Three are wanted:
       - [ ] on an entry: Open, Open with, Copy path, Properties
@@ -970,6 +972,32 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       reports a process that will not *start*; emacs-nox started fine and then
       exited. Watch the child briefly and report a quick non-zero exit, the
       way ricebar reports "printed, then failed".
+
+## M1 stage 3: the toolbar, and where a menu goes
+
+- [x] **The view-wide switches moved out of the context menu.** Layout, hidden
+      files, relist, split and close are on the toolbar now. A right click
+      used to open a list of settings rather than a list of things to do to
+      the file under the pointer, and a button can also *show* whether a thing
+      is on, which a menu item cannot.
+
+- [x] **A button does not know where it is.** iced tells `update` no geometry,
+      so a menu opened from the toolbar had nowhere to go and appeared in the
+      top-left corner. The pointer is tracked with `event::listen_with` -- the
+      documented answer -- and a menu from a button opens under the hand that
+      opened it. The `fn` handed to `listen_with` must not capture, so it is a
+      bare function.
+
+- [x] **A menu is clamped to the window.** The toolbar is at the right-hand
+      end of the bar, so its menu ran off the edge and wrapped its longest
+      line instead of simply moving left. `config.window` is the size the
+      window *opened* at; `window::resize_events` is the only thing that says
+      what it is now.
+
+- [x] **Two instances on one display paint nothing.** A blank screenshot
+      during this work turned out to be two ricedirs fighting over the same
+      Wayland display, not a rendering fault -- which is the single-instance
+      guard in `## M3` arriving as a real symptom rather than a nicety.
 
 ## M2 — the job engine
 
