@@ -1,0 +1,15 @@
+# A testing tool, not part of ricedir: its own package, built on demand by
+# dev/pointer.sh. The empty `[workspace]` keeps it out of the crate above it.
+[workspace]
+
+[package]
+name = "vpointer"
+version = "0.1.0"
+# 2024, like the crates above it, so `cargo fmt --check` agrees with the file
+# as written. vkeyboard is still on 2021 and does not.
+edition = "2024"
+publish = false
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }

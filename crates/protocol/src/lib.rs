@@ -42,7 +42,7 @@ pub enum Kind {
 /// Deliberately not an open-ended command string. Each request is a named
 /// thing with typed arguments, so a window can refuse one it does not know
 /// rather than guessing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request", rename_all = "kebab-case")]
 pub enum Request {
     /// What this connection may do, and which version is spoken.
@@ -95,7 +95,7 @@ impl Request {
     ///
     /// A `match` with no wildcard arm, so a new request cannot be added
     /// without somebody deciding what kind it is.
-    pub fn kind(&self) -> Kind {
+    pub const fn kind(&self) -> Kind {
         match self {
             Self::Hello { .. }
             | Self::ListDir { .. }
@@ -110,7 +110,7 @@ impl Request {
     }
 
     /// The name an MCP tool list shows.
-    pub fn name(&self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::Hello { .. } => "hello",
             Self::ListDir { .. } => "list_dir",
@@ -129,7 +129,7 @@ impl Request {
 }
 
 /// One entry, as an agent sees it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub name: String,
     pub path: PathBuf,
@@ -139,7 +139,7 @@ pub struct Entry {
 }
 
 /// One open directory, as an agent sees it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Buffer {
     pub index: usize,
     pub path: PathBuf,
@@ -149,7 +149,7 @@ pub struct Buffer {
 }
 
 /// What ricedir says back.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "response", rename_all = "kebab-case")]
 pub enum Response {
     Hello {

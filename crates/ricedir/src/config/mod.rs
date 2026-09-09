@@ -104,7 +104,7 @@ impl Patterns {
         self.0.iter()
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
@@ -322,7 +322,7 @@ pub enum Layout {
 
 impl Layout {
     /// The next one, for a key or a button that cycles them.
-    pub fn next(self) -> Self {
+    pub const fn next(self) -> Self {
         match self {
             Self::List => Self::Detail,
             Self::Detail => Self::Icons,
@@ -330,11 +330,39 @@ impl Layout {
         }
     }
 
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::List => "list",
             Self::Detail => "detail",
             Self::Icons => "icons",
+        }
+    }
+}
+
+/// The parts of a listing's appearance that belong to one buffer.
+///
+/// The config says what a *new* buffer starts as; after that each one keeps
+/// its own. Two tiles side by side wanting different views is the ordinary
+/// case -- a wide detail listing beside a grid of pictures, or a `.config`
+/// opened with its dotfiles showing while the other tile stays tidy -- and a
+/// switch that changed both at once made the second tile useless for the
+/// thing it was opened for.
+///
+/// Gathered into one struct so a buffer takes them in a single argument, and
+/// so adding the next one is a field rather than another parameter at every
+/// call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct View {
+    pub layout: Layout,
+    pub show_hidden: bool,
+}
+
+impl List {
+    /// What a buffer opened from this config starts as.
+    pub const fn view(&self) -> View {
+        View {
+            layout: self.layout,
+            show_hidden: self.show_hidden,
         }
     }
 }
@@ -552,10 +580,11 @@ impl std::fmt::Display for Quoted<'_> {
 fn trustworthy(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
-    let writable_by_others = |path: &Path| match std::fs::metadata(path) {
-        // 0o022 is the group-write and other-write bits.
-        Ok(metadata) => metadata.permissions().mode() & 0o022 != 0,
-        Err(_) => false,
+    // 0o022 is the group-write and other-write bits. A path that cannot be
+    // read at all is not "writable by others" -- whatever goes wrong next
+    // will say so with a better message than a trust refusal would.
+    let writable_by_others = |path: &Path| {
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o022 != 0)
     };
 
     if writable_by_others(path) {
@@ -644,8 +673,8 @@ mod tests {
         );
     }
 
-    /// Keys are kebab-case in the file and snake_case in Rust; nothing checks
-    /// that mapping except a test that reads one.
+    /// Keys are kebab-case in the file and `snake_case` in Rust; nothing
+    /// checks that mapping except a test that reads one.
     #[test]
     fn reads_kebab_case_keys() {
         let config = parse_text("[list]\nshow-hidden = true\ndirectories-first = false\n")

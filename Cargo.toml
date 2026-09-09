@@ -31,3 +31,80 @@ publish = false
 ricedir-protocol = { path = "crates/protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# `pedantic` and `nursery` are on, and the exceptions below are argued rather
+# than assumed. Each crate opts in with `[lints] workspace = true`.
+#
+# The point of turning them on is the lints that find real things -- a
+# `Result` that is always `Ok`, a clone nobody needed, an `async fn` with
+# nothing to await. The cost is a handful that are wrong for this program, and
+# those are named here once instead of being sprinkled through the code as
+# `#[allow]`.
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+# The list widget turns pixels into row indices about thirty times. Every one
+# of those is a deliberate floor of a value that cannot be negative, and
+# float-to-integer casts saturate rather than wrap, so the failure the lint
+# warns about cannot happen here. Marking each site would bury the arithmetic
+# the widget exists for.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+
+# `update` and `view` are one `match` over every message and every widget.
+# Cutting them into pieces to satisfy a line count would scatter the loop that
+# is easiest to read in one place.
+too_many_lines = "allow"
+
+# Arms are kept apart when they carry different reasons, and the comment above
+# each one is the reason. Merging them to save a line deletes the explanation:
+# `Bookmark` is `Kind::View` for a quite different reason from `Select`.
+match_same_arms = "allow"
+
+# An item declared next to the comment that explains it beats the same item at
+# the top of the function with the explanation left behind.
+items_after_statements = "allow"
+
+# Both rewrite a readable `match` into a less readable combinator. `map_or`
+# with a tuple default, or a closure that only exists to hold a default, is
+# not an improvement over saying `Some` and `None`.
+option_if_let_else = "allow"
+single_match_else = "allow"
+
+# Exact comparison is what is wanted: "did the clamped scroll offset actually
+# change" is a redraw guard, and a test comparing a parsed default against the
+# default means exactly equal.
+float_cmp = "allow"
+
+# `a.mul_add(b, c)` is faster and more accurate, and unreadable in layout
+# arithmetic where the shape of the expression is the documentation.
+suboptimal_flops = "allow"
+
+# `|found| found.is_dir()` reads better than `std::fs::Metadata::is_dir`.
+redundant_closure_for_method_calls = "allow"
+
+# Inside a private module the two are the same thing, and `pub(crate)` says
+# which one was meant.
+redundant_pub_crate = "allow"
+
+# ricedir is a binary. Nobody downstream is calling these, so a `#[must_use]`
+# on each and an `# Errors` section per `Result` is paperwork for an audience
+# of one.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+
+# `config::List` is a list of independent switches. Grouping them into an
+# enum would make the config file worse to write, which is the thing that
+# matters about it.
+struct_excessive_bools = "allow"
+
+# iced fixes the signature of a `listen_with` handler, so the event arrives by
+# value whether or not this one consumes it.
+needless_pass_by_value = "allow"
+
+# `{path}` is ricedir's own placeholder in the handler table, not a format
+# argument.
+literal_string_with_formatting_args = "allow"

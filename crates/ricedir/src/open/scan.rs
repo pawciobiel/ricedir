@@ -30,7 +30,7 @@ pub struct Report {
 }
 
 impl Report {
-    pub fn allowed() -> Self {
+    pub const fn allowed() -> Self {
         Self {
             verdict: Verdict::Allow,
             rule: None,

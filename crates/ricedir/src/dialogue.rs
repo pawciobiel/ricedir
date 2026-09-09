@@ -55,7 +55,7 @@ pub enum Choice {
 }
 
 impl Dialogue {
-    fn path(&self) -> &PathBuf {
+    const fn path(&self) -> &PathBuf {
         match self {
             Self::NoHandler { path, .. }
             | Self::Warned { path, .. }

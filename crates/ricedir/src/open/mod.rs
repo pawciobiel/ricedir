@@ -253,7 +253,11 @@ fn flatpak_installed(id: &str) -> bool {
 /// on one would hold the window for as long as somebody watched a film.
 /// stderr is piped so a handler that fails immediately can say why in the
 /// notice line rather than into a terminal nobody is looking at.
-pub async fn spawn(plan: &Plan) -> Result<(), String> {
+///
+/// Not `async`: there is nothing to wait for. It still has to be called from
+/// inside the tokio runtime, because `tokio::process::Command` registers the
+/// child with the reactor.
+pub fn spawn(plan: &Plan) -> Result<(), String> {
     let Plan::Run {
         name,
         program,
@@ -300,17 +304,19 @@ mod tests {
     }
 
     fn handler(mime: Option<&str>, glob: Option<&str>, run: &[&str]) -> Handler {
+        use std::fmt::Write;
+
         // Built through the parser, so the tests exercise the same
         // scalar-or-array deserialiser a real config goes through.
         let mut text = String::from("[[handler]]\n");
         if let Some(mime) = mime {
-            text.push_str(&format!("mime = \"{mime}\"\n"));
+            let _ = writeln!(text, "mime = \"{mime}\"");
         }
         if let Some(glob) = glob {
-            text.push_str(&format!("glob = \"{glob}\"\n"));
+            let _ = writeln!(text, "glob = \"{glob}\"");
         }
         let quoted: Vec<String> = run.iter().map(|text| format!("\"{text}\"")).collect();
-        text.push_str(&format!("run = [{}]\n", quoted.join(", ")));
+        let _ = writeln!(text, "run = [{}]", quoted.join(", "));
 
         let raw: crate::config::Raw = toml::from_str(&text).expect("test handler should parse");
         raw.handler.into_iter().next().expect("one handler")

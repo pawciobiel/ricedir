@@ -1,4 +1,31 @@
-/target
+# Unanchored, so the dev tools under dev/ are covered too. `/target` matched
+# only the workspace's own, and dev/vkeyboard/target went in with 231 build
+# artefacts before anyone noticed. Those embed the build path, so they leak a
+# home directory name as well as being junk.
+target/
 
-# Never commit an API key.
+# Never commit a credential. None of these belong in a file manager, and the
+# list is here so an accident is caught by the tool rather than by a reader.
 *.token
+*.key
+*.pem
+*.p12
+*.pfx
+.env
+.env.*
+.envrc
+secrets.*
+*_history
+
+# Screenshots and recordings from the rig. `dev/rig.sh` writes to /tmp, but a
+# `grim` run from the repository root lands here.
+*.png
+*.ppm
+*.gif
+*.mp4
+shot*.png
+
+# Editor and OS leavings.
+*.swp
+*~
+.DS_Store

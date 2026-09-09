@@ -82,6 +82,14 @@ pub enum Action {
     },
     /// Show or hide the filter box. A person only: an agent filters by text.
     Filtering(bool),
+    /// Turn the path bar over to its text face, or back to its breadcrumbs.
+    ///
+    /// A person only. An agent already names a path in `Go` and has nothing
+    /// to gain from a text box being on screen.
+    TypingPath {
+        buffer: usize,
+        typing: bool,
+    },
     /// Put away whatever is in front. A person only.
     Escape,
     /// Show a menu at a point on screen. A person only: a pointer and a
@@ -102,13 +110,63 @@ pub enum Action {
         buffer: usize,
     },
     /// Add a directory to the favourite places.
+    ///
+    /// `path` names a subdirectory the menu was opened over; `None` means the
+    /// directory the buffer is showing, which is what Ctrl+D asks for and
+    /// what a browser's star does. One action rather than two, because the
+    /// only difference between them is which path.
     Bookmark {
+        buffer: usize,
+        path: Option<PathBuf>,
+    },
+    /// Take one back out again.
+    ///
+    /// Built at the same time as the menu it lives in. Adding without
+    /// removing makes every mistake permanent, which is worse than not
+    /// offering the button.
+    Unbookmark {
         path: PathBuf,
     },
-    /// Show or hide the files whose names start with a dot.
-    ShowHidden(bool),
-    /// Arrange the entries a different way.
-    Layout(crate::config::Layout),
+    /// Split the focused tile and show a directory in the new half.
+    ///
+    /// Not `Split` followed by `Go`: the two would be separate actions, and
+    /// the second would have to name a buffer that the first has only just
+    /// created.
+    OpenBeside {
+        path: PathBuf,
+    },
+    /// Show or hide the files whose names start with a dot, in one buffer.
+    ///
+    /// Per buffer for the same reason as [`Action::Layout`]: a tile opened on
+    /// a `.config` is no reason for the tile beside it to fill up with `.git`
+    /// and `.cache`.
+    ShowHidden {
+        buffer: usize,
+        showing: bool,
+    },
+    /// Arrange one buffer's entries a different way.
+    ///
+    /// One buffer, not the window: two tiles wanting different views is the
+    /// ordinary case, and a switch that changed both made the second useless.
+    Layout {
+        buffer: usize,
+        layout: crate::config::Layout,
+    },
+    /// Point the focused tile at a buffer that is already open.
+    ///
+    /// The other half of the emacs model. Splitting gives the new tile a
+    /// buffer of its own, which is what a file manager usually wants; this is
+    /// how two tiles come to *share* one listing and one watcher.
+    ShowBuffer {
+        buffer: usize,
+    },
+    /// Forget a buffer no tile is showing.
+    ///
+    /// A long session opens directories and closes tiles, and without this
+    /// the list grows for as long as the window is open.
+    CloseBuffer {
+        buffer: usize,
+    },
     /// Split the focused tile in two.
     Split(Axis),
     /// Close the focused tile. The buffer it showed stays open.
@@ -135,7 +193,7 @@ impl Action {
     ///
     /// The kinds are defined once in `ricedir-protocol` and read here, so the
     /// window and the wire cannot disagree about which requests need a person.
-    pub fn kind(&self) -> Kind {
+    pub const fn kind(&self) -> Kind {
         match self {
             Self::Selection | Self::Buffers | Self::Cursor => Kind::Session,
 
@@ -151,23 +209,27 @@ impl Action {
             | Self::Leave { .. }
             | Self::Filter { .. }
             | Self::Filtering(_)
+            | Self::TypingPath { .. }
             | Self::Escape
             | Self::Menu { .. }
             | Self::SortBy(_)
             | Self::ReverseSort
             | Self::CopyPath { .. }
-            | Self::ShowHidden(_)
-            | Self::Layout(_)
+            | Self::ShowHidden { .. }
+            | Self::Layout { .. }
             | Self::Split(_)
             | Self::CloseTile
             | Self::NextTile
             | Self::PreviousTile
+            | Self::OpenBeside { .. }
+            | Self::ShowBuffer { .. }
+            | Self::CloseBuffer { .. }
             | Self::Relist { .. } => Kind::View,
 
             // A bookmark writes a file, but ricedir's own, not one of the
             // person's. Nothing in the plan mechanism is about protecting
             // ricedir from itself, so it acts at once like any other view.
-            Self::Bookmark { .. } => Kind::View,
+            Self::Bookmark { .. } | Self::Unbookmark { .. } => Kind::View,
 
             // Opening runs a program. It is not a file *write*, so it is not
             // `Kind::File`, but it is the one view-shaped action with a scan
@@ -274,9 +336,18 @@ mod tests {
                 text: String::new(),
             },
             Action::Filtering(true),
+            Action::TypingPath {
+                buffer: 0,
+                typing: true,
+            },
             Action::Escape,
             Action::Menu {
-                kind: crate::app::MenuKind::Context { row: 0 },
+                kind: crate::app::MenuKind::Context { row: Some(0) },
+                buffer: 0,
+                at: (0.0, 0.0),
+            },
+            Action::Menu {
+                kind: crate::app::MenuKind::Place { index: 0 },
                 buffer: 0,
                 at: (0.0, 0.0),
             },
@@ -284,10 +355,29 @@ mod tests {
             Action::ReverseSort,
             Action::CopyPath { buffer: 0 },
             Action::Bookmark {
+                buffer: 0,
+                path: Some(PathBuf::from("/tmp")),
+            },
+            Action::Bookmark {
+                buffer: 0,
+                path: None,
+            },
+            Action::Unbookmark {
                 path: PathBuf::from("/tmp"),
             },
-            Action::ShowHidden(true),
-            Action::Layout(crate::config::Layout::Icons),
+            Action::OpenBeside {
+                path: PathBuf::from("/tmp"),
+            },
+            Action::ShowHidden {
+                buffer: 0,
+                showing: true,
+            },
+            Action::Layout {
+                buffer: 0,
+                layout: crate::config::Layout::Icons,
+            },
+            Action::ShowBuffer { buffer: 0 },
+            Action::CloseBuffer { buffer: 0 },
             Action::Split(Axis::Vertical),
             Action::CloseTile,
             Action::NextTile,

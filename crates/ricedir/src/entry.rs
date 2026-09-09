@@ -26,7 +26,7 @@ pub enum Kind {
 
 impl Kind {
     /// Whether entering this should list a directory.
-    pub fn is_directory(self) -> bool {
+    pub const fn is_directory(self) -> bool {
         matches!(
             self,
             Self::Directory

@@ -36,12 +36,12 @@ const SETTLE: Duration = Duration::from_millis(120);
 /// first listing. With two tiles on one directory each one's read wakes the
 /// other's watch, and they feed each other forever -- which is what the
 /// flickering after a split was, measured at 33 events in four seconds.
-fn changes_a_listing(kind: &notify::EventKind) -> bool {
+fn changes_a_listing(kind: notify::EventKind) -> bool {
     use notify::EventKind;
 
     !matches!(kind, EventKind::Access(_))
         && !matches!(kind, EventKind::Other)
-        && kind != &EventKind::Any
+        && kind != EventKind::Any
 }
 
 /// Watch one directory, and say when it has settled after a change.
@@ -64,7 +64,7 @@ pub fn directory(path: PathBuf, generation: u64) -> Subscription<()> {
                 notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                     let Ok(event) = event else { return };
 
-                    if !changes_a_listing(&event.kind) {
+                    if !changes_a_listing(event.kind) {
                         return;
                     }
 

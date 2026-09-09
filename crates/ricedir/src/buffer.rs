@@ -49,9 +49,9 @@ pub struct Buffer {
     entries: Vec<Entry>,
     /// Indices into `entries` that the filter lets through, in shown order.
     /// The list widget draws this, so a filter never disturbs a selection.
-    view: Vec<usize>,
+    visible: Vec<usize>,
 
-    /// Where the keyboard cursor is, as a position in `view`.
+    /// Where the keyboard cursor is, as a position in `visible`.
     pub cursor: usize,
     /// Whether anyone has actually put the cursor somewhere.
     ///
@@ -61,13 +61,18 @@ pub struct Buffer {
     /// as the rest came in -- which is how a directory of 100k files opened
     /// with the cursor on `file17`.
     placed: bool,
-    /// Where a shift-extended selection started, as a position in `view`.
+    /// Where a shift-extended selection started, as a position in `visible`.
     pub anchor: usize,
     /// Selected entries, by index into `entries`.
     pub selection: HashSet<usize>,
 
     /// What the filter box says. Empty means everything.
     pub filter: String,
+
+    /// How this directory is arranged, and whether the dotfiles show.
+    ///
+    /// Per buffer, not per window: see [`crate::config::View`].
+    pub view: crate::config::View,
 
     /// Directories already visited, for back and forward.
     pub history: Vec<PathBuf>,
@@ -83,12 +88,15 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn new(path: PathBuf) -> Self {
+    /// A fresh buffer. `view` comes from the config, or from the tile that
+    /// split to make this one.
+    pub fn new(path: PathBuf, view: crate::config::View) -> Self {
         Self {
             path,
+            view,
             listing: Listing::Loading,
             entries: Vec::new(),
-            view: Vec::new(),
+            visible: Vec::new(),
             cursor: 0,
             placed: false,
             anchor: 0,
@@ -103,22 +111,22 @@ impl Buffer {
 
     /// The entries the list should draw, in order.
     pub fn shown(&self) -> impl ExactSizeIterator<Item = &Entry> {
-        self.view.iter().map(|index| &self.entries[*index])
+        self.visible.iter().map(|index| &self.entries[*index])
     }
 
     /// How many rows the list has.
-    pub fn rows(&self) -> usize {
-        self.view.len()
+    pub const fn rows(&self) -> usize {
+        self.visible.len()
     }
 
     /// The entry at a row, if there is one.
     pub fn at(&self, row: usize) -> Option<&Entry> {
-        self.view.get(row).map(|index| &self.entries[*index])
+        self.visible.get(row).map(|index| &self.entries[*index])
     }
 
     /// Whether the entry at a row is selected.
     pub fn is_selected(&self, row: usize) -> bool {
-        self.view
+        self.visible
             .get(row)
             .is_some_and(|index| self.selection.contains(index))
     }
@@ -153,7 +161,7 @@ impl Buffer {
     pub fn fail(&mut self, problem: String) {
         self.listing = Listing::Failed(problem);
         self.entries.clear();
-        self.view.clear();
+        self.visible.clear();
         self.cursor = 0;
         self.anchor = 0;
     }
@@ -180,11 +188,11 @@ impl Buffer {
 
         let filter = Filter::new(&self.filter);
 
-        self.view = self
+        self.visible = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| list.show_hidden || !entry.hidden)
+            .filter(|(_, entry)| self.view.show_hidden || !entry.hidden)
             .filter(|(_, entry)| filter.admits(&entry.name))
             .map(|(index, _)| index)
             .collect();
@@ -199,7 +207,7 @@ impl Buffer {
 
         self.cursor = if self.placed {
             on.and_then(|name| {
-                self.view
+                self.visible
                     .iter()
                     .position(|index| self.entries[*index].name == name)
             })
@@ -217,7 +225,7 @@ impl Buffer {
     /// directory should stop there, not reappear at the top.
     pub fn move_cursor(&mut self, by: isize) {
         self.placed = true;
-        if self.view.is_empty() {
+        if self.visible.is_empty() {
             self.cursor = 0;
             return;
         }
@@ -235,7 +243,7 @@ impl Buffer {
     pub fn select_only(&mut self, row: usize) {
         self.placed = true;
         self.selection.clear();
-        if let Some(index) = self.view.get(row) {
+        if let Some(index) = self.visible.get(row) {
             self.selection.insert(*index);
         }
         self.cursor = row.min(self.rows().saturating_sub(1));
@@ -245,7 +253,7 @@ impl Buffer {
     /// Add or remove one row from the selection.
     pub fn toggle(&mut self, row: usize) {
         self.placed = true;
-        if let Some(index) = self.view.get(row).copied()
+        if let Some(index) = self.visible.get(row).copied()
             && !self.selection.remove(&index)
         {
             self.selection.insert(index);
@@ -257,7 +265,7 @@ impl Buffer {
     /// Select every row between the anchor and this one.
     pub fn extend_to(&mut self, row: usize) {
         self.placed = true;
-        if self.view.is_empty() {
+        if self.visible.is_empty() {
             self.cursor = 0;
             return;
         }
@@ -271,18 +279,18 @@ impl Buffer {
             (row, anchor)
         };
 
-        self.selection = self.view[from..=to].iter().copied().collect();
+        self.selection = self.visible[from..=to].iter().copied().collect();
         self.cursor = row;
     }
 
     pub fn select_all(&mut self) {
-        self.selection = self.view.iter().copied().collect();
+        self.selection = self.visible.iter().copied().collect();
     }
 
     /// Select what is not selected.
     pub fn invert(&mut self) {
         self.selection = self
-            .view
+            .visible
             .iter()
             .copied()
             .filter(|index| !self.selection.contains(index))
@@ -306,13 +314,14 @@ impl Buffer {
             self.selection.clear();
         }
 
-        let last = self.view.len();
+        let last = self.visible.len();
 
         match columns {
             None => {
                 let from = rows.start.min(last);
                 let to = rows.end.min(last);
-                self.selection.extend(self.view[from..to].iter().copied());
+                self.selection
+                    .extend(self.visible[from..to].iter().copied());
             }
             Some(columns) => {
                 for line in rows.clone() {
@@ -326,7 +335,7 @@ impl Buffer {
                         else {
                             continue;
                         };
-                        if let Some(index) = self.view.get(at) {
+                        if let Some(index) = self.visible.get(at) {
                             self.selection.insert(*index);
                         }
                     }
@@ -337,7 +346,7 @@ impl Buffer {
 
     /// The selected entries, in the order they are shown.
     pub fn selected(&self) -> impl Iterator<Item = &Entry> {
-        self.view
+        self.visible
             .iter()
             .filter(|index| self.selection.contains(index))
             .map(|index| &self.entries[*index])
@@ -468,7 +477,7 @@ mod tests {
     }
 
     fn buffer(names: &[&str]) -> Buffer {
-        let mut buffer = Buffer::new(PathBuf::from("/tmp"));
+        let mut buffer = Buffer::new(PathBuf::from("/tmp"), List::default().view());
         buffer.extend(
             names.iter().map(|name| entry(name)).collect(),
             &List::default(),
@@ -477,18 +486,17 @@ mod tests {
         buffer
     }
 
-    /// Hidden files are filtered out of the view but stay in `entries`, so
-    /// toggling the setting does not need another listing.
+    /// Hidden files leave the visible rows but stay in `entries`, so turning
+    /// them on does not need another listing.
     #[test]
-    fn hidden_entries_leave_the_view_but_not_the_buffer() {
+    fn hidden_entries_leave_the_rows_but_not_the_buffer() {
         let mut buffer = buffer(&["visible", ".hidden"]);
         assert_eq!(buffer.rows(), 1);
 
-        let showing = List {
-            show_hidden: true,
-            ..List::default()
-        };
-        buffer.rebuild(&showing);
+        // The buffer's own flag, not the config's: the config only says what
+        // a buffer starts as.
+        buffer.view.show_hidden = true;
+        buffer.rebuild(&List::default());
         assert_eq!(buffer.rows(), 2);
     }
 
@@ -523,7 +531,7 @@ mod tests {
     #[test]
     fn an_untouched_cursor_stays_at_the_top_while_chunks_arrive() {
         let list = List::default();
-        let mut buffer = Buffer::new(PathBuf::from("/tmp"));
+        let mut buffer = Buffer::new(PathBuf::from("/tmp"), List::default().view());
 
         buffer.extend(vec![entry("m"), entry("n")], &list);
         assert_eq!(buffer.cursor, 0);

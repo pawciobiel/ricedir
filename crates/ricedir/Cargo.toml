@@ -36,3 +36,7 @@ toml = "1"
 # work is blocking I/O and belongs on plain threads, and a tokio channel is
 # what carries results back into a subscription.
 tokio = { version = "1", features = ["io-util", "process", "sync", "time"] }
+
+# Pedantic and nursery, with the exceptions argued in the workspace file.
+[lints]
+workspace = true

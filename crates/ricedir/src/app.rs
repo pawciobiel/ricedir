@@ -59,8 +59,18 @@ pub struct Menu {
 /// Which menu, and so what is in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuKind {
-    /// A right click on a row.
-    Context { row: usize },
+    /// A right click on a row, or past the last one.
+    ///
+    /// Empty space is not "no menu": paste, a new folder and the hidden-files
+    /// switch are about the directory, and empty space is where people look
+    /// for them. Offering the file items there instead, greyed out or acting
+    /// on whatever happened to be selected, is the thing that makes a context
+    /// menu untrustworthy.
+    Context { row: Option<usize> },
+    /// A right click on one of the places in the sidebar.
+    Place { index: usize },
+    /// Every open directory, to point this tile at one of them.
+    Buffers,
     /// The toolbar's sort button.
     Sort,
     /// The toolbar's last button: everything the other buttons do, in words.
@@ -73,6 +83,12 @@ pub enum MenuKind {
 /// which way round they go, because the names are `split-horizontal` and
 /// `split-vertical` and neither says whether that is the divider or the
 /// direction the panes sit in.
+/// How wide the places and jobs panel is.
+///
+/// Named because the menus need it too: anything opened for a tile has to
+/// start to the right of this or it covers the panel it is not about.
+const SIDEBAR: f32 = 180.0;
+
 const SPLIT_RIGHT: char = '\u{eb56}';
 const SPLIT_DOWN: char = '\u{eb57}';
 
@@ -94,6 +110,13 @@ pub struct App {
     /// Whether the filter box is on screen. Hidden until asked for, because a
     /// box that is always there is a box that is always in the way.
     filtering: bool,
+    /// The path being typed, when the path bar is showing its text face.
+    ///
+    /// The draft rather than the buffer's path: what is typed has to survive
+    /// being wrong -- a half-finished path names nothing, and replacing the
+    /// buffer's own path with it would relist on every keystroke. It belongs
+    /// to the focused tile, the way the filter box does.
+    typing_path: Option<String>,
     /// The face the glyphs come from, resolved once at startup.
     ///
     /// `Font::with_name` wants a `&'static str` and the family comes from a
@@ -138,6 +161,17 @@ pub enum Message {
     Filter(usize, String),
     /// Show or hide the filter box.
     Filtering(bool),
+    /// The path bar's text face: what has been typed, and going there or back.
+    PathTyped(String),
+    TypingPath(usize, bool),
+    /// The typed path was submitted.
+    PathSubmitted(usize),
+    /// Escape, from the subscription rather than the list. Only the path
+    /// bar's text face uses it; everything else Escape does still comes
+    /// through the list widget.
+    EscapedPath,
+    /// Tab, likewise: complete the path being typed.
+    CompletePath,
     /// A breadcrumb, or back, forward, up.
     Go(usize, PathBuf),
     Back(usize),
@@ -167,15 +201,17 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
     let notice = config.problem.clone();
     let config_font = config.list.icon_font.clone();
     let (config_width, config_height) = (config.window.width, config.window.height);
+    let config_view = config.list.view();
     let mut app = App {
         config,
-        buffers: vec![Buffer::new(start.clone())],
+        buffers: vec![Buffer::new(start, config_view)],
         windows: HashMap::new(),
         notice,
         dialogue: None,
         typed: String::new(),
         filtering: false,
-        icon_font: icon_font(&config_font),
+        typing_path: None,
+        icon_font: config_font.as_deref().map(icon_font),
         menu: None,
         pointer: (0.0, 0.0),
         size: iced::Size::new(config_width, config_height),
@@ -244,10 +280,12 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             // moving a cursor in the other.
             focus_showing(app, index);
 
-            let Some(action) = translate(index, found, app.config.list.layout) else {
-                return Task::none();
-            };
-            action::dispatch(app, action)
+            let showing = app
+                .buffers
+                .get(index)
+                .map_or(app.config.list.layout, |found| found.view.layout);
+
+            action::dispatch(app, translate(index, found, showing, app.pointer))
         }
 
         Message::Act(action) => action::dispatch(app, action),
@@ -369,6 +407,75 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
 
+        Message::TypingPath(index, typing) => {
+            if !typing {
+                app.typing_path = None;
+                return Task::none();
+            }
+
+            // Starts as the path it is showing, so the common thing -- take a
+            // piece of this path -- needs no typing at all.
+            let Some(buffer) = app.buffers.get(index) else {
+                return Task::none();
+            };
+            app.typing_path = Some(buffer.path.to_string_lossy().into_owned());
+
+            // Focused *and* selected: turning the bar over to copy half a
+            // path should not need a drag from one end first.
+            iced::widget::operation::focus(path_id())
+                .chain(iced::widget::operation::select_all(path_id()))
+        }
+
+        Message::PathTyped(text) => {
+            app.typing_path = Some(text);
+            Task::none()
+        }
+
+        Message::EscapedPath => {
+            // Only this. Every other thing Escape puts away still comes
+            // through the list widget's own `Action::Escape`.
+            app.typing_path = None;
+            Task::none()
+        }
+
+        Message::CompletePath => {
+            let Some(typed) = &app.typing_path else {
+                return Task::none();
+            };
+            let Some(longer) = complete(typed) else {
+                return Task::none();
+            };
+
+            app.typing_path = Some(longer);
+            // The caret goes to the end, or the next keystroke lands in the
+            // middle of what was just filled in.
+            iced::widget::operation::move_cursor_to_end(path_id())
+        }
+
+        Message::PathSubmitted(index) => {
+            let Some(text) = app.typing_path.take() else {
+                return Task::none();
+            };
+
+            let path = expand(&text);
+
+            // A path that is not a directory says so and stays on screen with
+            // what was typed still in it. Going nowhere and clearing the box
+            // would look like the keystroke was lost.
+            if !path.is_dir() {
+                app.typing_path = Some(text);
+                return refuse(app, format!("{} is not a directory", path.display()));
+            }
+
+            action::dispatch(
+                app,
+                Action::Go {
+                    buffer: index,
+                    path,
+                },
+            )
+        }
+
         Message::Go(index, into) => action::dispatch(
             app,
             Action::Go {
@@ -385,8 +492,16 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 ///
 /// The widget reports what happened to it; this says which action that is.
 /// Kept apart so the widget knows nothing about buffers or history.
-fn translate(buffer: usize, found: list::Action, current: crate::config::Layout) -> Option<Action> {
-    Some(match found {
+///
+/// `pointer` is where the hand is. A menu opened by a key has no click to sit
+/// under, and the last known pointer position is a better guess than a corner.
+const fn translate(
+    buffer: usize,
+    found: list::Action,
+    current: crate::config::Layout,
+    pointer: (f32, f32),
+) -> Action {
+    match found {
         list::Action::Select(row) => Action::Select { buffer, row },
         list::Action::Toggle(row) => Action::Toggle { buffer, row },
         list::Action::Extend(row) => Action::Extend { buffer, row },
@@ -408,27 +523,61 @@ fn translate(buffer: usize, found: list::Action, current: crate::config::Layout)
         list::Action::Activate(row) => Action::Activate { buffer, row },
         list::Action::Leave => Action::Leave { buffer },
         list::Action::Filter => Action::Filtering(true),
-        list::Action::Layout(None) => Action::Layout(current.next()),
-        list::Action::Layout(Some(layout)) => Action::Layout(layout),
+        list::Action::Layout(None) => Action::Layout {
+            buffer,
+            layout: current.next(),
+        },
+        list::Action::Layout(Some(layout)) => Action::Layout { buffer, layout },
         list::Action::SplitRight => Action::Split(pane_grid::Axis::Vertical),
         list::Action::SplitDown => Action::Split(pane_grid::Axis::Horizontal),
         list::Action::CloseTile => Action::CloseTile,
         list::Action::NextTile => Action::NextTile,
         list::Action::PreviousTile => Action::PreviousTile,
         list::Action::Escape => Action::Escape,
+        list::Action::Bookmark => Action::Bookmark { buffer, path: None },
+        list::Action::Buffers => Action::Menu {
+            kind: MenuKind::Buffers,
+            buffer,
+            at: pointer,
+        },
+        list::Action::TypePath => Action::TypingPath {
+            buffer,
+            typing: true,
+        },
         list::Action::Menu { row, at } => Action::Menu {
             kind: MenuKind::Context { row },
             buffer,
             at: (at.x, at.y),
         },
-    })
+    }
+}
+
+/// A path short enough for a menu line, with `$HOME` written as `~`.
+///
+/// The buffer list is a column of paths and most of them start with the same
+/// twelve characters, which is exactly the part that carries no information.
+fn short(path: &Path) -> String {
+    let full = path.to_string_lossy();
+
+    let Some(home) = std::env::var_os("HOME") else {
+        return full.into_owned();
+    };
+    let home = home.to_string_lossy();
+
+    match full.strip_prefix(home.as_ref()) {
+        Some("") => String::from("~"),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => full.into_owned(),
+    }
 }
 
 /// Resolve the icon family, once.
-fn icon_font(family: &Option<String>) -> Option<iced::Font> {
-    family
-        .clone()
-        .map(|family| iced::Font::with_name(String::leak(family)))
+///
+/// `Font::with_name` wants a `&'static str` while the family comes from the
+/// config, so the string is leaked. Once, at start-up, which is why this is
+/// not called from `view`.
+fn icon_font(family: &str) -> iced::Font {
+    iced::Font::with_name(String::leak(family.to_owned()))
 }
 
 /// Give one tile the keyboard.
@@ -463,7 +612,7 @@ fn focus_showing(app: &mut App, buffer: usize) {
 }
 
 /// Put away the context menu, if one is open.
-pub fn close_menu(app: &mut App) {
+pub const fn close_menu(app: &mut App) {
     app.menu = None;
 }
 
@@ -490,11 +639,13 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
 
         Action::Filtering(showing) => Task::done(Message::Filtering(showing)),
 
+        Action::TypingPath { buffer, typing } => Task::done(Message::TypingPath(buffer, typing)),
+
         Action::Menu { kind, buffer, at } => {
             // A right click already moved the cursor. The menu acts on
             // whatever is selected, so what it will do is on screen before it
             // opens. A toolbar menu changes no selection at all.
-            if let MenuKind::Context { row } = kind {
+            if let MenuKind::Context { row: Some(row) } = kind {
                 with(app, buffer, |found| {
                     if found.is_selected(row) {
                         found.move_to(row);
@@ -553,7 +704,15 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             iced::clipboard::write(paths.join("\n"))
         }
 
-        Action::Bookmark { path } => {
+        Action::Bookmark { buffer, path } => {
+            // `None` means the directory this buffer is showing. Resolved
+            // here rather than at the caller, so a key press does not have to
+            // carry a path the widget never saw.
+            let Some(path) = path.or_else(|| app.buffers.get(buffer).map(|f| f.path.clone()))
+            else {
+                return Task::none();
+            };
+
             match crate::places::bookmark(&path) {
                 Ok(()) => {
                     app.places = places::list();
@@ -566,52 +725,107 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             Task::none()
         }
 
-        Action::ShowHidden(showing) => {
-            app.config.list.show_hidden = showing;
-            let list = app.config.list.clone();
-            for found in &mut app.buffers {
-                found.rebuild(&list);
+        Action::Unbookmark { path } => {
+            match crate::places::unbookmark(&path) {
+                Ok(()) => {
+                    app.places = places::list();
+                    app.notice = Some(format!("{} is no longer a place", path.display()));
+                }
+                Err(error) => {
+                    app.notice = Some(format!("could not remove the bookmark: {error}"));
+                }
             }
             Task::none()
         }
 
-        Action::Layout(layout) => {
-            app.config.list.layout = layout;
-            app.notice = Some(format!("{} view", layout.name()));
+        Action::ShowHidden { buffer, showing } => {
+            // Only this buffer, and only this buffer relists. The dotfiles
+            // are part of the view, and a tile opened on a `.config` is no
+            // reason for the other one to fill up with `.git` and `.cache`.
+            let list = app.config.list.clone();
+            with(app, buffer, |found| {
+                found.view.show_hidden = showing;
+                found.rebuild(&list);
+            });
             Task::none()
         }
 
-        Action::Split(axis) => {
-            // The new tile gets a buffer of its own on the same directory, so
-            // the two are independent. Pointing a tile at a buffer another
-            // one already shows is the other move, and that is what shares a
-            // listing -- see `Tiles`.
-            let Some(window) = app.windows.values_mut().next() else {
-                return Task::none();
-            };
-            let Some(showing) = window.panes.get(window.focus).copied() else {
-                return Task::none();
-            };
-            let Some(path) = app.buffers.get(showing).map(|found| found.path.clone()) else {
-                return Task::none();
-            };
-
-            let fresh = app.buffers.len();
-            app.buffers.push(Buffer::new(path));
-
-            let Some(window) = app.windows.values_mut().next() else {
-                return Task::none();
-            };
-            let Some((pane, _)) = window.panes.split(axis, window.focus, fresh) else {
-                // `pane_grid` refuses a split it cannot fit. Saying so beats
-                // a keystroke that does nothing.
-                app.buffers.pop();
-                return refuse(app, String::from("no room to split"));
-            };
-            window.focus = pane;
-
-            relist(app, fresh)
+        Action::Layout { buffer, layout } => {
+            with(app, buffer, |found| found.view.layout = layout);
+            Task::none()
         }
+
+        Action::ShowBuffer { buffer } => {
+            if app.buffers.get(buffer).is_none() {
+                return Task::none();
+            }
+
+            let Some(window) = app.windows.values_mut().next() else {
+                return Task::none();
+            };
+            let focus = window.focus;
+            if window.panes.get(focus).copied() == Some(buffer) {
+                // Already showing it. Relisting would be a surprise.
+                return Task::none();
+            }
+            if let Some(showing) = window.panes.get_mut(focus) {
+                *showing = buffer;
+            }
+
+            // Only visible buffers are watched -- inotify allows 128
+            // instances here -- so one that has been out of sight is showing
+            // whatever the directory held when it was last on screen. This is
+            // the only way a buffer becomes visible again, so it is the only
+            // place that has to notice.
+            relist(app, buffer)
+        }
+
+        Action::CloseBuffer { buffer } => {
+            let showing = |app: &App, index: usize| {
+                app.windows
+                    .values()
+                    .any(|tiles| tiles.panes.iter().any(|(_, at)| *at == index))
+            };
+
+            if app.buffers.len() <= 1 {
+                return refuse(app, String::from("that is the only buffer"));
+            }
+            if showing(app, buffer) {
+                return refuse(app, String::from("a tile is showing that one"));
+            }
+            if app.buffers.get(buffer).is_none() {
+                return Task::none();
+            }
+
+            // `swap_remove`, so every other index but one stays put. The
+            // buffer that was last now sits in the hole, and any tile that
+            // pointed at the last index has to be told.
+            let moved = app.buffers.len() - 1;
+            app.buffers.swap_remove(buffer);
+
+            if moved != buffer {
+                for tiles in app.windows.values_mut() {
+                    for (_, at) in tiles.panes.iter_mut() {
+                        if *at == moved {
+                            *at = buffer;
+                        }
+                    }
+                }
+
+                // The moved buffer's listing task, if one is still running,
+                // is addressed to the index it used to have and its chunks
+                // would be dropped. Relisting is the honest fix: closing a
+                // buffer is a deliberate, occasional act, so one extra
+                // directory read costs nothing anybody will feel.
+                return relist(app, buffer);
+            }
+
+            Task::none()
+        }
+
+        Action::Split(axis) => split(app, axis, None),
+
+        Action::OpenBeside { path } => split(app, pane_grid::Axis::Vertical, Some(path)),
 
         Action::CloseTile => {
             let Some(window) = app.windows.values_mut().next() else {
@@ -663,6 +877,10 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             }
             if app.dialogue.is_some() {
                 return Task::done(Message::Dialogue(Choice::Dismiss));
+            }
+            if app.typing_path.is_some() {
+                app.typing_path = None;
+                return Task::none();
             }
             Task::done(Message::Filtering(false))
         }
@@ -721,6 +939,12 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             let from = std::mem::replace(&mut found.path, path);
             found.history.push(from);
             found.future.clear();
+
+            // Arriving somewhere clears whatever the notice line was
+            // complaining about. "`/s` is not a directory" left up after a
+            // successful move reads as though this directory were the
+            // problem.
+            app.notice = None;
             relist(app, buffer)
         }
 
@@ -803,6 +1027,47 @@ fn resort(app: &mut App) {
 }
 
 /// Do something to one buffer, if it is still there.
+/// Split the focused tile, and give the new half a buffer of its own.
+///
+/// `where_to` is the directory for the new tile; `None` means the same one the
+/// old tile shows. Either way it is a *separate* buffer, so the two are
+/// independent. Pointing a tile at a buffer another one already shows is the
+/// other move, and that is what shares a listing -- see `Tiles`.
+fn split(app: &mut App, axis: pane_grid::Axis, where_to: Option<PathBuf>) -> Task<Message> {
+    let Some(window) = app.windows.values().next() else {
+        return Task::none();
+    };
+    let Some(showing) = window.panes.get(window.focus).copied() else {
+        return Task::none();
+    };
+    let Some((path, view)) = app
+        .buffers
+        .get(showing)
+        .map(|found| (found.path.clone(), found.view))
+    else {
+        return Task::none();
+    };
+
+    let fresh = app.buffers.len();
+    // The new tile copies the view of the one it split from, which is what
+    // somebody splitting a grid to compare two directories expects.
+    app.buffers
+        .push(Buffer::new(where_to.unwrap_or(path), view));
+
+    let Some(window) = app.windows.values_mut().next() else {
+        return Task::none();
+    };
+    let Some((pane, _)) = window.panes.split(axis, window.focus, fresh) else {
+        // `pane_grid` refuses a split it cannot fit. Saying so beats a
+        // keystroke that does nothing.
+        app.buffers.pop();
+        return refuse(app, String::from("no room to split"));
+    };
+    window.focus = pane;
+
+    relist(app, fresh)
+}
+
 fn with(app: &mut App, buffer: usize, change: impl FnOnce(&mut Buffer)) {
     if let Some(found) = app.buffers.get_mut(buffer) {
         change(found);
@@ -824,7 +1089,7 @@ fn scanned(app: &App, path: PathBuf) -> Task<Message> {
 
 /// Start a handler, and report only a failure.
 fn start(plan: Plan) -> Task<Message> {
-    Task::perform(async move { open::spawn(&plan).await }, Message::Spawned)
+    Task::perform(async move { open::spawn(&plan) }, Message::Spawned)
 }
 
 /// Turn a plan that cannot run into the dialogue that asks about it.
@@ -1049,7 +1314,15 @@ fn tile<'a>(app: &'a App, index: usize, buffer: &'a Buffer, focused: bool) -> El
         // Only the focused tile takes the keyboard, and not while a dialogue
         // is up: otherwise Escape would close the dialogue and clear the
         // filter in one keystroke, and arrows would move an unseen cursor.
-        focused && app.dialogue.is_none(),
+        //
+        // Nor while the path bar is showing its text face. That is different
+        // from the filter box, which deliberately leaves the list live --
+        // `text_input` captures neither the vertical arrows nor Tab, so
+        // filtering and navigating at once is free. A path being typed wants
+        // those keys: Tab is completion, and with the list live it switched
+        // tiles instead. Escape then has to come from the subscription, since
+        // the list is no longer there to report it.
+        focused && app.dialogue.is_none() && app.typing_path.is_none(),
         move |action| Message::List(index, action),
     );
 
@@ -1156,6 +1429,19 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
             iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                 Some(Message::Pointer(position.x, position.y))
             }
+            // The path bar's text face takes the keyboard away from the list,
+            // so nothing else is left to report Escape while it is open.
+            // `update` ignores this unless the box is actually up.
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                ..
+            }) => Some(Message::EscapedPath),
+            // Tab, for the same reason. `text_input` does not capture it
+            // either, so without this it would reach nothing at all.
+            iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
+                ..
+            }) => Some(Message::CompletePath),
             _ => None,
         }
     }
@@ -1197,6 +1483,15 @@ fn path_bar<'a>(app: &'a App, index: usize, buffer: &'a Buffer) -> Element<'a, M
     };
 
     let mut crumbs = row![
+        // Leftmost, then back and forward, then the path. A browser's order,
+        // which is the one most hands already know.
+        tool(
+            app,
+            '\u{f021}',
+            String::from("Relist  (F5)"),
+            false,
+            Message::Act(Action::Relist { buffer: index }),
+        ),
         quiet(
             String::from("<"),
             (!buffer.history.is_empty()).then_some(Message::Back(index)),
@@ -1209,27 +1504,76 @@ fn path_bar<'a>(app: &'a App, index: usize, buffer: &'a Buffer) -> Element<'a, M
     .spacing(2)
     .align_y(iced::Alignment::Center);
 
-    // Built from the components rather than by splitting the string, so a
-    // directory with a slash-looking name in it cannot fool the crumbs.
-    let mut walked = PathBuf::new();
-    for component in buffer.path.components() {
-        walked.push(component.as_os_str());
+    // The path bar has two faces, and this is where it turns over. Text when
+    // somebody asked for text -- a row of buttons gives nothing to drag
+    // across, and taking `~/workspace/rust` out of a longer path to
+    // paste into a terminal is a thing people do constantly.
+    let focused = app
+        .windows
+        .values()
+        .any(|window| window.panes.get(window.focus).copied() == Some(index));
 
-        let label = match component {
-            std::path::Component::RootDir => String::from("/"),
-            other => other.as_os_str().to_string_lossy().into_owned(),
-        };
+    let middle: Element<'a, Message> = match &app.typing_path {
+        Some(typed) if focused => iced::widget::text_input("path", typed)
+            .id(path_id())
+            .on_input(Message::PathTyped)
+            .on_submit(Message::PathSubmitted(index))
+            .size(14)
+            .padding([2, 6])
+            .width(Length::Fill)
+            .into(),
 
-        crumbs = crumbs.push(quiet(label, Some(Message::Go(index, walked.clone()))));
-    }
+        _ => {
+            // Built from the components rather than by splitting the string,
+            // so a directory with a slash-looking name in it cannot fool the
+            // crumbs.
+            let mut walked = PathBuf::new();
+            for component in buffer.path.components() {
+                walked.push(component.as_os_str());
+
+                let label = match component {
+                    std::path::Component::RootDir => String::from("/"),
+                    other => other.as_os_str().to_string_lossy().into_owned(),
+                };
+
+                crumbs = crumbs.push(quiet(label, Some(Message::Go(index, walked.clone()))));
+            }
+
+            // The space after the last crumb turns the bar over. A click on a
+            // crumb already means "go there" and has to keep meaning it, so
+            // the two are told apart by where the click lands -- which makes
+            // the gap the only unambiguous target, and on a short path it is
+            // most of the bar. The `\u{f044}` button beside it is the target
+            // that is never ambiguous.
+            iced::widget::mouse_area(container(crumbs).width(Length::Fill))
+                .on_press(Message::Act(Action::TypingPath {
+                    buffer: index,
+                    typing: true,
+                }))
+                .into()
+        }
+    };
 
     // The crumbs take what is left, so the toolbar stays pinned to the right
     // however long the path is.
-    row![container(crumbs).width(Length::Fill), toolbar(app, index)]
-        .align_y(iced::Alignment::Center)
-        .padding([4, 4])
-        .width(Length::Fill)
-        .into()
+    row![
+        container(middle).width(Length::Fill),
+        tool(
+            app,
+            '\u{f044}',
+            String::from("Edit the path  (Ctrl+L)"),
+            app.typing_path.is_some() && focused,
+            Message::Act(Action::TypingPath {
+                buffer: index,
+                typing: app.typing_path.is_none(),
+            }),
+        ),
+        toolbar(app, index, buffer.view)
+    ]
+    .align_y(iced::Alignment::Center)
+    .padding([4, 4])
+    .width(Length::Fill)
+    .into()
 }
 
 /// The buttons at the right of a tile's path bar.
@@ -1238,14 +1582,19 @@ fn path_bar<'a>(app: &'a App, index: usize, buffer: &'a Buffer) -> Element<'a, M
 /// answer "which tile does this act on", and the honest answer is whichever
 /// has the keyboard -- which is one more thing to know before pressing a
 /// button. Beside the path it is already unambiguous.
-fn toolbar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
+fn toolbar(app: &App, index: usize, view: crate::config::View) -> Element<'_, Message> {
     let list = &app.config.list;
+    let layout = view.layout;
 
     // Every codepoint checked against the installed font before use, the way
     // `icon.rs` was built. A guessed one draws an empty box.
-    let layout_glyph = match list.layout {
-        crate::config::Layout::List => '\u{f0c9}',
-        crate::config::Layout::Detail => '\u{f00b}',
+    //
+    // The bars glyph is not here: it belongs to the menu at the far right,
+    // where a browser puts it, and two buttons wearing it would each look
+    // like the other one's job.
+    let layout_glyph = match layout {
+        crate::config::Layout::List => '\u{f03a}',
+        crate::config::Layout::Detail => '\u{f0ce}',
         crate::config::Layout::Icons => '\u{f009}',
     };
 
@@ -1255,7 +1604,7 @@ fn toolbar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
         '\u{f0dd}'
     };
 
-    let hidden_glyph = if list.show_hidden {
+    let hidden_glyph = if view.show_hidden {
         '\u{f06e}'
     } else {
         '\u{f070}'
@@ -1265,13 +1614,12 @@ fn toolbar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
         tool(
             app,
             layout_glyph,
-            format!(
-                "View: {} \u{2192} {}",
-                list.layout.name(),
-                list.layout.next().name()
-            ),
+            format!("View: {} \u{2192} {}", layout.name(), layout.next().name()),
             false,
-            Message::Act(Action::Layout(list.layout.next())),
+            Message::Act(Action::Layout {
+                buffer: index,
+                layout: layout.next(),
+            }),
         ),
         tool(
             app,
@@ -1290,15 +1638,11 @@ fn toolbar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
             app,
             hidden_glyph,
             String::from("Hidden files"),
-            list.show_hidden,
-            Message::Act(Action::ShowHidden(!list.show_hidden)),
-        ),
-        tool(
-            app,
-            '\u{f021}',
-            String::from("Relist"),
-            false,
-            Message::Act(Action::Relist { buffer: index }),
+            view.show_hidden,
+            Message::Act(Action::ShowHidden {
+                buffer: index,
+                showing: !view.show_hidden,
+            }),
         ),
         tool(
             app,
@@ -1324,9 +1668,12 @@ fn toolbar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
         // Everything the buttons do, spelled out. A tile narrow enough to
         // clip the buttons still has this, and a person who cannot tell one
         // glyph from another can read the words.
+        //
+        // Far right, wearing the bars a browser wears. It is the one button
+        // here that people already know where to look for.
         tool(
             app,
-            '\u{f142}',
+            '\u{f0c9}',
             String::from("Everything else"),
             false,
             Message::Act(Action::Menu {
@@ -1342,13 +1689,7 @@ fn toolbar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
 }
 
 /// One toolbar button: a glyph, and a tooltip saying what it does.
-fn tool<'a>(
-    app: &'a App,
-    glyph: char,
-    says: String,
-    lit: bool,
-    message: Message,
-) -> Element<'a, Message> {
+fn tool(app: &App, glyph: char, says: String, lit: bool, message: Message) -> Element<'_, Message> {
     use iced::widget::{button, tooltip};
 
     let theme = &app.config.theme;
@@ -1441,8 +1782,8 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
 
     let buffer = app.buffers.get(menu.buffer);
     let row = match menu.kind {
-        MenuKind::Context { row } => Some(row),
-        MenuKind::Sort | MenuKind::Toolbar => None,
+        MenuKind::Context { row } => row,
+        MenuKind::Place { .. } | MenuKind::Buffers | MenuKind::Sort | MenuKind::Toolbar => None,
     };
     let entry = row.and_then(|row| buffer.and_then(|found| found.at(row)));
     let directory = entry.filter(|entry| entry.kind.is_directory());
@@ -1473,17 +1814,28 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
     if menu.kind == MenuKind::Toolbar {
         let list = &app.config.list;
 
+        // The buffer the menu was opened over, not the config: the view is a
+        // property of one tile, and the menu has to offer the same next step
+        // the button beside it does.
+        let view = buffer.map_or_else(|| list.view(), |found| found.view);
+
         items = items.push(item(
-            format!("View: {}", list.layout.next().name()),
-            Message::Act(Action::Layout(list.layout.next())),
+            format!("View: {}", view.layout.next().name()),
+            Message::Act(Action::Layout {
+                buffer: menu.buffer,
+                layout: view.layout.next(),
+            }),
         ));
         items = items.push(item(
-            String::from(if list.show_hidden {
+            String::from(if view.show_hidden {
                 "Hide hidden files"
             } else {
                 "Show hidden files"
             }),
-            Message::Act(Action::ShowHidden(!list.show_hidden)),
+            Message::Act(Action::ShowHidden {
+                buffer: menu.buffer,
+                showing: !view.show_hidden,
+            }),
         ));
         items = items.push(item(
             String::from("Relist"),
@@ -1506,6 +1858,14 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
         items = items.push(item(
             String::from("Filter\u{2026}"),
             Message::Act(Action::Filtering(true)),
+        ));
+        items = items.push(item(
+            String::from("Open directories\u{2026}  (Ctrl+B)"),
+            Message::Act(Action::Menu {
+                kind: MenuKind::Buffers,
+                buffer: menu.buffer,
+                at: app.pointer,
+            }),
         ));
     } else if menu.kind == MenuKind::Sort {
         use crate::config::Sort;
@@ -1535,15 +1895,105 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
             String::from("Reverse the order"),
             Message::Act(Action::ReverseSort),
         ));
-    } else {
-        if let Some(row) = row
-            && entry.is_some()
-        {
+    } else if menu.kind == MenuKind::Buffers {
+        // Every open directory, and how many tiles already show it. The count
+        // is the thing worth saying: picking one that is already beside you
+        // is how two tiles come to share a listing, and picking one nothing
+        // shows is how a buffer comes back from being closed.
+        for (at, found) in app.buffers.iter().enumerate() {
+            let tiles = app
+                .windows
+                .values()
+                .flat_map(|window| window.panes.iter())
+                .filter(|(_, index)| **index == at)
+                .count();
+
+            let mark = if at == menu.buffer { " \u{2022}" } else { "" };
+            let seen = match tiles {
+                0 => String::from("  (no tile)"),
+                1 => String::new(),
+                many => format!("  ({many} tiles)"),
+            };
+
+            items = items.push(item(
+                format!("{at}  {}{mark}{seen}", short(&found.path)),
+                Message::Act(Action::ShowBuffer { buffer: at }),
+            ));
+        }
+
+        // Closing is offered for this tile's own buffer only when something
+        // else is showing it too, which is never -- so it is offered for the
+        // ones nothing shows, where it is the whole point.
+        let idle: Vec<usize> = app
+            .buffers
+            .iter()
+            .enumerate()
+            .map(|(at, _)| at)
+            .filter(|at| {
+                !app.windows
+                    .values()
+                    .any(|window| window.panes.iter().any(|(_, index)| index == at))
+            })
+            .collect();
+
+        for at in idle {
+            let Some(found) = app.buffers.get(at) else {
+                continue;
+            };
+            items = items.push(item(
+                format!("Close {}", short(&found.path)),
+                Message::Act(Action::CloseBuffer { buffer: at }),
+            ));
+        }
+    } else if let MenuKind::Place { index } = menu.kind {
+        // On a place in the sidebar. Three items, and the third only for a
+        // bookmark: the home directory and a mounted disk are not ours to
+        // take out of the list.
+        let Some(place) = app.places.get(index) else {
+            return iced::widget::Space::new().into();
+        };
+
+        items = items.push(item(
+            format!("Open {}", place.label),
+            Message::Act(Action::Go {
+                buffer: menu.buffer,
+                path: place.path.clone(),
+            }),
+        ));
+        items = items.push(item(
+            String::from("Open in a new tile"),
+            Message::Act(Action::OpenBeside {
+                path: place.path.clone(),
+            }),
+        ));
+
+        if place.kind == places::Kind::Bookmark {
+            items = items.push(item(
+                String::from("Remove from places"),
+                Message::Act(Action::Unbookmark {
+                    path: place.path.clone(),
+                }),
+            ));
+        }
+    } else if let Some(row) = row {
+        // On an entry. What can be done to the file under the pointer, and
+        // nothing about the window: a right click that opened a list of
+        // settings was what pushed those onto the toolbar.
+        if entry.is_some() {
             items = items.push(item(
                 String::from("Open"),
                 Message::Act(Action::Activate {
                     buffer: menu.buffer,
                     row,
+                }),
+            ));
+        }
+
+        if let Some(entry) = directory {
+            items = items.push(item(
+                String::from("Open in a new tile"),
+                Message::Act(Action::OpenBeside {
+                    path: entry.path.clone(),
                 }),
             ));
         }
@@ -1555,35 +2005,89 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
             }),
         ));
 
-        // Only a directory can be a place, and the current one is offered
-        // when the click landed on a file, since that is still useful.
-        let bookmarkable = directory
-            .map(|entry| entry.path.clone())
-            .or_else(|| buffer.map(|found| found.path.clone()));
-
-        if let Some(path) = bookmarkable {
-            let label = match directory {
-                Some(entry) => format!("Add {} to places", entry.name),
-                None => String::from("Add this directory to places"),
-            };
-            items = items.push(item(label, Message::Act(Action::Bookmark { path })));
+        if let Some(entry) = directory {
+            items = items.push(item(
+                format!("Add {} to places", entry.name),
+                Message::Act(Action::Bookmark {
+                    buffer: menu.buffer,
+                    path: Some(entry.path.clone()),
+                }),
+            ));
         }
+    } else {
+        // On empty space. About the directory rather than about a file --
+        // which is why the click had to be told apart from one on a row, and
+        // why "paste" and "new folder" will land here in M2 rather than in
+        // the menu above.
+        let Some(found) = buffer else {
+            return iced::widget::Space::new().into();
+        };
+
+        items = items.push(item(
+            String::from(if found.view.show_hidden {
+                "Hide hidden files"
+            } else {
+                "Show hidden files"
+            }),
+            Message::Act(Action::ShowHidden {
+                buffer: menu.buffer,
+                showing: !found.view.show_hidden,
+            }),
+        ));
+        items = items.push(item(
+            String::from("Relist"),
+            Message::Act(Action::Relist {
+                buffer: menu.buffer,
+            }),
+        ));
+        items = items.push(item(
+            String::from("Copy path"),
+            Message::Act(Action::CopyPath {
+                buffer: menu.buffer,
+            }),
+        ));
+        items = items.push(item(
+            String::from("Add this directory to places  (Ctrl+D)"),
+            Message::Act(Action::Bookmark {
+                buffer: menu.buffer,
+                path: None,
+            }),
+        ));
     }
 
     // Kept inside the window. A menu opened near the right edge would
     // otherwise be clipped, and its longest line would wrap instead of the
     // menu simply moving left -- which is what a sort menu on the toolbar did,
     // since the toolbar lives at the right-hand end of the bar.
-    const WIDE: f32 = 230.0;
+    //
+    // The buffer list is wider than the rest because its lines are paths.
+    // `short` takes `$HOME` off the front and the rest is as long as it is;
+    // at the other menus' width every second line wrapped.
+    let wide: f32 = if menu.kind == MenuKind::Buffers {
+        360.0
+    } else {
+        230.0
+    };
     const TALL: f32 = 200.0;
 
+    // A menu opened by a key has no click to sit under, and the pointer may
+    // never have moved -- `app.pointer` is then still the window's corner,
+    // which is where the buffer list first appeared, half of it off the
+    // screen. So it is placed rather than followed: below the toolbar and
+    // clear of the sidebar, which is inside the tile it acts on.
+    let asked_at = if menu.kind == MenuKind::Buffers {
+        (SIDEBAR + 12.0, 40.0)
+    } else {
+        menu.at
+    };
+
     let at = (
-        menu.at.0.min((app.size.width - WIDE).max(0.0)),
-        menu.at.1.min((app.size.height - TALL).max(0.0)),
+        asked_at.0.min((app.size.width - wide).max(0.0)),
+        asked_at.1.min((app.size.height - TALL).max(0.0)),
     );
 
     let panel = container(items)
-        .width(Length::Fixed(WIDE))
+        .width(Length::Fixed(wide))
         .padding(4)
         .style(move |_: &iced::Theme| container::Style {
             background: Some(background.into()),
@@ -1630,34 +2134,43 @@ fn sidebar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
     };
 
     let mut list = column![].width(Length::Fill);
-    let mut last = None;
+    let mut previous = None;
 
-    for place in &app.places {
+    for (at, place) in app.places.iter().enumerate() {
         // A rule between the four groups, so the panel reads as a short list
         // of short lists rather than one long one.
-        if last.is_some_and(|kind| kind != place.kind) {
+        if previous.is_some_and(|kind| kind != place.kind) {
             list = list.push(iced::widget::Space::new().height(6));
         }
-        last = Some(place.kind);
+        previous = Some(place.kind);
 
-        list = list.push(
-            button(text(place.label.clone()).size(13))
-                .width(Length::Fill)
-                .padding([3, 10])
-                .style(move |_: &iced::Theme, status| button::Style {
-                    background: None,
-                    text_color: if matches!(status, button::Status::Hovered) {
-                        iced::Color::WHITE
-                    } else {
-                        foreground
-                    },
-                    ..button::Style::default()
-                })
-                .on_press(Message::Act(Action::Go {
-                    buffer: index,
-                    path: place.path.clone(),
-                })),
-        );
+        let entry = button(text(place.label.clone()).size(13))
+            .width(Length::Fill)
+            .padding([3, 10])
+            .style(move |_: &iced::Theme, status| button::Style {
+                background: None,
+                text_color: if matches!(status, button::Status::Hovered) {
+                    iced::Color::WHITE
+                } else {
+                    foreground
+                },
+                ..button::Style::default()
+            })
+            .on_press(Message::Act(Action::Go {
+                buffer: index,
+                path: place.path.clone(),
+            }));
+
+        // `button` has no right press, and `mouse_area`'s does not say where
+        // it happened. The tracked pointer answers that: it is the same
+        // position, one event earlier.
+        list = list.push(iced::widget::mouse_area(entry).on_right_press(Message::Act(
+            Action::Menu {
+                kind: MenuKind::Place { index: at },
+                buffer: index,
+                at: app.pointer,
+            },
+        )));
     }
 
     let jobs = column![
@@ -1675,7 +2188,7 @@ fn sidebar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
         .width(Length::Fill)
         .height(Length::Fill),
     )
-    .width(Length::Fixed(180.0))
+    .width(Length::Fixed(SIDEBAR))
     .height(Length::Fill)
     .style(move |_: &iced::Theme| container::Style {
         background: Some(theme.background.color().into()),
@@ -1688,8 +2201,103 @@ fn sidebar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
 ///
 /// A fixed id rather than one per buffer: there is one box, and it belongs to
 /// whichever tile is in front.
-fn filter_id() -> iced::widget::Id {
+const fn filter_id() -> iced::widget::Id {
     iced::widget::Id::new("ricedir-filter")
+}
+
+/// The path bar's text face, for the same reason.
+const fn path_id() -> iced::widget::Id {
+    iced::widget::Id::new("ricedir-path")
+}
+
+/// The longest path every directory matching what has been typed agrees on.
+///
+/// `None` when nothing matches, so a Tab that completes nothing changes
+/// nothing rather than emptying the box. Directories only: the path bar goes
+/// to a directory, and offering a file would complete to something that
+/// cannot be submitted.
+///
+/// The common prefix rather than the first match, which is what a shell does
+/// and what stops Tab guessing: two directories starting `wo` complete to
+/// `wo` and wait for another letter.
+fn complete(typed: &str) -> Option<String> {
+    let full = expand(typed);
+
+    // Trailing slash means "inside this", not "finish this name".
+    let (directory, start) = if typed.ends_with('/') {
+        (full.as_path(), String::new())
+    } else {
+        (
+            full.parent()?,
+            full.file_name()?.to_string_lossy().into_owned(),
+        )
+    };
+
+    let mut matches = Vec::new();
+    for entry in std::fs::read_dir(directory).ok()? {
+        let Ok(entry) = entry else { continue };
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&start) {
+            matches.push(name);
+        }
+    }
+
+    let (first, rest) = matches.split_first()?;
+    let mut shared = first.clone();
+    for name in rest {
+        let keep = shared
+            .char_indices()
+            .zip(name.chars())
+            .take_while(|((_, want), got)| want == got)
+            .count();
+        // By character, then cut on a boundary the indices give us.
+        shared = shared.chars().take(keep).collect();
+    }
+
+    if shared.len() <= start.len() {
+        return None;
+    }
+
+    let mut done = directory.join(shared).to_string_lossy().into_owned();
+    // A completed directory gets its slash, so the next Tab looks inside it.
+    if matches.len() == 1 {
+        done.push('/');
+    }
+    Some(done)
+}
+
+/// What a typed path means: `~` is home, and a relative one is relative to
+/// nothing in particular, so it is left as typed and will simply not exist.
+///
+/// Deliberately *not* a shell: no globbing, no `$VAR`, no command
+/// substitution. A path bar that ran a shell would be a shell prompt with a
+/// file manager attached to it.
+fn expand(text: &str) -> PathBuf {
+    under(text, std::env::var_os("HOME").map(PathBuf::from).as_deref())
+}
+
+/// [`expand`], with home passed in.
+///
+/// Apart so it can be tested: `HOME` is process-global and the test harness
+/// runs in threads, so a test that set it would fight every other test that
+/// reads it. `places::user_dirs` is split for the same reason.
+fn under(text: &str, home: Option<&Path>) -> PathBuf {
+    let text = text.trim();
+
+    let Some(home) = home else {
+        return PathBuf::from(text);
+    };
+
+    match text {
+        "~" => home.to_path_buf(),
+        rest => match rest.strip_prefix("~/") {
+            Some(inside) => home.join(inside),
+            None => PathBuf::from(rest),
+        },
+    }
 }
 
 fn buffer_of(app: &App, window: window::Id) -> Option<&Buffer> {
@@ -1708,7 +2316,7 @@ fn relist(app: &mut App, index: usize) -> Task<Message> {
     let generation = buffer.generation;
 
     *buffer = {
-        let mut fresh = Buffer::new(buffer.path.clone());
+        let mut fresh = Buffer::new(buffer.path.clone(), buffer.view);
         fresh.generation = generation;
         fresh.history = std::mem::take(&mut buffer.history);
         fresh.future = std::mem::take(&mut buffer.future);
@@ -1726,6 +2334,7 @@ fn relist(app: &mut App, index: usize) -> Task<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Layout;
     use crate::entry::{Entry, Kind};
 
     /// Drive `update` and drop the task: what these are about is the state it
@@ -1737,12 +2346,16 @@ mod tests {
     fn app() -> App {
         App {
             config: Config::default(),
-            buffers: vec![Buffer::new(PathBuf::from("/tmp/one"))],
+            buffers: vec![Buffer::new(
+                PathBuf::from("/tmp/one"),
+                Config::default().list.view(),
+            )],
             windows: HashMap::new(),
             notice: None,
             dialogue: None,
             typed: String::new(),
             filtering: false,
+            typing_path: None,
             icon_font: None,
             menu: None,
             pointer: (0.0, 0.0),
@@ -1765,6 +2378,38 @@ mod tests {
             // reason, or fail for one.
             hidden: name.starts_with('.'),
         }
+    }
+
+    /// A view belongs to one buffer. Two tiles side by side wanting different
+    /// arrangements is the ordinary case -- a wide detail listing beside a
+    /// grid of pictures -- and a switch that changed both at once made the
+    /// second tile useless for the thing it was opened for.
+    #[test]
+    fn a_view_switch_reaches_only_its_own_buffer() {
+        let mut app = app();
+        let start = Config::default().list.view();
+        app.buffers
+            .push(Buffer::new(PathBuf::from("/tmp/two"), start));
+
+        tell(
+            &mut app,
+            Message::Act(Action::Layout {
+                buffer: 1,
+                layout: Layout::Icons,
+            }),
+        );
+
+        assert_eq!(
+            app.buffers[0].view.layout,
+            Layout::List,
+            "the other tile moved"
+        );
+        assert_eq!(app.buffers[1].view.layout, Layout::Icons);
+
+        // And the config it started from is untouched, so a new buffer still
+        // opens the way the config says rather than the way the last click
+        // left one.
+        assert_eq!(app.config.list.layout, Layout::default());
     }
 
     /// A chunk from a listing that has been replaced would otherwise put the
@@ -1943,7 +2588,7 @@ mod tests {
             Message::List(
                 0,
                 list::Action::Menu {
-                    row: 1,
+                    row: Some(1),
                     at: iced::Point::new(40.0, 90.0),
                 },
             ),
@@ -1955,6 +2600,39 @@ mod tests {
             .map(|found| found.name.as_str())
             .collect();
         assert_eq!(selected, ["b.txt"]);
+    }
+
+    /// A right click past the last row is about the directory, so it must not
+    /// pick a file on the way. Selecting the nearest row instead is how a
+    /// menu ends up acting on something the person never pointed at.
+    #[test]
+    fn a_menu_on_empty_space_selects_nothing() {
+        let mut app = app();
+        let list = Config::default().list;
+        app.buffers[0].extend(
+            vec![entry("a.txt", Kind::File), entry("b.txt", Kind::File)],
+            &list,
+        );
+        app.buffers[0].finish(&list);
+
+        tell(
+            &mut app,
+            Message::List(
+                0,
+                list::Action::Menu {
+                    row: None,
+                    at: iced::Point::new(40.0, 600.0),
+                },
+            ),
+        );
+
+        assert!(app.menu.is_some(), "the menu should still open");
+        assert_eq!(
+            app.menu.as_ref().map(|menu| menu.kind),
+            Some(MenuKind::Context { row: None }),
+            "and know it was empty space"
+        );
+        assert_eq!(app.buffers[0].selected().count(), 0);
     }
 
     /// A right click inside an existing selection must not throw it away.
@@ -1978,7 +2656,7 @@ mod tests {
         tell(
             &mut app,
             Message::Act(Action::Menu {
-                kind: MenuKind::Context { row: 1 },
+                kind: MenuKind::Context { row: Some(1) },
                 buffer: 0,
                 at: (0.0, 0.0),
             }),
@@ -1993,7 +2671,7 @@ mod tests {
     fn any_other_action_closes_the_menu() {
         let mut app = app();
         app.menu = Some(Menu {
-            kind: MenuKind::Context { row: 0 },
+            kind: MenuKind::Context { row: Some(0) },
             buffer: 0,
             at: (0.0, 0.0),
         });
@@ -2009,7 +2687,7 @@ mod tests {
         let mut app = app();
         app.filtering = true;
         app.menu = Some(Menu {
-            kind: MenuKind::Context { row: 0 },
+            kind: MenuKind::Context { row: Some(0) },
             buffer: 0,
             at: (0.0, 0.0),
         });
@@ -2022,10 +2700,11 @@ mod tests {
     /// Hiding hidden files must rebuild every buffer, not only the one in
     /// front, or a second tile keeps showing them.
     #[test]
-    fn showing_hidden_files_reaches_every_buffer() {
+    fn showing_hidden_files_reaches_only_its_own_buffer() {
         let mut app = app();
         let list = Config::default().list;
-        app.buffers.push(Buffer::new(PathBuf::from("/tmp/two")));
+        app.buffers
+            .push(Buffer::new(PathBuf::from("/tmp/two"), list.view()));
 
         for buffer in &mut app.buffers {
             buffer.extend(
@@ -2036,9 +2715,191 @@ mod tests {
         }
         assert_eq!(app.buffers[1].rows(), 1);
 
-        tell(&mut app, Message::Act(Action::ShowHidden(true)));
-        assert_eq!(app.buffers[0].rows(), 2);
-        assert_eq!(app.buffers[1].rows(), 2, "the buffer behind too");
+        tell(
+            &mut app,
+            Message::Act(Action::ShowHidden {
+                buffer: 1,
+                showing: true,
+            }),
+        );
+
+        assert_eq!(app.buffers[1].rows(), 2);
+        assert_eq!(app.buffers[0].rows(), 1, "the other tile filled up");
+    }
+
+    /// The path bar takes a path, not a shell line. `~` is the one expansion,
+    /// because it is the one people type; a `$VAR` or a `*` left alone will
+    /// simply not be a directory and be refused.
+    #[test]
+    fn a_typed_path_expands_only_a_tilde() {
+        let home = Path::new("/home/somebody");
+        let at = |text| under(text, Some(home));
+
+        assert_eq!(at("~"), PathBuf::from("/home/somebody"));
+        assert_eq!(at("~/src"), PathBuf::from("/home/somebody/src"));
+        assert_eq!(at("  /tmp/x  "), PathBuf::from("/tmp/x"));
+        assert_eq!(at("$HOME"), PathBuf::from("$HOME"), "not a shell");
+        assert_eq!(at("/tmp/*"), PathBuf::from("/tmp/*"), "nor a glob");
+        assert_eq!(at("~notme"), PathBuf::from("~notme"), "not a user");
+
+        // No home at all is survivable: a `~` is then just a silly directory
+        // name, which is exactly what it is on disk.
+        assert_eq!(under("~/src", None), PathBuf::from("~/src"));
+    }
+
+    /// Tab completes to what every match agrees on, the way a shell does, so
+    /// it never guesses between two directories.
+    #[test]
+    fn tab_completes_to_the_shared_prefix() {
+        let root = std::env::temp_dir().join("ricedir-complete");
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["workspace", "workbench", "other"] {
+            std::fs::create_dir_all(root.join(name)).expect("make the tree");
+        }
+        std::fs::write(root.join("workfile"), b"x").expect("and a file");
+
+        let typed = format!("{}/wo", root.display());
+        let done = complete(&typed).expect("two directories start `work`");
+        assert_eq!(done, format!("{}/work", root.display()), "no slash yet");
+
+        // One match completes fully and gets a slash, so the next Tab looks
+        // inside it. The file starting `work` is not offered.
+        let typed = format!("{}/works", root.display());
+        let done = complete(&typed).expect("only workspace");
+        assert_eq!(done, format!("{}/workspace/", root.display()));
+
+        // Nothing matching changes nothing rather than emptying the box.
+        let typed = format!("{}/zzz", root.display());
+        assert!(complete(&typed).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path that is not a directory says so and keeps what was typed. Going
+    /// nowhere and clearing the box would look like the keystroke was lost.
+    #[test]
+    fn submitting_a_path_that_is_not_there_says_so() {
+        let mut app = app();
+        app.typing_path = Some(String::from("/tmp/definitely-not-a-directory-here"));
+
+        tell(&mut app, Message::PathSubmitted(0));
+
+        assert_eq!(
+            app.typing_path.as_deref(),
+            Some("/tmp/definitely-not-a-directory-here"),
+            "what was typed should still be there"
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|say| say.contains("not a directory")),
+            "and the notice should say why: {:?}",
+            app.notice
+        );
+    }
+
+    /// Escape leaves the text face. It arrives from the subscription rather
+    /// than the list, because the list is not taking keys while the box is up.
+    #[test]
+    fn escape_leaves_the_path_text_face() {
+        let mut app = app();
+        app.typing_path = Some(String::from("/tmp/half-typed"));
+
+        tell(&mut app, Message::EscapedPath);
+        assert!(app.typing_path.is_none());
+    }
+
+    /// Pointing a tile at a buffer that is already open is the other half of
+    /// the emacs model: this is how two tiles come to share one listing.
+    #[test]
+    fn showing_a_buffer_points_the_focused_tile_at_it() {
+        let mut app = app();
+        app.windows.insert(window::Id::unique(), Tiles::new(0));
+        let start = Config::default().list.view();
+        app.buffers
+            .push(Buffer::new(PathBuf::from("/tmp/two"), start));
+
+        tell(&mut app, Message::Act(Action::ShowBuffer { buffer: 1 }));
+
+        let tiles = app.windows.values().next().expect("one window");
+        assert_eq!(tiles.buffer(), 1);
+        assert_eq!(app.buffers.len(), 2, "no buffer was made or lost");
+    }
+
+    /// A buffer a tile is showing must not be closed underneath it, and the
+    /// last one must not go at all -- either leaves a tile pointing at an
+    /// index that is not there.
+    #[test]
+    fn a_buffer_in_use_is_not_closed() {
+        let mut app = app();
+        app.windows.insert(window::Id::unique(), Tiles::new(0));
+        let start = Config::default().list.view();
+        app.buffers
+            .push(Buffer::new(PathBuf::from("/tmp/two"), start));
+
+        tell(&mut app, Message::Act(Action::CloseBuffer { buffer: 0 }));
+        assert_eq!(app.buffers.len(), 2, "a tile is showing that one");
+
+        app.buffers.truncate(1);
+        tell(&mut app, Message::Act(Action::CloseBuffer { buffer: 0 }));
+        assert_eq!(app.buffers.len(), 1, "and it is the only one");
+    }
+
+    /// Closing uses `swap_remove`, so the buffer that was last lands in the
+    /// hole. Any tile pointing at the old last index has to be told, or it
+    /// shows a directory nobody asked for -- or nothing at all.
+    #[test]
+    fn closing_a_buffer_moves_the_last_one_and_tells_the_tiles() {
+        let mut app = app();
+        app.windows.insert(window::Id::unique(), Tiles::new(0));
+        let start = Config::default().list.view();
+        app.buffers
+            .push(Buffer::new(PathBuf::from("/tmp/spare"), start));
+        app.buffers
+            .push(Buffer::new(PathBuf::from("/tmp/last"), start));
+
+        // The one tile shows the last buffer; buffer 1 is showing nowhere.
+        if let Some(window) = app.windows.values_mut().next() {
+            let focus = window.focus;
+            if let Some(at) = window.panes.get_mut(focus) {
+                *at = 2;
+            }
+        }
+
+        tell(&mut app, Message::Act(Action::CloseBuffer { buffer: 1 }));
+
+        assert_eq!(app.buffers.len(), 2);
+        assert_eq!(
+            app.buffers[1].path,
+            PathBuf::from("/tmp/last"),
+            "the last buffer moved into the hole"
+        );
+
+        let tiles = app.windows.values().next().expect("one window");
+        assert_eq!(tiles.buffer(), 1, "and the tile followed it");
+    }
+
+    /// "Open in a new tile" splits and lands on the directory asked for, not
+    /// on the one the old tile was showing.
+    #[test]
+    fn opening_beside_puts_the_new_tile_on_the_named_directory() {
+        let mut app = app();
+        app.windows.insert(window::Id::unique(), Tiles::new(0));
+
+        tell(
+            &mut app,
+            Message::Act(Action::OpenBeside {
+                path: PathBuf::from("/tmp/elsewhere"),
+            }),
+        );
+
+        assert_eq!(app.buffers.len(), 2);
+        assert_eq!(app.buffers[0].path, PathBuf::from("/tmp/one"), "unmoved");
+        assert_eq!(app.buffers[1].path, PathBuf::from("/tmp/elsewhere"));
+
+        let tiles = app.windows.values().next().expect("one window");
+        assert_eq!(tiles.panes.len(), 2);
+        assert_eq!(tiles.buffer(), 1, "the new tile has the keyboard");
     }
 
     /// Splitting gives the new tile a buffer of its own, so the two are
@@ -2050,6 +2911,11 @@ mod tests {
         app.windows.insert(window::Id::unique(), Tiles::new(0));
         assert_eq!(app.buffers.len(), 1);
 
+        // Set both halves of the view away from the config's, so a split that
+        // reached for the config rather than the parent would show.
+        app.buffers[0].view.layout = Layout::Icons;
+        app.buffers[0].view.show_hidden = true;
+
         tell(
             &mut app,
             Message::Act(Action::Split(pane_grid::Axis::Vertical)),
@@ -2057,6 +2923,10 @@ mod tests {
 
         assert_eq!(app.buffers.len(), 2, "a buffer of its own");
         assert_eq!(app.buffers[1].path, app.buffers[0].path, "same directory");
+        assert_eq!(
+            app.buffers[1].view, app.buffers[0].view,
+            "the new tile should look like the one it split from"
+        );
 
         let tiles = app.windows.values().next().expect("one window");
         assert_eq!(tiles.panes.len(), 2);

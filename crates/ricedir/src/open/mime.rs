@@ -191,7 +191,7 @@ impl Database {
                 .or_else(|| self.suffixes.get(&lower[at + 1..]));
 
             if let Some(rule) = found {
-                best = better(best, rule);
+                best = Some(better(best, rule));
             }
         }
 
@@ -202,7 +202,7 @@ impl Database {
 
             let subject = if rule.case_sensitive { name } else { &lower };
             if matches(parts, subject) {
-                best = better(best, rule);
+                best = Some(better(best, rule));
             }
         }
 
@@ -304,14 +304,17 @@ pub fn plausible(claimed: &str, actual: &str) -> bool {
 }
 
 /// Which of two matching rules the spec prefers.
-fn better<'a>(current: Option<&'a Rule>, candidate: &'a Rule) -> Option<&'a Rule> {
+///
+/// A candidate always exists, so the answer always does; only what is held so
+/// far can be missing.
+fn better<'a>(current: Option<&'a Rule>, candidate: &'a Rule) -> &'a Rule {
     match current {
         Some(held)
             if (held.specificity, held.weight) >= (candidate.specificity, candidate.weight) =>
         {
-            Some(held)
+            held
         }
-        _ => Some(candidate),
+        _ => candidate,
     }
 }
 

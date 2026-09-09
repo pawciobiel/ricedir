@@ -235,6 +235,52 @@ pub fn bookmark(path: &Path) -> std::io::Result<()> {
     writeln!(open, "{}", path.display())
 }
 
+/// The file without one bookmark, or `None` if it was not in it.
+///
+/// Comments and blank lines are kept: the file is one a person may have
+/// edited, and a removal that tidied it would lose their notes.
+///
+/// Apart from the I/O so it can be tested without an `XDG_CONFIG_HOME`, which
+/// is process-global and would make two tests fight.
+fn without(existing: &str, path: &Path) -> Option<String> {
+    let mut kept = String::new();
+    let mut found = false;
+
+    for line in existing.lines() {
+        if Path::new(line.trim()) == path {
+            found = true;
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+
+    found.then_some(kept)
+}
+
+/// Take one bookmark out, leaving everything else in the file alone.
+///
+/// Written to a temporary file beside the real one and renamed over it, so an
+/// interrupted removal leaves the old list rather than half a list.
+pub fn unbookmark(path: &Path) -> std::io::Result<()> {
+    let Some(file) = bookmarks_path() else {
+        return Ok(());
+    };
+
+    // No file means nothing to take out.
+    let Ok(existing) = std::fs::read_to_string(&file) else {
+        return Ok(());
+    };
+
+    let Some(kept) = without(&existing, path) else {
+        return Ok(());
+    };
+
+    let temporary = file.with_extension("tmp");
+    std::fs::write(&temporary, kept)?;
+    std::fs::rename(&temporary, &file)
+}
+
 /// The kernel writes a space in a mount point as `\040`.
 fn unescape(text: &str) -> PathBuf {
     if !text.contains('\\') {
@@ -384,6 +430,31 @@ XDG_PICTURES_DIR="$HOME/Pictures"
         assert_eq!(places[0].label, "src");
         assert_eq!(places[1].path, PathBuf::from("/srv/with a space"));
         assert_eq!(places[1].kind, Kind::Bookmark);
+    }
+
+    /// Removal keeps the rest of the file, comments included. The file is one
+    /// a person may have edited by hand, and a removal that tidied it would
+    /// throw their notes away.
+    #[test]
+    fn removing_a_bookmark_keeps_everything_else() {
+        let text = "# mine\n/home/someone/src\n\n/srv/photos\n";
+
+        let kept = without(text, Path::new("/home/someone/src")).expect("it was in the file");
+        assert_eq!(kept, "# mine\n\n/srv/photos\n");
+
+        // Still parses, and to the one that is left.
+        let places = bookmarks(&kept);
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].path, PathBuf::from("/srv/photos"));
+    }
+
+    /// A path that is not in the file must leave it alone rather than
+    /// rewriting it to the same thing -- the caller uses `None` to skip the
+    /// write entirely.
+    #[test]
+    fn removing_a_bookmark_that_is_not_there_changes_nothing() {
+        let text = "/home/someone/src\n";
+        assert!(without(text, Path::new("/home/someone/other")).is_none());
     }
 
     /// Nothing here may panic on rubbish: `mountinfo` is a kernel interface

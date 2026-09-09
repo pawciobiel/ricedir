@@ -234,7 +234,7 @@ stylesheet, no D-Bus, and it runs on Hyprland, sway and niri.
       per frame. The list lays out only the rows inside the viewport. This is
       the single largest piece of unknown work in M1 and should be built first.
 
-- [x] **One TOML file, kebab-case keys, hot reload, and a trust check.** All of
+- [x] **One TOML file, kebab-case keys, and a trust check.** All of
       ricebar's config discipline carries over unchanged, including
       `#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]`, a
       hand-written `impl Default` per struct rather than per-field serde
@@ -436,18 +436,42 @@ landing before the list widget is even proven.
       addressed by index. `Ctrl+\\` splits right, `Ctrl+-` splits down,
       `Ctrl+W` closes a tile, Tab and Shift-Tab move between them, and the
       focused tile is edged in the accent. Closing a tile keeps its buffer.
-- [ ] **A buffer list, to point a tile at a directory that is already open.**
-      The half of the emacs model that is not built. Splitting gives the new
-      tile a buffer of its own, which is what a file manager wants: two
-      independent panes. Sharing a listing between two tiles is the *other*
-      move, and there is no way to ask for it yet.
-      - [ ] `Action::ShowBuffer { tile, buffer }` — the whole mechanism; the
-            rest is how somebody asks for it
-      - [ ] a list to pick from, over the tile, showing each open directory
-            and how many tiles already show it
-      - [ ] close a buffer no tile is showing, so a long session does not
-            accumulate them forever
-      - [ ] `Ctrl+B` to open the list, digits to pick
+- [x] **A buffer list, to point a tile at a directory that is already open.**
+      The other half of the emacs model. Splitting gives the new tile a buffer
+      of its own, which is what a file manager usually wants; this is how two
+      tiles come to *share* one listing and one watcher.
+      - [x] `Action::ShowBuffer { buffer }` — it points the focused tile,
+            so no `tile` argument is needed
+      - [x] a list to pick from, showing each open directory and how many
+            tiles show it. `$HOME` is written `~`, and the panel is 360 wide
+            rather than the menus' 230: at that width every second line
+            wrapped, because these lines are paths.
+      - [x] close a buffer no tile is showing
+      - [x] `Ctrl+B` to open the list. Digits to pick are not built; the
+            list is a menu and a click does.
+
+      **Closing uses `swap_remove`.** Tiles hold indices into `App.buffers`,
+      so a plain `remove` would shift every index after the hole and every
+      tile would be looking at the wrong directory. `swap_remove` moves one
+      element -- the last -- so exactly one fixup is needed, and any tile
+      pointing at the old last index is told. Proved in the rig by closing
+      buffer 0 while the only tile showed buffer 1: the tile followed.
+
+      **The moved buffer is relisted.** Its listing task, if one is still
+      running, is addressed to the index it used to have, and its chunks
+      would be dropped into a hole. Closing a buffer is a deliberate,
+      occasional act, so one extra directory read costs nothing anybody
+      feels.
+
+      **A menu opened by a key has nowhere to sit.** `app.pointer` is the
+      window's corner until the mouse first moves, which is where the buffer
+      list appeared -- half of it off screen. It is placed rather than
+      followed now: below the toolbar and clear of the sidebar.
+
+- [x] **A buffer nobody is looking at no longer goes stale.** `ShowBuffer` is
+      the only way a hidden buffer becomes visible again, so it is the only
+      place that has to relist. Proved in the rig: a file made in a hidden
+      buffer's directory was there the moment the buffer came back.
 - [x] **Places.** Home and the XDG user directories from
       `~/.config/user-dirs.dirs`, mounted filesystems from
       `/proc/self/mountinfo` (filtered: no `sysfs`, `proc`, `cgroup`, `tmpfs`
@@ -458,11 +482,22 @@ landing before the list widget is even proven.
       The panel refreshes and the notice line says which path went in.
 - [ ] **Add to favourite places, the other ways in.** Removal first: without
       it a mistake is permanent.
-      - [ ] `Action::Unbookmark { path }`, and rewriting the file without
-            that line
-      - [ ] a menu on the places panel, which is where removal belongs
-      - [ ] `Ctrl+D` on the focused tile, which is what a browser taught
-            everybody
+      - [x] `Action::Unbookmark { path }`, and rewriting the file without
+            that line. Comments and blank lines survive -- the file is one a
+            person may have edited, and a removal that tidied it would throw
+            their notes away. Written to a temporary file and renamed over the
+            real one, so an interrupted removal leaves the old list rather
+            than half a list. The rewriting is a pure function, `without`, so
+            it can be tested without touching `XDG_CONFIG_HOME`, which is
+            process-global and would make two tests fight.
+      - [x] a menu on the places panel, which is where removal belongs.
+            Only a bookmark offers it: the home directory and a mounted disk
+            are not ours to take out of the list.
+      - [x] `Ctrl+D` on the focused tile, which is what a browser taught
+            everybody. `Action::Bookmark` grew a `buffer` and an optional
+            `path`: `None` means the directory being shown. One action rather
+            than two, because the only difference is which path -- and
+            `translate` has no path to hand, only a buffer index.
       - [ ] drag a directory from the list onto the panel
       - [ ] reorder them by dragging, since the file is an order and nothing
             else respects it yet
@@ -470,13 +505,44 @@ landing before the list widget is even proven.
       from `Path::components` rather than by splitting the string, so a name
       with a slash-looking character in it cannot fool them. Back, forward and
       up work off a per-buffer history.
-- [ ] **Path bar, the text half.** Not built, and this entry was ticked once
-      claiming it was. The two-faced design is in `## M6`; these are the parts.
-      - [ ] a text face that shows the path and can be typed into
-      - [ ] `Ctrl+L` to reach it, `Escape` and losing focus to leave
-      - [ ] a click on the bar but not on a crumb, which is the ambiguous one
-      - [ ] completion on Tab, against the directory being typed
-      - [ ] a path that does not exist says so rather than listing nothing
+- [x] **Path bar, the text half.** The two-faced design is in `## M6`, which
+      keeps the animation and the prettier separators; this is the half that
+      works.
+      - [x] a text face that shows the path and can be typed into. It opens
+            with the path already selected, so the common thing -- take a
+            piece of this path -- needs no typing and no drag from one end.
+      - [x] `Ctrl+L` to reach it, `Escape` to leave, and a `\u{f044}` button
+            in the bar that is never ambiguous
+      - [x] a click on the bar but not on a crumb. The gap after the last
+            crumb is a `mouse_area` filling the rest of the bar, so on a short
+            path the target is most of the bar rather than a sliver.
+      - [x] completion on Tab, to the prefix every match shares -- what a
+            shell does, and what stops Tab guessing between two directories.
+            Directories only: the bar goes to a directory, and completing to a
+            file would fill in something that cannot be submitted. One match
+            gets a trailing slash so the next Tab looks inside it.
+      - [x] a path that does not exist says so and keeps what was typed.
+            Going nowhere and clearing the box would look like the keystroke
+            was lost.
+
+      **The list stops taking keys while the box is up**, which the filter box
+      deliberately does not do. `text_input` captures neither the vertical
+      arrows nor Tab, so filtering and navigating at once is free -- but a
+      path being typed wants Tab for completion, and with the list live it
+      switched tiles instead. That leaves nothing to report Escape or Tab, so
+      both come from `event::listen_with`; `update` ignores them unless the
+      box is actually open.
+
+      **`~` is the only expansion.** No `$VAR`, no globbing, no command
+      substitution. A path bar that ran a shell would be a shell prompt with a
+      file manager attached. `under` takes home as an argument so it can be
+      tested: `HOME` is process-global and the harness runs in threads, the
+      same reason `places::user_dirs` is split that way.
+
+      **A stale notice outlived the thing it complained about.** "`/s` is not
+      a directory" was still on screen after a later move succeeded, reading
+      as though the new directory were the problem. Arriving somewhere clears
+      it.
 - [x] **Filter and sort.** A filter box that narrows as you type (substring by
       default, glob with a leading `:`), a hidden-files toggle, and a sort menu
       over name, size, modified, type and extension.
@@ -558,12 +624,36 @@ landing before the list widget is even proven.
             pressing a button.
       - [ ] a jobs button, once there are jobs
 
-- [ ] **The menu should differ by where the click landed.** One menu is drawn
-      today whatever is under the pointer. Three are wanted:
-      - [ ] on an entry: Open, Open with, Copy path, Properties
-      - [ ] on empty space: Paste, New folder, Show hidden, Relist, and
-            "Add this directory to places"
-      - [ ] on a place in the sidebar: Open in a new tile, Remove from places
+- [x] **The menu differs by where the click landed.** One menu was drawn
+      whatever was under the pointer. Three now:
+      - [x] on an entry: Open, Open in a new tile, Copy path, and "Add
+            <name> to places" for a directory. Open with and Properties wait
+            for the dialogue work in M6.
+      - [x] on empty space: Show hidden, Relist, Copy path, "Add this
+            directory to places". Paste and New folder land here in M2.
+      - [x] on a place in the sidebar: Open, Open in a new tile, and Remove
+            from places for a bookmark.
+
+      **Empty space was not a menu at all before.** A right click past the
+      last row fell into the branch that starts a rubber band, which only
+      handles the left button, so nothing happened. `list::Action::Menu` now
+      carries `row: Option<usize>`, and `None` is a *different* menu rather
+      than an absent one: paste, a new folder and the hidden-files switch are
+      about the directory, and empty space is where people look for them.
+      A test asserts that such a click selects nothing -- picking the nearest
+      row instead is how a menu ends up acting on a file nobody pointed at.
+
+      **`button` has no right press**, and `mouse_area`'s does not say where
+      it happened, so a place in the sidebar reads the tracked pointer: the
+      same position, one event earlier.
+
+      **"Open in a new tile" is one action, not two.** `Split` followed by
+      `Go` would need the second to name a buffer the first had only just
+      made. `Action::OpenBeside { path }` splits and lists in one go, sharing
+      the split with `Action::Split` through a helper.
+
+      All three were checked in the rig with the pointer -- the first thing
+      `dev/pointer.sh` was good for.
 - [x] **Watching.** `notify` on the visible buffers only, debounced 120 ms and
       coalesced into "relist this directory". Beware the rename dance ricebar
       documents: editors and `mv` replace a file rather than writing it, and a
@@ -599,13 +689,13 @@ landing before the list widget is even proven.
       Keep the full relist as the fallback for overflow, for an unreadable
       event, and for `Relist` in the menu, which is what somebody reaches for
       when they think the listing is wrong.
-- [ ] **A buffer nobody is looking at goes stale.** Only visible buffers are
-      watched, on purpose: inotify allows 128 instances here. But nothing
-      relists a buffer when it becomes visible again, so with tiles a hidden
-      one will show what the directory held some minutes ago. The fix is a
-      relist on becoming visible; the cost is that switching tiles is no
-      longer instant on a huge directory, which argues for doing it in the
-      background and painting the old listing until the new one lands.
+- [ ] **A relist on becoming visible is not free.** Done above, and the cost
+      is real: showing a hidden buffer on a directory of 100,000 clears the
+      listing and reads it again, so the tile is empty for a moment. Painting
+      the old listing until the new one lands is the fix, and it wants the
+      same machinery as `## Undecided: how a job tells the window what
+      changed` -- a listing that arrives beside what is on screen rather than
+      instead of it. Left until that is settled.
 - [x] **MIME resolution.** Parse `/usr/share/mime/globs2` (`weight:type:glob`,
       one per line, already sorted by weight) plus `aliases`, and fall back to
       a small hand-written magic sniffer for the couple of dozen signatures
@@ -1018,6 +1108,75 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       `U+EB57` top and bottom. Guessing had a 50% chance and no way to notice
       being wrong except somebody pressing the button.
 
+## M1 stage 3: a browser's bar, and a view per buffer
+
+- [x] **The bar reads left to right the way a browser's does.** Relist first,
+      then back and forward, then the path; the buttons at the right, and the
+      menu last of all wearing `U+F0C9`, the bars a browser puts in that
+      corner. None of this is better in the abstract -- it is better because
+      most hands already know it, and a file manager is not the place to
+      teach a new arrangement.
+
+- [x] **The layout button stopped wearing the menu's glyph.** It had `U+F0C9`
+      for the list view, which is the hamburger. Now `U+F03A` for the list,
+      `U+F0CE` for the detail table and `U+F009` for the icons -- three
+      glyphs that show the arrangement they switch to. Every codepoint was
+      rendered before it was believed, the same rule the divider taught.
+
+- [x] **The layout belongs to the buffer, not to the config.** It was read
+      from `config.list.layout`, so switching the view in one tile switched
+      every tile. Two tiles wanting different views is the ordinary case -- a
+      wide detail listing beside a grid of pictures -- and the switch made the
+      second tile useless for the thing it was opened for. `Buffer` carries a
+      `layout` now, `Buffer::new` takes the config's as a starting value, a
+      split copies its parent's, and `Action::Layout` names the buffer it
+      acts on. Measured in the rig with three tiles: one switched to icons,
+      two stayed lists.
+
+- [x] **Hidden files followed the layout out of the config.** Same reasoning,
+      same shape: a tile opened on a `.config` is no reason for the tile beside
+      it to fill up with `.git` and `.cache`. Both settings now live in one
+      `config::View`, held as `Buffer.view`, so the next per-buffer setting is
+      a field rather than another argument at every call -- the sort is the one
+      that will ask. `Buffer`'s private `view: Vec<usize>` became `visible` to
+      make room for the name.
+
+      Measured in the rig with two tiles: the left showed 8 items with the
+      dotfile and its button lit, the right stayed at 7.
+
+- [x] **clippy `pedantic` and `nursery` are on.** 102 warnings the first time.
+      Most were style opinions, and 17 of those are now `allow`ed in
+      `[workspace.lints.clippy]` with the argument beside each one -- the
+      pixel-to-index casts the list widget is made of, `too_many_lines` on a
+      `match` over every message, `match_same_arms` where the arms are kept
+      apart by their comments.
+
+      What it was worth doing for is the handful that were real:
+      `open::spawn` was `async` with nothing to await; `mime::better` returned
+      an `Option` that was always `Some`; `translate` returned an `Option` that
+      was always `Some`, and its caller had a dead `else` branch;
+      `Buffer::new(start.clone(), ..)` cloned a path nothing used again;
+      `draw_glyph_sized` took a `&self` it never read; `icon_font` took
+      `&Option<String>` and cloned out of it. Thirteen small functions became
+      `const fn`, and the protocol's four wire types now derive `Eq`.
+
+      One near-miss worth keeping: `FileList::grid` divided by a cell width
+      that goes negative in a tile narrower than one cell. The cast saturates
+      to zero so it was never wrong, but nothing said so; it clamps now.
+
+- [x] **ricebar's `vpointer` is here, as `dev/vpointer` and `dev/pointer.sh`.**
+      Nothing could click until now, so the toolbar, the context menu, the
+      rubber band and the double click were all verified by reading. This was
+      wanted the moment a button had to be pressed to test anything, and the
+      hidden-files switch is the first thing proved with it.
+
+- [x] **The rig loses the first key of every script.** The compositor gives a
+      new virtual keyboard its seat and keymap on a round trip of its own, and
+      a key sent before that arrives nowhere -- not refused, not logged. Two
+      bindings, `Ctrl+\` and `Ctrl+-`, looked broken for half an hour and were
+      both fine; a `KeyPressed` probe showed nothing reaching the widget at
+      all. `dev/keys.sh` now starts its example with a `wait`, and says why.
+
 ## M2 — the job engine
 
 - [ ] **The queue.** A job is a plan built before any byte moves: the full
@@ -1283,7 +1442,7 @@ than the one already installed is partly that it looks good.
 
       Today it is buttons and only buttons, so there is no way to copy half a
       path. That is a thing people do constantly: they want
-      `/home/someone/workspace/rust` out of a longer path to paste into a
+      `~/workspace/rust` out of a longer path to paste into a
       terminal, and a row of buttons gives them nothing to drag across.
 
       **The two faces:**
@@ -1340,6 +1499,21 @@ own address space undoes everything M1 was for.
       the size and mtime stored in the PNG, so an existing cache is reused and
       ours is readable by anything else.
 - [ ] **A hard cap on concurrent helpers**, and a per-file timeout.
+
+## Last, if at all — reload the config without a restart
+
+Moved here on request, from the settled list at the top where it sat as though
+it were part of the config work. It is not: everything else in that entry is
+built, and this is a separate feature with a poor ratio.
+
+- [ ] **Watch the config file and apply a new one in place.** A file manager is
+      started and stopped all day, so a restart costs a second and this costs
+      a mechanism: every buffer holds a sort and a layout taken from the config
+      at the time it opened, and a reload has to decide which of those to
+      overrule and which to leave. The font family is the one key that can
+      never reload at all — `Font::with_name` takes a `&'static str` and iced
+      fixes the fallback family at start — so even a working reload has an
+      exception to explain.
 
 ## Tools we may end up building
 

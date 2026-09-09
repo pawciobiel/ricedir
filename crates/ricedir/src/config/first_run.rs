@@ -152,6 +152,8 @@ pub fn create(path: &Path) -> io::Result<()> {
 
 /// The `[[handler]]` blocks, from what this machine has.
 fn handlers() -> String {
+    use std::fmt::Write;
+
     let mut written = String::new();
 
     for offered in OFFERED {
@@ -159,18 +161,20 @@ fn handlers() -> String {
 
         match found {
             Some(need) => {
-                written.push_str(&format!(
+                let _ = write!(
+                    written,
                     "# {}\n[[handler]]\n{}\n{}\n\n",
                     offered.comment,
                     offered.matcher,
                     invocation(need)
-                ));
+                );
             }
             None => {
                 // Written commented out with what it wanted, so the file is
                 // still a menu of what ricedir could do here.
                 let wanted: Vec<String> = offered.needs.iter().map(describe).collect();
-                written.push_str(&format!(
+                let _ = write!(
+                    written,
                     "# {} -- nothing installed. Wanted one of: {}.\n\
                      #   [[handler]]\n\
                      #   {}\n\
@@ -178,7 +182,7 @@ fn handlers() -> String {
                     offered.comment,
                     wanted.join(", "),
                     offered.matcher,
-                ));
+                );
             }
         }
     }

@@ -83,9 +83,19 @@ pub enum Action {
     PreviousTile,
     /// Escape: put away whatever is showing.
     Escape,
+    /// Add the directory being shown to the favourite places.
+    Bookmark,
+    /// Show the list of open directories, to point this tile at one.
+    Buffers,
+    /// Turn the path bar over to its text face.
+    TypePath,
     /// Right click, with where it happened, so a menu can be put there.
+    ///
+    /// `None` means the click landed past the last row. That is a different
+    /// menu, not an absent one: "paste here" and "new folder" are about the
+    /// directory, and empty space is where people look for them.
     Menu {
-        row: usize,
+        row: Option<usize>,
         at: Point,
     },
     /// A rubber band was dragged over these cells.
@@ -165,7 +175,9 @@ impl<'a, Message> FileList<'a, Message> {
             theme,
             row_height: list.row_height.max(1.0),
             text_size,
-            layout: list.layout,
+            // The buffer's, not the config's. The config only says what a
+            // buffer starts as; after that each tile keeps its own view.
+            layout: buffer.view.layout,
             icons: list.icons.then_some(icons).flatten(),
             focused,
             on_action: Box::new(on_action),
@@ -180,8 +192,13 @@ impl<'a, Message> FileList<'a, Message> {
     fn grid(&self, width: f32) -> (usize, f32) {
         match self.layout {
             config::Layout::Icons => {
-                let across = ((width - PADDING * 2.0 - BAR) / CELL.width).floor();
-                ((across as usize).max(1), CELL.height)
+                // A tile narrower than one cell gives a negative width here.
+                // The cast would saturate to zero anyway, but clamping says
+                // so rather than leaving it to be looked up.
+                let across = ((width - PADDING * 2.0 - BAR) / CELL.width)
+                    .floor()
+                    .max(1.0);
+                (across as usize, CELL.height)
             }
             _ => (1, self.row_height),
         }
@@ -424,9 +441,20 @@ where
                     return;
                 };
                 let Some(row) = self.row_at(point, bounds, state.offset) else {
-                    // Empty space. A drag from here is a rubber band, which is
-                    // the one selection gesture a mouse-first file manager
-                    // cannot be without.
+                    // Empty space. A right click here is about the directory
+                    // rather than about a file, so it gets its own menu.
+                    if *button == mouse::Button::Right {
+                        shell.publish((self.on_action)(Action::Menu {
+                            row: None,
+                            at: point,
+                        }));
+                        shell.capture_event();
+                        return;
+                    }
+
+                    // A drag from here is a rubber band, which is the one
+                    // selection gesture a mouse-first file manager cannot be
+                    // without.
                     if *button == mouse::Button::Left {
                         let at = Point::new(point.x, point.y + state.offset);
                         state.band = Some((at, at));
@@ -447,7 +475,10 @@ where
                 };
 
                 let action = match button {
-                    mouse::Button::Right => Some(Action::Menu { row, at: point }),
+                    mouse::Button::Right => Some(Action::Menu {
+                        row: Some(row),
+                        at: point,
+                    }),
 
                     mouse::Button::Left => {
                         let now = std::time::Instant::now();
@@ -558,6 +589,29 @@ where
                         if character.as_str() == "i" && modifiers.command() =>
                     {
                         Some(Action::Invert)
+                    }
+                    // Ctrl-D bookmarks, which is what a browser taught
+                    // everybody. It is the directory being shown, not the
+                    // row under the cursor: that is the thing the address
+                    // bar of a browser would have had in it.
+                    keyboard::Key::Character(character)
+                        if character.as_str() == "d" && modifiers.command() =>
+                    {
+                        Some(Action::Bookmark)
+                    }
+                    // Ctrl-B for the buffer list, which is what emacs calls
+                    // it and what this half of the model came from.
+                    keyboard::Key::Character(character)
+                        if character.as_str() == "b" && modifiers.command() =>
+                    {
+                        Some(Action::Buffers)
+                    }
+                    // Ctrl-L for the address bar, which is what every browser
+                    // taught everybody.
+                    keyboard::Key::Character(character)
+                        if character.as_str() == "l" && modifiers.command() =>
+                    {
+                        Some(Action::TypePath)
                     }
                     // `/` because it is what every list in a terminal uses,
                     // and Ctrl-F because it is what every window does.
@@ -930,7 +984,7 @@ impl<Message> FileList<'_, Message> {
         if let Some(font) = self.icons {
             // Two and a half times the text, which is what makes this layout
             // worth having: at the same size it is a list with more gaps.
-            self.draw_glyph_sized(
+            Self::draw_glyph_sized(
                 renderer,
                 crate::icon::of(entry),
                 Rectangle {
@@ -965,7 +1019,7 @@ impl<Message> FileList<'_, Message> {
     }
 
     /// The colour an entry's name is drawn in, before the cursor overrides it.
-    fn colour_of(&self, entry: &Entry) -> Color {
+    const fn colour_of(&self, entry: &Entry) -> Color {
         match entry.kind {
             Kind::Link { broken: true, .. } => self.theme.urgent.color(),
             Kind::Directory
@@ -1004,9 +1058,13 @@ impl<Message> FileList<'_, Message> {
     }
 
     /// A glyph at a size of its own, for the tile layout.
+    ///
+    /// Not a variation on [`Self::draw_glyph`]: it is anchored at the top
+    /// centre rather than the left middle, so nothing but the `fill_text`
+    /// call is shared. Takes no `self` -- everything it draws with is an
+    /// argument.
     #[allow(clippy::too_many_arguments)]
     fn draw_glyph_sized<Renderer: text::Renderer<Font = iced::Font>>(
-        &self,
         renderer: &mut Renderer,
         glyph: char,
         bounds: Rectangle,
