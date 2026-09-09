@@ -97,12 +97,30 @@ const OFFERED: &[Offered] = &[
     Offered {
         comment: "anything textual",
         matcher: r#"mime = "text/*""#,
+        // A text editor on Linux is usually a terminal program, so the
+        // terminal pairs come first and the bare ones are only the editors
+        // that are certainly windows of their own.
+        //
+        // `emacs` was at the top of this list and it was wrong. The build
+        // here is emacs-nox: it links no GUI toolkit at all, so launched from
+        // a window manager it has no terminal, starts, and dies without
+        // drawing anything. Nothing on `$PATH` says which build you have, and
+        // the same trap waits for `vim`, `vi` and `nano`.
         needs: &[
-            Need::Program("emacs"),
             Need::Terminal("foot", "nvim"),
             Need::Terminal("foot", "vim"),
-            Need::Terminal("alacritty", "nvim"),
+            Need::Terminal("foot", "emacs"),
             Need::Terminal("foot", "nano"),
+            Need::Terminal("alacritty", "nvim"),
+            Need::Terminal("alacritty", "vim"),
+            Need::Terminal("alacritty", "emacs"),
+            Need::Terminal("alacritty", "nano"),
+            // Editors that are their own window, so no terminal is wanted.
+            Need::Program("gnome-text-editor"),
+            Need::Program("gedit"),
+            Need::Program("kate"),
+            Need::Program("mousepad"),
+            Need::Program("code"),
         ],
     },
 ];

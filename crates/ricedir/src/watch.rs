@@ -27,6 +27,23 @@ use notify::{RecursiveMode, Watcher};
 /// short enough that saving a file in an editor feels immediate.
 const SETTLE: Duration = Duration::from_millis(120);
 
+/// Whether an event could have changed what a listing shows.
+///
+/// Reading a directory is not a change to it, and saying otherwise costs more
+/// than a wasted relist: inotify reports a *read* as `Access(Open)`, so a
+/// relist opens the directory, the watch fires, and it relists again. With one
+/// tile that loop never starts, because nothing reads the directory after the
+/// first listing. With two tiles on one directory each one's read wakes the
+/// other's watch, and they feed each other forever -- which is what the
+/// flickering after a split was, measured at 33 events in four seconds.
+fn changes_a_listing(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+
+    !matches!(kind, EventKind::Access(_))
+        && !matches!(kind, EventKind::Other)
+        && kind != &EventKind::Any
+}
+
 /// Watch one directory, and say when it has settled after a change.
 ///
 /// The subscription is keyed on the path *and* a generation, so navigating
@@ -45,12 +62,16 @@ pub fn directory(path: PathBuf, generation: u64) -> Subscription<()> {
             // it, which reads as "no directory ever changes".
             let watcher =
                 notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                    if event.is_ok() {
-                        // Blocking, from notify's own thread. A full channel means
-                        // the loop below is already behind on relisting, and the
-                        // event it would have queued asks for the same thing.
-                        let _ = sender.try_send(());
+                    let Ok(event) = event else { return };
+
+                    if !changes_a_listing(&event.kind) {
+                        return;
                     }
+
+                    // Blocking, from notify's own thread. A full channel means
+                    // the loop below is already behind on relisting, and the
+                    // event it would have queued asks for the same thing.
+                    let _ = sender.try_send(());
                 });
 
             let Ok(mut watcher) = watcher else {

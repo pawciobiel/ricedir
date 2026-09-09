@@ -925,6 +925,52 @@ Two things the run found that no test had:
       turns them into indices, so the cost follows what is selected rather
       than what the directory holds.
 
+## M1 stage 3: three faults a real session found
+
+Reported from Hyprland on 2026-09-09, after the first install. Everything else
+held up: tiles, splitting, resizing, the three layouts, copy path, the places
+panel, adding a favourite, and Okular opening a PDF through flatpak.
+
+- [x] **Two tiles on one directory relisted each other forever.** The
+      flickering after a split. inotify reports a directory *read* as
+      `Access(Open)`, so a relist opens the directory, the other tile's watch
+      fires, it relists, and round it goes -- measured at 33 events in four
+      seconds. One tile never starts the loop, because nothing reads the
+      directory again after the first listing.
+
+      `watch.rs` now ignores any event that cannot change a listing. Idle CPU
+      after a split went from 7 ticks in four seconds to 0, and a file made in
+      a terminal still appears in both tiles.
+
+      The first guess was wrong and worth recording: the watch set was a
+      `HashSet`, whose order changes between calls, so the subscription batch
+      was shuffled after every update. That is a real fault and it is fixed --
+      it is a `BTreeSet` now -- but it was not this one. Measuring beat
+      reasoning again.
+
+- [x] **A click did not move the keyboard to the tile it landed in.** The list
+      widget captures its own presses, so `pane_grid`'s `on_click` never saw
+      them. You could select a row in one tile and find the arrows moving the
+      other tile's cursor -- which is the "select-bar is on the top folder and
+      difficult to do anything" in the report. Anything done to a tile now
+      focuses it first.
+
+- [x] **`emacs` is not necessarily a window.** The generated config opened
+      text with `emacs -- {path}`, and the build here is emacs-nox: it links
+      no GUI toolkit, so from a launcher it has no terminal, starts, and dies
+      without drawing. Nothing on `$PATH` says which build is installed, and
+      `vim`, `vi` and `nano` have the same trap.
+
+      A text editor on Linux is usually a terminal program, so the
+      terminal pairs come first now and only editors that are certainly their
+      own window -- `gnome-text-editor`, `gedit`, `kate`, `mousepad`, `code`
+      -- are offered bare.
+
+- [ ] **A handler that starts and immediately dies says nothing.** `spawn`
+      reports a process that will not *start*; emacs-nox started fine and then
+      exited. Watch the child briefly and report a quick non-zero exit, the
+      way ricebar reports "printed, then failed".
+
 ## M2 — the job engine
 
 - [ ] **The queue.** A job is a plan built before any byte moves: the full

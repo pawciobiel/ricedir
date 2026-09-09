@@ -196,6 +196,13 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         // Every request becomes an `Action` and goes through the registry.
         // The widget says what happened; `action` says what it means.
         Message::List(index, found) => {
+            // Anything done to a tile focuses it first. The list widget
+            // captures its own presses, so `pane_grid`'s `on_click` never
+            // sees them and the keyboard would stay on whichever tile had it
+            // -- you could select a row in one tile and then find the arrows
+            // moving a cursor in the other.
+            focus_showing(app, index);
+
             let Some(action) = translate(index, found, app.config.list.layout) else {
                 return Task::none();
             };
@@ -383,6 +390,25 @@ fn focus_tile(app: &mut App, pane: pane_grid::Pane) {
     for tiles in app.windows.values_mut() {
         if tiles.panes.get(pane).is_some() {
             tiles.focus = pane;
+        }
+    }
+}
+
+/// Give the keyboard to whichever tile is showing this buffer.
+///
+/// The first one found: two tiles can show one buffer, and then either will
+/// do -- they are the same listing and the same cursor.
+fn focus_showing(app: &mut App, buffer: usize) {
+    for tiles in app.windows.values_mut() {
+        let found = tiles
+            .panes
+            .iter()
+            .find(|(_, index)| **index == buffer)
+            .map(|(pane, _)| *pane);
+
+        if let Some(pane) = found {
+            tiles.focus = pane;
+            return;
         }
     }
 }
@@ -989,7 +1015,11 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
     // Only the buffers on screen are watched. inotify allows 128 instances
     // here, and a long session opens more directories than that. A buffer in
     // two tiles is watched once, which is what the set is for.
-    let watching: std::collections::HashSet<usize> = app
+    // A `BTreeSet`, not a `HashSet`. Both remove the duplicate when two tiles
+    // show one buffer, but a `HashSet` iterates in an order that changes from
+    // one call to the next, so the batch of subscriptions handed to iced would
+    // be shuffled after every update. Sorted, it is the same list every time.
+    let watching: std::collections::BTreeSet<usize> = app
         .windows
         .values()
         .flat_map(|tiles| tiles.panes.iter().map(|(_, index)| *index))
