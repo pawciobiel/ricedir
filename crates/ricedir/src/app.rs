@@ -15,6 +15,7 @@ use crate::buffer::{self, Buffer, Listing};
 use crate::config::Config;
 use crate::dialogue::{self, Choice, Dialogue};
 use crate::open::{self, Plan, scan};
+use crate::places::{self, Place};
 use crate::widget::list::{self, FileList};
 
 pub struct App {
@@ -35,6 +36,12 @@ pub struct App {
     /// Whether the filter box is on screen. Hidden until asked for, because a
     /// box that is always there is a box that is always in the way.
     filtering: bool,
+    /// Home, the user directories, the mounts and the bookmarks.
+    ///
+    /// Read once at startup and after a bookmark is added. A disk appearing is
+    /// worth a refresh too, which is M3's business once the socket exists to
+    /// ask for one.
+    places: Vec<Place>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +87,7 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
         dialogue: None,
         typed: String::new(),
         filtering: false,
+        places: places::list(),
     };
 
     // The id comes back before the window exists, so the buffer can be tied to
@@ -595,6 +603,25 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill);
 
+    // Places above, jobs below, the tiles in the rest. Fixed furniture: a file
+    // manager whose panels move around is one nobody can be shown how to use.
+    let page = row![
+        sidebar(app, index),
+        // One pixel of `muted`, full height. A `Space` with no height makes
+        // the container collapse to nothing, which is a divider you cannot
+        // see -- it was written that way once.
+        container(iced::widget::Space::new())
+            .width(1)
+            .height(Length::Fill)
+            .style(move |_: &iced::Theme| container::Style {
+                background: Some(app.config.theme.muted.color().into()),
+                ..container::Style::default()
+            }),
+        page
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill);
+
     let Some(dialogue) = &app.dialogue else {
         return page.into();
     };
@@ -750,6 +777,75 @@ fn status<'a>(app: &'a App, buffer: &'a Buffer) -> Element<'a, Message> {
         .into()
 }
 
+/// The panel down the left: places at the top, jobs at the bottom.
+fn sidebar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
+    use iced::widget::{button, scrollable};
+
+    let theme = &app.config.theme;
+    let dim = theme.dim.color();
+    let foreground = theme.foreground.color();
+
+    let heading = |what: &'a str| {
+        container(text(what).size(11).color(dim))
+            .padding([8, 10])
+            .width(Length::Fill)
+    };
+
+    let mut list = column![].width(Length::Fill);
+    let mut last = None;
+
+    for place in &app.places {
+        // A rule between the four groups, so the panel reads as a short list
+        // of short lists rather than one long one.
+        if last.is_some_and(|kind| kind != place.kind) {
+            list = list.push(iced::widget::Space::new().height(6));
+        }
+        last = Some(place.kind);
+
+        list = list.push(
+            button(text(place.label.clone()).size(13))
+                .width(Length::Fill)
+                .padding([3, 10])
+                .style(move |_: &iced::Theme, status| button::Style {
+                    background: None,
+                    text_color: if matches!(status, button::Status::Hovered) {
+                        iced::Color::WHITE
+                    } else {
+                        foreground
+                    },
+                    ..button::Style::default()
+                })
+                .on_press(Message::Act(Action::Go {
+                    buffer: index,
+                    path: place.path.clone(),
+                })),
+        );
+    }
+
+    let jobs = column![
+        heading("JOBS"),
+        container(text("nothing running").size(12).color(dim)).padding([0, 10]),
+    ]
+    .width(Length::Fill);
+
+    container(
+        column![
+            heading("PLACES"),
+            container(scrollable(list)).height(Length::Fill),
+            jobs,
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill),
+    )
+    .width(Length::Fixed(180.0))
+    .height(Length::Fill)
+    .style(move |_: &iced::Theme| container::Style {
+        background: Some(theme.background.color().into()),
+        ..container::Style::default()
+    })
+    .into()
+}
+
 /// The filter box, so it can be focused when it appears.
 ///
 /// A fixed id rather than one per buffer: there is one box, and it belongs to
@@ -809,6 +905,7 @@ mod tests {
             dialogue: None,
             typed: String::new(),
             filtering: false,
+            places: Vec::new(),
         }
     }
 

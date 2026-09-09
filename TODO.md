@@ -415,7 +415,7 @@ landing before the list widget is even proven.
 - [ ] **Tiles and buffers.** `pane_grid` for the tiles, a flat `Vec<Buffer>`
       addressed by index, split/close/focus, and a buffer list to point a tile
       somewhere else. Closing the last tile of a buffer keeps the buffer.
-- [ ] **Places.** Home and the XDG user directories from
+- [x] **Places.** Home and the XDG user directories from
       `~/.config/user-dirs.dirs`, mounted filesystems from
       `/proc/self/mountinfo` (filtered: no `sysfs`, `proc`, `cgroup`, `tmpfs`
       under `/run`), and bookmarks in ricedir's own file so nothing is written
@@ -457,7 +457,7 @@ landing before the list widget is even proven.
       started from a launcher has no terminal to print to.
 - [x] **The status line.** Entry count, selection count, selected size, free
       space on the buffer's filesystem, and the active filter.
-- [ ] **The jobs panel, empty.** The panel and its layout, with nothing to put
+- [x] **The jobs panel, empty.** The panel and its layout, with nothing to put
       in it until M2. Cheap now, and it stops the sidebar being redesigned
       later.
 
@@ -633,6 +633,30 @@ Two things the run found that no test had:
       component a `&'static str` with `Box::leak`, in a `view` that runs every
       frame. Caught by reading it back rather than by any tool. Worth a look
       for others: nothing else in the tree leaks per frame, but nothing checks.
+
+## M1 stage 3: the places panel
+
+- [x] **An allow-list of filesystems, not a deny-list.** This machine mounts
+      twenty-one things and three of them are worth showing. A deny-list needs
+      a new entry every time somebody invents a filesystem, and shows it
+      wrongly until then. Docker's overlays are excluded by mount point rather
+      than by type, since they are real `ext4` and there are dozens.
+
+- [x] **`mountinfo` has a variable number of fields before ` - `.** The
+      filesystem type is found by walking to the separator, never by counting
+      columns. The mount point is field five, and the kernel writes a space in
+      it as `\040`, so `/media/My Backup` needs unescaping before it is a path.
+
+- [x] **A user directory pointing at `$HOME` means there is none.** That is
+      what the spec says, and drawing it puts Home in the list twice.
+
+- [x] **`PUBLICSHARE` is not "Publicshare".** Two of the spec's names are one
+      word that reads as two, so they are written out rather than folded.
+
+- [x] **A one-pixel divider needs a height.** `container(Space::new())` with a
+      background and no height collapses to nothing, which is a divider that
+      is not there. Confirmed the fix by counting pixels rather than looking:
+      one column of `#45475a` at x=180.
 
 ## M2 — the job engine
 
