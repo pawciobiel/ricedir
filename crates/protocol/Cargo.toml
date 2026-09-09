@@ -1,0 +1,14 @@
+[package]
+name = "ricedir-protocol"
+description = "The messages ricedir and its agents send each other"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# serde and nothing else, on purpose. Every dependency added here is one the
+# MCP program also gains, and the point of this crate is how little it is.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

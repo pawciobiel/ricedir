@@ -5,6 +5,7 @@
 // stage 1 of M1 is finished; it is not a licence to leave dead code behind.
 #![allow(dead_code)]
 
+mod action;
 mod app;
 mod buffer;
 mod config;

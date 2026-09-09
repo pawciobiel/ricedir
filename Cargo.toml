@@ -1,44 +1,33 @@
-[package]
-name = "ricedir"
+# One repository, three crates.
+#
+# The split is not tidiness. `ricedir-mcp` must not be able to call anything
+# that touches a file: the rule in CLAUDE.md is that file tools refuse when no
+# window runs, and a rule a compiler enforces is stronger than a rule a person
+# remembers. So the MCP program depends on `ricedir-protocol` and nothing else,
+# and asks the running window to do the work.
+#
+# `ricedir-protocol` holds the messages and nothing more. It deliberately does
+# not hold the MIME code, the scan chain or the config: the MCP program never
+# needs to answer those questions, only to ask them.
+[workspace]
+resolver = "3"
+members = ["crates/protocol", "crates/ricedir", "crates/mcp"]
+
+# `cargo run` and `cargo build` with no `-p` mean the file manager, which is
+# what anyone typing them wants.
+default-members = ["crates/ricedir"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "A Wayland file manager built with iced, that an agent can be watched using"
 license = "MIT"
 repository = "https://github.com/pawciobiel/ricedir"
-keywords = ["wayland", "file-manager", "iced", "hyprland", "mcp"]
-categories = ["gui"]
-readme = "README.md"
-# Installed with `cargo install --git`, not from crates.io, for the same reason
-# as ricebar: publishing there means signing in through GitHub and granting that
-# login access it does not need. The metadata above stays accurate either way,
-# and this stops an accidental `cargo publish` rather than a deliberate one.
+# Installed with `cargo install --git`, not from crates.io: publishing there
+# means signing in through GitHub and granting that login access it does not
+# need. This stops an accidental `cargo publish` rather than a deliberate one.
 publish = false
-# docs/ holds prose and the README's recordings, and dev/ is for working on
-# ricedir. Neither belongs in a package.
-exclude = ["/docs", "/dev"]
 
-[dependencies]
-# `image` and `svg` are what let a file type's icon be a picture from an icon
-# theme rather than a font glyph. They pull in decoders and resvg, which is
-# most of ricedir's compile time -- worth it for a program whose whole job is
-# to show a directory and look good doing it.
-#
-# `advanced` exposes the widget traits. It is not optional here: the file list
-# is a widget of ours, because iced's own `table` builds an `Element` per cell
-# and a directory can hold 100k of them.
-iced = { version = "0.14", features = ["tokio", "image", "svg", "advanced"] }
-jiff = "0.2"
-# Directory watching. `macos_fsevent` and the serde features are for platforms
-# and uses ricedir has none of, so only the inotify backend is compiled.
-notify = { version = "8", default-features = false }
-# `regex-lite` rather than `regex`: the scan chain matches filenames, which is
-# a hundred bytes against a pattern somebody typed into their own config. It
-# has no dependencies and a fraction of the compile time, and none of what it
-# gives up -- Unicode character classes, the SIMD search -- is wanted here.
-regex-lite = "0.1"
+[workspace.dependencies]
+ricedir-protocol = { path = "crates/protocol" }
 serde = { version = "1", features = ["derive"] }
-toml = "1"
-# `sync` is the bridge from the listing and job threads to the Elm loop: file
-# work is blocking I/O and belongs on plain threads, and a tokio channel is
-# what carries results back into a subscription.
-tokio = { version = "1", features = ["io-util", "process", "sync", "time"] }
+serde_json = "1"

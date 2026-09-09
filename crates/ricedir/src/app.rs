@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use iced::widget::{column, container, row, text};
 use iced::{Element, Length, Task, window};
 
+use crate::action::{self, Action};
 use crate::buffer::{self, Buffer, Listing};
 use crate::config::Config;
 use crate::dialogue::{self, Choice, Dialogue};
@@ -44,6 +45,8 @@ pub enum Message {
     /// so a chunk from one that has been replaced can be dropped.
     Listed(usize, u64, buffer::Update),
     List(usize, list::Action),
+    /// An action from anywhere that is not the list widget.
+    Act(Action),
     /// The directory a buffer is showing changed on disk.
     Changed(usize),
     /// The filter box was typed into.
@@ -131,69 +134,16 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
 
-        Message::List(index, action) => {
-            let list = app.config.list.clone();
-            let Some(buffer) = app.buffers.get_mut(index) else {
+        // Every request becomes an `Action` and goes through the registry.
+        // The widget says what happened; `action` says what it means.
+        Message::List(index, found) => {
+            let Some(action) = translate(index, found) else {
                 return Task::none();
             };
-
-            match action {
-                list::Action::Select(row) => buffer.select_only(row),
-                list::Action::Toggle(row) => buffer.toggle(row),
-                list::Action::Extend(row) => buffer.extend_to(row),
-                list::Action::Cursor(row) => buffer.move_to(row),
-                list::Action::SelectAll => buffer.select_all(),
-                list::Action::Filter => return Task::done(Message::Filtering(true)),
-                list::Action::Escape => {
-                    // One key for "put away whatever is in front of me", in
-                    // the order things are stacked.
-                    if app.dialogue.is_some() {
-                        return Task::done(Message::Dialogue(Choice::Dismiss));
-                    }
-                    return Task::done(Message::Filtering(false));
-                }
-                // The menu is stage 3; the click still moves the cursor, so
-                // right-clicking does something rather than nothing.
-                list::Action::Menu { row, .. } => buffer.move_to(row),
-
-                list::Action::Activate(row) => {
-                    // Opening a file is stage 2. Entering a directory is the
-                    // half that stage 1 needs.
-                    let into = buffer
-                        .at(row)
-                        .filter(|entry| entry.kind.is_directory())
-                        .map(|entry| entry.path.clone());
-
-                    let Some(into) = into else {
-                        // A file, not a directory. The scan chain gets its say
-                        // before anything is chosen to run it with.
-                        let Some(path) = buffer.at(row).map(|entry| entry.path.clone()) else {
-                            return Task::none();
-                        };
-                        return scanned(app, path);
-                    };
-
-                    let from = std::mem::replace(&mut buffer.path, into);
-                    buffer.history.push(from);
-                    buffer.future.clear();
-                    return relist(app, index);
-                }
-
-                list::Action::Leave => {
-                    let Some(parent) = buffer.path.parent().map(PathBuf::from) else {
-                        return Task::none();
-                    };
-
-                    let from = std::mem::replace(&mut buffer.path, parent);
-                    buffer.history.push(from);
-                    buffer.future.clear();
-                    return relist(app, index);
-                }
-            }
-
-            let _ = list;
-            Task::none()
+            action::dispatch(app, action)
         }
+
+        Message::Act(action) => action::dispatch(app, action),
 
         Message::Scanned(path, report) => {
             use crate::config::Verdict;
@@ -248,16 +198,13 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 
         Message::Changed(index) => relist(app, index),
 
-        Message::Filter(index, text) => {
-            let list = app.config.list.clone();
-            let Some(buffer) = app.buffers.get_mut(index) else {
-                return Task::none();
-            };
-
-            buffer.filter = text;
-            buffer.rebuild(&list);
-            Task::none()
-        }
+        Message::Filter(index, text) => action::dispatch(
+            app,
+            Action::Filter {
+                buffer: index,
+                text,
+            },
+        ),
 
         Message::Filtering(showing) => {
             app.filtering = showing;
@@ -285,45 +232,181 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
 
-        Message::Go(index, into) => {
-            let Some(buffer) = app.buffers.get_mut(index) else {
+        Message::Go(index, into) => action::dispatch(
+            app,
+            Action::Go {
+                buffer: index,
+                path: into,
+            },
+        ),
+        Message::Back(index) => action::dispatch(app, Action::Back { buffer: index }),
+        Message::Forward(index) => action::dispatch(app, Action::Forward { buffer: index }),
+    }
+}
+
+/// What a click or a key from the list widget means.
+///
+/// The widget reports what happened to it; this says which action that is.
+/// Kept apart so the widget knows nothing about buffers or history.
+fn translate(buffer: usize, found: list::Action) -> Option<Action> {
+    Some(match found {
+        list::Action::Select(row) => Action::Select { buffer, row },
+        list::Action::Toggle(row) => Action::Toggle { buffer, row },
+        list::Action::Extend(row) => Action::Extend { buffer, row },
+        list::Action::Cursor(row) => Action::Select { buffer, row },
+        list::Action::SelectAll => Action::SelectAll { buffer },
+        list::Action::Activate(row) => Action::Activate { buffer, row },
+        list::Action::Leave => Action::Leave { buffer },
+        list::Action::Filter => Action::Filtering(true),
+        list::Action::Escape => Action::Escape,
+        // The menu is still to come. The click moves the cursor meanwhile, so
+        // a right click does something rather than nothing.
+        list::Action::Menu { row, .. } => Action::Select { buffer, row },
+    })
+}
+
+/// Say no, and say why.
+///
+/// Every refusal goes through here, so a person always learns which rule
+/// stopped them rather than watching nothing happen.
+pub fn refuse(app: &mut App, reason: String) -> Task<Message> {
+    app.notice = Some(reason);
+    Task::none()
+}
+
+/// Do what an action says.
+///
+/// Reached only through `action::dispatch`, which checks the kind first.
+pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
+    let list = app.config.list.clone();
+
+    match action {
+        // Session actions answer a question. In the window there is nobody
+        // asking, so they do nothing; on the socket they will be answered
+        // before they ever reach here.
+        Action::Selection | Action::Buffers | Action::Cursor => Task::none(),
+
+        Action::Filtering(showing) => Task::done(Message::Filtering(showing)),
+
+        Action::Escape => {
+            // One key for "put away whatever is in front of me", in the order
+            // things are stacked.
+            if app.dialogue.is_some() {
+                return Task::done(Message::Dialogue(Choice::Dismiss));
+            }
+            Task::done(Message::Filtering(false))
+        }
+
+        Action::Select { buffer, row } => {
+            with(app, buffer, |found| found.select_only(row));
+            Task::none()
+        }
+        Action::Toggle { buffer, row } => {
+            with(app, buffer, |found| found.toggle(row));
+            Task::none()
+        }
+        Action::Extend { buffer, row } => {
+            with(app, buffer, |found| found.extend_to(row));
+            Task::none()
+        }
+        Action::SelectAll { buffer } => {
+            with(app, buffer, Buffer::select_all);
+            Task::none()
+        }
+
+        Action::Filter { buffer, text } => {
+            with(app, buffer, |found| {
+                found.filter = text;
+                found.rebuild(&list);
+            });
+            Task::none()
+        }
+
+        Action::Go { buffer, path } => {
+            let Some(found) = app.buffers.get_mut(buffer) else {
                 return Task::none();
             };
-            if buffer.path == into {
+            if found.path == path {
                 return Task::none();
             }
 
-            let from = std::mem::replace(&mut buffer.path, into);
-            buffer.history.push(from);
-            buffer.future.clear();
-            relist(app, index)
+            let from = std::mem::replace(&mut found.path, path);
+            found.history.push(from);
+            found.future.clear();
+            relist(app, buffer)
         }
 
-        Message::Back(index) => {
-            let Some(buffer) = app.buffers.get_mut(index) else {
+        Action::Leave { buffer } => {
+            let Some(found) = app.buffers.get_mut(buffer) else {
                 return Task::none();
             };
-            let Some(back) = buffer.history.pop() else {
+            let Some(parent) = found.path.parent().map(PathBuf::from) else {
                 return Task::none();
             };
 
-            let from = std::mem::replace(&mut buffer.path, back);
-            buffer.future.push(from);
-            relist(app, index)
+            let from = std::mem::replace(&mut found.path, parent);
+            found.history.push(from);
+            found.future.clear();
+            relist(app, buffer)
         }
 
-        Message::Forward(index) => {
-            let Some(buffer) = app.buffers.get_mut(index) else {
+        Action::Back { buffer } => {
+            let Some(found) = app.buffers.get_mut(buffer) else {
                 return Task::none();
             };
-            let Some(forward) = buffer.future.pop() else {
+            let Some(back) = found.history.pop() else {
                 return Task::none();
             };
 
-            let from = std::mem::replace(&mut buffer.path, forward);
-            buffer.history.push(from);
-            relist(app, index)
+            let from = std::mem::replace(&mut found.path, back);
+            found.future.push(from);
+            relist(app, buffer)
         }
+
+        Action::Forward { buffer } => {
+            let Some(found) = app.buffers.get_mut(buffer) else {
+                return Task::none();
+            };
+            let Some(forward) = found.future.pop() else {
+                return Task::none();
+            };
+
+            let from = std::mem::replace(&mut found.path, forward);
+            found.history.push(from);
+            relist(app, buffer)
+        }
+
+        Action::Activate { buffer, row } => {
+            let Some(found) = app.buffers.get_mut(buffer) else {
+                return Task::none();
+            };
+
+            // A directory is entered. A file goes to the scan chain first,
+            // and there is no other route to opening one.
+            let into = found
+                .at(row)
+                .filter(|entry| entry.kind.is_directory())
+                .map(|entry| entry.path.clone());
+
+            let Some(into) = into else {
+                let Some(path) = found.at(row).map(|entry| entry.path.clone()) else {
+                    return Task::none();
+                };
+                return scanned(app, path);
+            };
+
+            let from = std::mem::replace(&mut found.path, into);
+            found.history.push(from);
+            found.future.clear();
+            relist(app, buffer)
+        }
+    }
+}
+
+/// Do something to one buffer, if it is still there.
+fn with(app: &mut App, buffer: usize, change: impl FnOnce(&mut Buffer)) {
+    if let Some(found) = app.buffers.get_mut(buffer) {
+        change(found);
     }
 }
 

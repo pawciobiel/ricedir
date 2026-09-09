@@ -350,19 +350,30 @@ landing before the list widget is even proven.
       never-fatal `load()`, `trustworthy()` on the file *and its parent*,
       `first_run::create()` writing a config plus the probed handler list, and
       `color.rs` verbatim (`#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa`, 9 tests).
-- [ ] **The action registry — not started, and the docs said otherwise.**
-      `CLAUDE.md` listed `src/action.rs` as written and described it as the
-      single door every request goes through. There is no such file: the list
-      widget's own `Action` enum goes straight into `app::update`, which is
-      fine for a keyboard and a mouse and is exactly the shape M3 cannot use.
-      Doing it late is the retrofit `## Decided before any code` said would be
-      expensive, so it should come before the socket rather than with it.
+- [x] **The action registry, and a crate boundary to go with it.** One
+      repository, three crates: `ricedir-protocol` holds the messages,
+      `ricedir` is the window, `ricedir-mcp` is the translator.
 
-      One `Action` enum with typed arguments, one
-      `dispatch(action) -> Task<Message>`, and a name plus a one-line
-      description per variant. The menus, the toolbar and the bindings table
-      are all built from it, so a new action appears in all three at once and
-      M3 gets its tool list for free. Nothing here talks to an agent yet.
+      `ricedir-mcp` does not depend on `ricedir`. That is the whole reason for
+      the split. "File tools refuse when no window is running" was a sentence
+      in `CLAUDE.md`, and a sentence is only as strong as whoever reads it
+      next; now a call to `ricedir::open::spawn` from the MCP program is
+      `error[E0433]`. Checked by writing that call on purpose and reading the
+      error.
+
+      The registry itself: the list widget reports what happened to it,
+      `app::translate` says which action that is, `action::dispatch` checks
+      the kind, `app::carry_out` does the work. `Action::of` is the only place
+      a wire request becomes an action.
+
+      **Kinds live in the protocol crate, not in the window.** Both sides read
+      the same `Kind`, so the wire and the window cannot disagree about which
+      requests need a person. A test asserts a request keeps its kind through
+      the conversion.
+
+      Done before the socket rather than with it, as `## Decided before any
+      code` asked. At 5,808 lines it took an afternoon.
+
 - [x] **The window.** `iced::daemon` rather than `application`, because a
       second ricedir window should be a second window and not a second process.
       Theme, font and font size from the config; `decorations` left on until M6.

@@ -1,0 +1,15 @@
+[package]
+name = "ricedir-mcp"
+description = "Lets an agent drive a running ricedir, and watch itself doing it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# `ricedir` is deliberately absent, and must stay absent. This program asks the
+# running window to do things; it must not be able to do them itself. The
+# missing dependency is what makes that a compile error rather than a promise.
+[dependencies]
+ricedir-protocol.workspace = true
+serde_json.workspace = true
