@@ -1011,6 +1011,46 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       rather than stopping the world with a modal, and a finished job stays
       until dismissed if it had any.
 
+## Undecided: how a job tells the window what changed
+
+Raised on 2026-09-09, to be settled before M2 is built rather than during it.
+
+**What is wanted.** A copy or a delete of something large shows progress in the
+jobs panel. The rows it touches show it too: a file being deleted greys out, a
+file being written appears and fills. Copying twenty files updates the listing
+as each one lands, without a relist per file.
+
+**Why it needs deciding first.** Three things must all see the same events and
+none of them may reach into the others: the jobs panel, the file list, and the
+socket. A job that calls `buffer.rebuild()` directly couples the engine to the
+widgets, and an agent watching over the socket would see nothing.
+
+**The options, with what each costs.** No decision yet.
+
+- [ ] **Everything through `Message`.** A job sends progress into the Elm loop
+      and `update` puts it where it belongs. *For:* one path, no new
+      machinery, and the socket taps the same place the window does. Against:
+      `update` grows a branch per event kind, and a copy of 200k files means
+      200k messages unless they are coalesced -- which M1's listing already
+      had to learn.
+- [ ] **A job registry the widgets read.** Jobs write into `App.jobs`, and the
+      panel and the list read it during `view`. *For:* no fan-out at all, and
+      a widget takes what it needs. Against: "which rows are affected" becomes
+      a lookup on every frame, and nothing tells the socket anything happened.
+- [ ] **An event bus with subscribers.** A `broadcast` channel; the panel, the
+      list and the socket each subscribe. *For:* the parts genuinely do not
+      know about each other, and M3's event stream is the same channel.
+      Against: two ways to move information around inside one program, and
+      iced already has one.
+- [ ] **A per-entry state on the buffer.** Each `Entry` gains "being copied",
+      "being deleted", "arriving". *For:* the list draws from what it already
+      has, and greying a row is a colour. Against: it is the *job's* state
+      living in the *buffer*, and two jobs touching one file need an answer.
+
+**What to work out before choosing:** how the socket's event stream in M3 is
+fed, since whatever answers that probably answers this too; and whether a
+progress update is a message at all or a value the next frame reads.
+
 ## M3 — the control surface
 
 Read-only, and the foundation for everything in M4. The point is that an agent
