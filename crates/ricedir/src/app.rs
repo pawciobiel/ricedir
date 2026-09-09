@@ -63,7 +63,18 @@ pub enum MenuKind {
     Context { row: usize },
     /// The toolbar's sort button.
     Sort,
+    /// The toolbar's last button: everything the other buttons do, in words.
+    Toolbar,
 }
+
+/// A box divided left and right, and a box divided top and bottom.
+///
+/// Codicons. Checked against the installed font and then rendered to see
+/// which way round they go, because the names are `split-horizontal` and
+/// `split-vertical` and neither says whether that is the divider or the
+/// direction the panes sit in.
+const SPLIT_RIGHT: char = '\u{eb56}';
+const SPLIT_DOWN: char = '\u{eb57}';
 
 pub struct App {
     config: Config,
@@ -957,7 +968,11 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
     })
     .width(Length::Fill)
     .height(Length::Fill)
-    .spacing(1)
+    // Wide enough to see and to grab. `pane_grid` leaves the gap empty and
+    // shows whatever is behind, so this only reads as a divider because the
+    // container below paints `muted` there -- at 1px against a background the
+    // same colour as the tiles, two tiles looked like one.
+    .spacing(4)
     .on_click(Message::TileClicked)
     .on_drag(Message::TileDragged)
     .on_resize(6, Message::TileResized)
@@ -990,7 +1005,15 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
                 background: Some(app.config.theme.muted.color().into()),
                 ..container::Style::default()
             }),
-        grid,
+        // `muted` behind the grid, so the gaps `pane_grid` leaves between
+        // tiles are lines rather than nothing.
+        container(grid)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_: &iced::Theme| container::Style {
+                background: Some(app.config.theme.muted.color().into()),
+                ..container::Style::default()
+            }),
     ]
     .width(Length::Fill)
     .height(Length::Fill);
@@ -1055,8 +1078,14 @@ fn tile<'a>(app: &'a App, index: usize, buffer: &'a Buffer, focused: bool) -> El
     let accent = app.config.theme.accent.color();
     let muted = app.config.theme.muted.color();
 
+    let background = app.config.theme.background.color();
+
     container(page.width(Length::Fill).height(Length::Fill))
         .style(move |_: &iced::Theme| container::Style {
+            // Its own background, now that `muted` sits behind the grid to
+            // make the gaps visible. Without this the divider colour shows
+            // through every tile.
+            background: Some(background.into()),
             border: iced::Border {
                 color: if focused { accent } else { muted },
                 width: if focused { 1.0 } else { 0.0 },
@@ -1249,9 +1278,6 @@ fn toolbar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
             sort_glyph,
             format!("Sort: {:?}", list.sort),
             false,
-            // A menu needs a point, and a button knows where it is only
-            // approximately. Pinned under the right-hand end of the bar,
-            // which is where the button is.
             // Under the pointer that clicked it. A button cannot say where
             // it is, so the menu goes where the hand already was.
             Message::Act(Action::Menu {
@@ -1276,17 +1302,38 @@ fn toolbar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
         ),
         tool(
             app,
-            '\u{f0db}',
-            String::from("Split"),
+            SPLIT_RIGHT,
+            String::from("Split right  (Ctrl+\\)"),
             false,
             Message::Act(Action::Split(pane_grid::Axis::Vertical)),
         ),
         tool(
             app,
+            SPLIT_DOWN,
+            String::from("Split down  (Ctrl+-)"),
+            false,
+            Message::Act(Action::Split(pane_grid::Axis::Horizontal)),
+        ),
+        tool(
+            app,
             '\u{f00d}',
-            String::from("Close this tile"),
+            String::from("Close this tile  (Ctrl+W)"),
             false,
             Message::Act(Action::CloseTile),
+        ),
+        // Everything the buttons do, spelled out. A tile narrow enough to
+        // clip the buttons still has this, and a person who cannot tell one
+        // glyph from another can read the words.
+        tool(
+            app,
+            '\u{f142}',
+            String::from("Everything else"),
+            false,
+            Message::Act(Action::Menu {
+                kind: MenuKind::Toolbar,
+                buffer: index,
+                at: app.pointer,
+            }),
         ),
     ]
     .spacing(2)
@@ -1395,7 +1442,7 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
     let buffer = app.buffers.get(menu.buffer);
     let row = match menu.kind {
         MenuKind::Context { row } => Some(row),
-        MenuKind::Sort => None,
+        MenuKind::Sort | MenuKind::Toolbar => None,
     };
     let entry = row.and_then(|row| buffer.and_then(|found| found.at(row)));
     let directory = entry.filter(|entry| entry.kind.is_directory());
@@ -1423,7 +1470,44 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
     // where a button can also *show* whether a thing is on. A context menu
     // that carried them made every right click a list of settings rather than
     // a list of things to do to the file under the pointer.
-    if menu.kind == MenuKind::Sort {
+    if menu.kind == MenuKind::Toolbar {
+        let list = &app.config.list;
+
+        items = items.push(item(
+            format!("View: {}", list.layout.next().name()),
+            Message::Act(Action::Layout(list.layout.next())),
+        ));
+        items = items.push(item(
+            String::from(if list.show_hidden {
+                "Hide hidden files"
+            } else {
+                "Show hidden files"
+            }),
+            Message::Act(Action::ShowHidden(!list.show_hidden)),
+        ));
+        items = items.push(item(
+            String::from("Relist"),
+            Message::Act(Action::Relist {
+                buffer: menu.buffer,
+            }),
+        ));
+        items = items.push(item(
+            String::from("Split right"),
+            Message::Act(Action::Split(pane_grid::Axis::Vertical)),
+        ));
+        items = items.push(item(
+            String::from("Split down"),
+            Message::Act(Action::Split(pane_grid::Axis::Horizontal)),
+        ));
+        items = items.push(item(
+            String::from("Close this tile"),
+            Message::Act(Action::CloseTile),
+        ));
+        items = items.push(item(
+            String::from("Filter\u{2026}"),
+            Message::Act(Action::Filtering(true)),
+        ));
+    } else if menu.kind == MenuKind::Sort {
         use crate::config::Sort;
 
         for (field, label) in [

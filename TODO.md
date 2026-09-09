@@ -547,7 +547,11 @@ landing before the list widget is even proven.
       - [x] a sort menu: the field, and which way round
       - [x] a hidden-files toggle that lights up when they are showing
       - [x] a relist button
-      - [x] split, and close this tile
+      - [x] split right and split down, as two buttons
+      - [x] a last button that opens all of it as a menu, in words: a narrow
+            tile clips the buttons, and a glyph nobody recognises is not a
+            button anybody presses
+      - [x] close this tile
       - [x] per tile rather than one bar across the window. A single bar has
             to answer "which tile does this act on", and the honest answer --
             whichever has the keyboard -- is one more thing to know before
@@ -998,6 +1002,21 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       during this work turned out to be two ricedirs fighting over the same
       Wayland display, not a rendering fault -- which is the single-instance
       guard in `## M3` arriving as a real symptom rather than a nicety.
+
+## M1 stage 3: the divider, and glyphs whose names lie
+
+- [x] **A 1px gap between tiles was invisible.** `pane_grid` leaves the gap
+      empty and shows whatever is behind it, and behind it was the same colour
+      as the tiles. The grid sits on a `muted` container now and the gap is 4px,
+      which is both visible and wide enough to grab. Each tile paints its own
+      background, or the divider colour would show through all of it.
+
+- [x] **`split-horizontal` and `split-vertical` do not say which is which.**
+      The codicon names describe neither the divider nor the direction the
+      panes end up in. Both were rendered and the screenshot magnified before
+      either was believed: `U+EB56` is a box divided left and right,
+      `U+EB57` top and bottom. Guessing had a 50% chance and no way to notice
+      being wrong except somebody pressing the button.
 
 ## M2 — the job engine
 
