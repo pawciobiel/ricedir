@@ -137,6 +137,8 @@ pub struct App {
     /// `config.window` is the size it *opened* at. Anything that has to fit on
     /// screen needs the size it is, which only `resize_events` reports.
     size: iced::Size,
+    /// Which step the reading bar is on. Moves only while a read is out.
+    tick: usize,
     /// Home, the user directories, the mounts and the bookmarks.
     ///
     /// Read once at startup and after a bookmark is added. A disk appearing is
@@ -156,7 +158,11 @@ pub enum Message {
     /// An action from anywhere that is not the list widget.
     Act(Action),
     /// The directory a buffer is showing changed on disk.
-    Changed(usize),
+    Changed(usize, crate::watch::Change),
+    /// The paths a change named, read on a thread and back with the answer.
+    Examined(usize, u64, Vec<(PathBuf, Option<crate::entry::Entry>)>),
+    /// The clock that moves the reading bar. Only runs while a read is out.
+    Tick,
     /// The filter box was typed into.
     Filter(usize, String),
     /// Show or hide the filter box.
@@ -216,6 +222,7 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
         pointer: (0.0, 0.0),
         size: iced::Size::new(config_width, config_height),
         places: places::list(),
+        tick: 0,
     };
 
     // The id comes back before the window exists, so the tiles can be tied to
@@ -260,7 +267,17 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 
             match update {
                 buffer::Update::Entries(entries) => buffer.extend(entries, &list),
-                buffer::Update::Done => buffer.finish(&list),
+                buffer::Update::Done => {
+                    buffer.finish(&list);
+
+                    // Something changed while this listing was being read, so
+                    // what just landed was already out of date when it
+                    // arrived. Read it once more. Without this the change is
+                    // lost until somebody presses F5.
+                    if buffer.take_stale() {
+                        return relist(app, index);
+                    }
+                }
                 buffer::Update::Failed(problem) => {
                     app.notice = Some(format!("{}: {problem}", buffer.path.display()));
                     buffer.fail(problem);
@@ -346,6 +363,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
 
+        Message::Tick => {
+            app.tick = app.tick.wrapping_add(1);
+            Task::none()
+        }
+
         Message::Resized(size) => {
             app.size = size;
             Task::none()
@@ -371,7 +393,41 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
 
-        Message::Changed(index) => relist(app, index),
+        Message::Changed(index, change) => {
+            // One file saved used to cost a whole `read_dir`, one
+            // `symlink_metadata` per entry and a full sort -- 114 CPU ticks
+            // on a directory of 100,000, every time somebody pressed save.
+            // Now it costs one `stat` per path the events named.
+            let touched = match change {
+                crate::watch::Change::Rescan => return relist(app, index),
+                crate::watch::Change::Touched(paths) => paths,
+            };
+
+            // The reading is a blocking syscall per path, so it goes to a
+            // thread and comes back as a message. On a local disk that is
+            // microseconds and the round trip is the expensive half; over
+            // sshfs it is the only thing keeping the window answering.
+            let generation = app.buffers.get(index).map_or(0, |found| found.generation);
+            buffer::examine(touched).map(move |read| Message::Examined(index, generation, read))
+        }
+
+        Message::Examined(index, generation, read) => {
+            let list = app.config.list.clone();
+            let Some(buffer) = app.buffers.get_mut(index) else {
+                return Task::none();
+            };
+
+            // The buffer moved on while the paths were being read, so what
+            // came back describes a directory it is no longer showing.
+            if generation != buffer.generation {
+                return Task::none();
+            }
+
+            // A `false` back means a replacement listing is already on its
+            // way and will say what is there, so there is nothing to do.
+            buffer.reconcile(read, &list);
+            Task::none()
+        }
 
         Message::Filter(index, text) => action::dispatch(
             app,
@@ -544,6 +600,7 @@ const fn translate(
             buffer,
             typing: true,
         },
+        list::Action::Relist => Action::Relist { buffer },
         list::Action::Menu { row, at } => Action::Menu {
             kind: MenuKind::Context { row },
             buffer,
@@ -1414,7 +1471,7 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
         Some(
             crate::watch::directory(buffer.path.clone(), buffer.generation)
                 .with(index)
-                .map(|(index, ())| Message::Changed(index)),
+                .map(|(index, change)| Message::Changed(index, change)),
         )
     });
 
@@ -1446,11 +1503,37 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
         }
     }
 
-    iced::Subscription::batch(watches.chain([
-        window::close_events().map(Message::Closed),
-        window::resize_events().map(|(_, size)| Message::Resized(size)),
-        iced::event::listen_with(moved),
-    ]))
+    // A clock, but only while something is being read.
+    //
+    // The count in the status line moves when a chunk lands, which on a local
+    // disk is often enough to look alive. On sshfs a chunk can take seconds,
+    // and on a hung NFS mount `readdir` never returns at all -- so exactly
+    // when it matters most, a count driven by arrivals stops moving and the
+    // window looks frozen. A clock keeps the bar sliding whatever the
+    // filesystem is doing, which is the one thing it has to say: ricedir is
+    // fine, the mount is slow.
+    //
+    // It is subscribed only while a read is outstanding, so an idle window
+    // wakes for nothing.
+    let reading = app
+        .buffers
+        .iter()
+        .any(|found| found.refreshing() || found.listing == Listing::Loading);
+
+    let ticking = reading
+        .then(|| iced::time::every(std::time::Duration::from_millis(80)).map(|_| Message::Tick));
+
+    iced::Subscription::batch(
+        watches.chain(
+            [
+                window::close_events().map(Message::Closed),
+                window::resize_events().map(|(_, size)| Message::Resized(size)),
+                iced::event::listen_with(moved),
+            ]
+            .into_iter()
+            .chain(ticking),
+        ),
+    )
 }
 
 /// Breadcrumbs, and the two arrows.
@@ -1743,14 +1826,34 @@ fn status<'a>(app: &'a App, buffer: &'a Buffer) -> Element<'a, Message> {
             .into();
     }
 
+    let reading = buffer.refreshing() || buffer.listing == Listing::Loading;
     let selected = buffer.selection.len();
     let counts = match buffer.listing {
-        Listing::Loading => format!("{} items, reading…", buffer.rows()),
+        Listing::Loading => format!("{} items, reading\u{2026}", buffer.rows()),
         Listing::Failed(_) => String::from("unreadable"),
         Listing::Ready if selected > 0 => {
             format!("{} items, {selected} selected", buffer.rows())
         }
         Listing::Ready => format!("{} items", buffer.rows()),
+    };
+
+    // A relist keeps the old listing up and stays `Ready`, so without this
+    // there is nothing on screen to say a refresh is running. The count of
+    // what is showing is still true, so it stays, and the second number is
+    // how much of the replacement has arrived.
+    //
+    // The number and the bar say different things and both are wanted. The
+    // number says how big the directory is turning out to be, but it only
+    // moves when a chunk lands -- rarely on sshfs, never on a hung mount.
+    // The bar runs off a clock and says the one thing left to say there:
+    // ricedir is alive and the filesystem is slow.
+    let counts = if buffer.refreshing() {
+        format!(
+            "{counts}  \u{b7}  refreshing, {} read\u{2026}",
+            buffer.read_so_far()
+        )
+    } else {
+        counts
     };
 
     // Saying a filter is on matters more than the count: a listing that is
@@ -1761,10 +1864,55 @@ fn status<'a>(app: &'a App, buffer: &'a Buffer) -> Element<'a, Message> {
         format!("{counts}  ·  filtered by `{}`", buffer.filter)
     };
 
-    container(row![text(counts).size(13)].spacing(12))
+    let mut line = row![text(counts).size(13)].spacing(12);
+
+    if reading {
+        line = line.push(reading_bar(app));
+    }
+
+    container(line.align_y(iced::Alignment::Center))
         .padding(8)
         .width(Length::Fill)
         .into()
+}
+
+/// A lit block sliding along a track, while a directory is being read.
+///
+/// Quads and nothing else -- no glyph, so no font to check, and no rotation,
+/// which iced has no transform for anyway. What it has to say is only that
+/// ricedir is alive: on a stalled sshfs or a hung NFS mount the count beside
+/// it stops moving, and a still window is indistinguishable from a crashed
+/// one.
+fn reading_bar(app: &App) -> Element<'_, Message> {
+    /// How many steps the block takes to cross and come back.
+    const STEPS: usize = 12;
+
+    let theme = &app.config.theme;
+    let accent = theme.accent.color();
+    let muted = theme.muted.color();
+
+    // A triangle wave, so it slides back rather than jumping to the start.
+    let step = app.tick % (STEPS * 2);
+    let at = if step < STEPS { step } else { STEPS * 2 - step };
+
+    let block = |lit: bool| {
+        container(iced::widget::Space::new().width(6).height(4)).style(move |_: &iced::Theme| {
+            container::Style {
+                background: Some(if lit { accent.into() } else { muted.into() }),
+                border: iced::Border {
+                    radius: 2.0.into(),
+                    ..iced::Border::default()
+                },
+                ..container::Style::default()
+            }
+        })
+    };
+
+    let mut track = row![].spacing(3);
+    for square in 0..STEPS {
+        track = track.push(block(square == at));
+    }
+    track.into()
 }
 
 /// The menu a right click opens, where the right click happened.
@@ -2315,17 +2463,16 @@ fn relist(app: &mut App, index: usize) -> Task<Message> {
     buffer.generation = buffer.generation.wrapping_add(1);
     let generation = buffer.generation;
 
-    *buffer = {
-        let mut fresh = Buffer::new(buffer.path.clone(), buffer.view);
-        fresh.generation = generation;
-        fresh.history = std::mem::take(&mut buffer.history);
-        fresh.future = std::mem::take(&mut buffer.future);
-        // A relist because the directory changed must not also clear what was
-        // typed into the filter box, or watching a directory would fight
-        // whoever is filtering it.
-        fresh.filter = std::mem::take(&mut buffer.filter);
-        fresh
-    };
+    // The old listing stays on screen while the new one is read, and is
+    // swapped for it when the last chunk lands. Clearing first blanked the
+    // tile for as long as the read took -- unnoticeable on a small directory
+    // and about a second on 100,000, which reads as the program losing the
+    // files rather than as it working.
+    //
+    // A buffer with nothing showing yet has nothing to preserve, so it
+    // streams straight in and paints as it goes. That is what makes a slow
+    // mount bearable, and it is worth keeping.
+    buffer.start_arriving();
 
     let path = buffer.path.clone();
     buffer::list(path).map(move |update| Message::Listed(index, generation, update))
@@ -2361,6 +2508,7 @@ mod tests {
             pointer: (0.0, 0.0),
             size: iced::Size::new(1100.0, 700.0),
             places: Vec::new(),
+            tick: 0,
         }
     }
 

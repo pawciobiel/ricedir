@@ -14,7 +14,9 @@
 //! instances on this machine, and a long session opens a lot of directories.
 //! A buffer nobody is looking at relists when it becomes visible instead.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use iced::Subscription;
@@ -26,6 +28,22 @@ use notify::{RecursiveMode, Watcher};
 /// Long enough that unpacking a tarball is one relist rather than hundreds,
 /// short enough that saving a file in an editor feels immediate.
 const SETTLE: Duration = Duration::from_millis(120);
+
+/// How many touched paths are worth re-reading one at a time.
+///
+/// Past this, reading the whole directory again is cheaper than the stats and
+/// bounds the memory the set can take. Unpacking a tarball goes this way.
+const TOO_MANY: usize = 512;
+
+/// What a settled burst of events amounts to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// These paths were mentioned. Re-read each and reconcile.
+    Touched(BTreeSet<PathBuf>),
+    /// Read the directory again from scratch: the kernel dropped events, or
+    /// so many arrived that one at a time is the slower way.
+    Rescan,
+}
 
 /// Whether an event could have changed what a listing shows.
 ///
@@ -51,12 +69,25 @@ fn changes_a_listing(kind: notify::EventKind) -> bool {
 /// subscription it is already running and keeps the old stream -- which is
 /// watching the directory that was left. ricebar's `app::subscription` has
 /// the same note, and it cost real time there.
-pub fn directory(path: PathBuf, generation: u64) -> Subscription<()> {
+pub fn directory(path: PathBuf, generation: u64) -> Subscription<Change> {
     Subscription::run_with((path, generation), |(path, _)| {
         let path = path.clone();
 
         iced::stream::channel(1, async move |mut output| {
-            let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
+
+            // Set when an event could not be queued, and read once the burst
+            // settles. It cannot be a message, because the way it is found
+            // out is that a message would not fit: an earlier version sent
+            // `Rescan` down the same full channel, which failed in exactly
+            // the same way and lost the fact silently. A directory of 900
+            // new files then settled at 218 rows and stayed there.
+            //
+            // Genuinely shared between notify's thread and this task, which
+            // is what an atomic is for -- and the only shared mutable state
+            // in ricedir.
+            let lost = std::sync::Arc::new(AtomicBool::new(false));
+            let losing = std::sync::Arc::clone(&lost);
 
             // The watcher must outlive this scope or the watch is dropped with
             // it, which reads as "no directory ever changes".
@@ -64,14 +95,29 @@ pub fn directory(path: PathBuf, generation: u64) -> Subscription<()> {
                 notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                     let Ok(event) = event else { return };
 
+                    // The kernel's queue filled and it threw events away.
+                    // notify says so as `Other` with `Rescan` set -- which the
+                    // filter below drops, so this has to be looked at first.
+                    // Missing it is how a listing quietly stops matching the
+                    // disk, which is the fault nobody can reproduce.
+                    if event.need_rescan() {
+                        losing.store(true, Ordering::Relaxed);
+                        let _ = sender.try_send(Change::Touched(BTreeSet::new()));
+                        return;
+                    }
+
                     if !changes_a_listing(event.kind) {
                         return;
                     }
 
-                    // Blocking, from notify's own thread. A full channel means
-                    // the loop below is already behind on relisting, and the
-                    // event it would have queued asks for the same thing.
-                    let _ = sender.try_send(());
+                    // Never blocks: this is notify's own thread, and holding
+                    // it up backs the kernel's queue into a real overflow.
+                    // A send that does not fit sets the flag instead, and the
+                    // burst settles into a rescan.
+                    let touched = Change::Touched(event.paths.into_iter().collect());
+                    if sender.try_send(touched).is_err() {
+                        losing.store(true, Ordering::Relaxed);
+                    }
                 });
 
             let Ok(mut watcher) = watcher else {
@@ -86,16 +132,42 @@ pub fn directory(path: PathBuf, generation: u64) -> Subscription<()> {
                 return;
             }
 
-            while receiver.recv().await.is_some() {
-                // Swallow whatever else arrives while the dust settles.
+            while let Some(first) = receiver.recv().await {
+                // Gather the burst rather than throwing it away. A path
+                // touched fifty times is one entry in the set and so one
+                // `stat` later, which is what makes the debounce worth
+                // having twice over.
+                let mut touched = BTreeSet::new();
+                let mut rescan = false;
+                let mut take = |change: Change| match change {
+                    Change::Rescan => rescan = true,
+                    Change::Touched(paths) => touched.extend(paths),
+                };
+                take(first);
+
                 loop {
                     tokio::time::sleep(SETTLE).await;
-                    if receiver.try_recv().is_err() {
+                    let mut quiet = true;
+                    while let Ok(change) = receiver.try_recv() {
+                        take(change);
+                        quiet = false;
+                    }
+                    if quiet {
                         break;
                     }
                 }
 
-                if output.send(()).await.is_err() {
+                // Past a point, reading the directory again beats stat-ing
+                // every path in it one at a time -- and so does having been
+                // told that some events never made it here at all.
+                let rescan = rescan || lost.swap(false, Ordering::Relaxed);
+                let settled = if rescan || touched.len() > TOO_MANY {
+                    Change::Rescan
+                } else {
+                    Change::Touched(touched)
+                };
+
+                if output.send(settled).await.is_err() {
                     return;
                 }
             }

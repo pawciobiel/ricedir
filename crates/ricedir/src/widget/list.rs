@@ -89,6 +89,8 @@ pub enum Action {
     Buffers,
     /// Turn the path bar over to its text face.
     TypePath,
+    /// Read the directory again.
+    Relist,
     /// Right click, with where it happened, so a menu can be put there.
     ///
     /// `None` means the click landed past the last row. That is a different
@@ -580,6 +582,10 @@ where
                     keyboard::Key::Named(key::Named::Enter) => Some(Action::Activate(cursor_row)),
                     keyboard::Key::Named(key::Named::Backspace) => Some(Action::Leave),
                     keyboard::Key::Named(key::Named::Escape) => Some(Action::Escape),
+                    // The toolbar's tooltip promised this and nothing bound
+                    // it. F5 is what every browser and every file manager
+                    // uses, so the promise was the right one to keep.
+                    keyboard::Key::Named(key::Named::F5) => Some(Action::Relist),
                     keyboard::Key::Character(character)
                         if character.as_str() == "a" && modifiers.command() =>
                     {

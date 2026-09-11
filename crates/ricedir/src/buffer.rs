@@ -4,7 +4,7 @@
 //! reopening the same directory is instant. Two tiles on one directory share
 //! one buffer, and so one listing and one watcher.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,13 @@ pub enum Listing {
     Failed(String),
 }
 
+/// Where the cursor and the selection were, by name rather than by index.
+#[derive(Debug, Default)]
+struct Remembered {
+    cursor: Option<String>,
+    selected: HashSet<String>,
+}
+
 /// An open directory.
 #[derive(Debug)]
 pub struct Buffer {
@@ -50,6 +57,16 @@ pub struct Buffer {
     /// Indices into `entries` that the filter lets through, in shown order.
     /// The list widget draws this, so a filter never disturbs a selection.
     visible: Vec<usize>,
+
+    /// A replacement listing being collected, while the old one stays up.
+    ///
+    /// `None` means stream straight into `entries`, which is what a first
+    /// listing does: there is nothing on screen to preserve, and a slow mount
+    /// should paint as it arrives rather than after. `Some` means something
+    /// is already showing -- a relist, or a tile coming back into view -- and
+    /// clearing it first would blank the tile for as long as the read takes.
+    /// On a directory of 100,000 that is long enough to look broken.
+    arriving: Option<Vec<Entry>>,
 
     /// Where the keyboard cursor is, as a position in `visible`.
     pub cursor: usize,
@@ -85,6 +102,15 @@ pub struct Buffer {
     /// When the entries were last sorted, so a streaming listing is not
     /// re-sorted once per chunk. `None` until the first chunk arrives.
     sorted: Option<Instant>,
+
+    /// Something changed that could not be applied, so read it all again.
+    ///
+    /// Set when a change arrives mid-relist: the entries being reconciled are
+    /// the ones about to be thrown away, and the replacement was read before
+    /// the change happened, so neither is right. Without this the change is
+    /// simply lost and the listing stops matching the disk until somebody
+    /// presses F5.
+    stale: bool,
 }
 
 impl Buffer {
@@ -97,6 +123,7 @@ impl Buffer {
             listing: Listing::Loading,
             entries: Vec::new(),
             visible: Vec::new(),
+            arriving: None,
             cursor: 0,
             placed: false,
             anchor: 0,
@@ -106,6 +133,7 @@ impl Buffer {
             future: Vec::new(),
             generation: 0,
             sorted: None,
+            stale: false,
         }
     }
 
@@ -131,6 +159,45 @@ impl Buffer {
             .is_some_and(|index| self.selection.contains(index))
     }
 
+    /// Begin a replacement listing, keeping what is on screen.
+    ///
+    /// A buffer showing nothing has nothing to keep, so it streams straight
+    /// into `entries` and paints as the chunks land -- which is what makes a
+    /// slow mount bearable.
+    pub fn start_arriving(&mut self) {
+        self.sorted = None;
+        self.arriving = if self.entries.is_empty() {
+            None
+        } else {
+            Some(Vec::with_capacity(self.entries.len()))
+        };
+    }
+
+    /// Whether a replacement listing is being read behind what is showing.
+    pub const fn refreshing(&self) -> bool {
+        self.arriving.is_some()
+    }
+
+    /// Whether something changed that could not be applied, clearing the mark.
+    ///
+    /// Asked once a listing lands, so the caller can read it again.
+    pub const fn take_stale(&mut self) -> bool {
+        let was = self.stale;
+        self.stale = false;
+        was
+    }
+
+    /// How much of a replacement listing has arrived so far.
+    ///
+    /// Says how big the directory is turning out to be as well as that
+    /// something is happening, which is more than a moving bar can. It is
+    /// not enough on its own, though: it only changes when a chunk lands, so
+    /// on a slow mount it moves rarely and on a hung one never. The bar
+    /// beside it runs off a clock for that reason.
+    pub fn read_so_far(&self) -> usize {
+        self.arriving.as_ref().map_or(0, Vec::len)
+    }
+
     /// Take another chunk from the listing thread.
     ///
     /// Sorting is throttled rather than done per chunk. Every chunk means one
@@ -140,6 +207,14 @@ impl Buffer {
     /// and costs a fraction of that, and [`Self::finish`] always sorts, so
     /// what settles is right however the chunks fell.
     pub fn extend(&mut self, entries: Vec<Entry>, list: &List) {
+        // A replacement listing is collected out of sight and shown all at
+        // once. Sorting it as it grows would cost the same quadratic work for
+        // a result nobody sees, and the old listing is still on screen.
+        if let Some(arriving) = &mut self.arriving {
+            arriving.extend(entries);
+            return;
+        }
+
         self.entries.extend(entries);
 
         let due = self
@@ -152,18 +227,115 @@ impl Buffer {
         }
     }
 
-    /// The listing finished: sort what arrived and settle the cursor.
+    /// Bring named paths up to date, without reading the directory again.
+    ///
+    /// **One rule: re-read every path the events mentioned, and let the
+    /// answer decide.** It exists now, so insert it or replace what is there;
+    /// it does not, so take it out. That covers create, remove, a metadata
+    /// change, and every shape of rename, without pairing anything.
+    ///
+    /// The reading happens on a worker thread and arrives here already done,
+    /// as `(path, what it is now)` pairs -- `None` meaning gone. An earlier
+    /// version called `symlink_metadata` in this function, which put a
+    /// blocking syscall on the Elm loop: microseconds on a local disk, tens
+    /// of milliseconds each over sshfs, and for ever on a hung NFS mount,
+    /// with the whole window frozen behind it.
+    ///
+    /// Pairing was the hazard this was expected to have. Measured on this
+    /// machine, notify 8 emits a rename *three* ways at once -- `Name(From)`,
+    /// `Name(To)` and a synthesised `Name(Both)`, all sharing a tracker id --
+    /// while a move out of the directory gives only `From` and a move in only
+    /// `To`. Re-reading is right for all five without knowing which it was,
+    /// and applying the same event twice changes nothing.
+    ///
+    /// Returns `false` when it declined, which today means a replacement
+    /// listing is already on its way and would undo the work.
+    pub fn reconcile(&mut self, read: Vec<(PathBuf, Option<Entry>)>, list: &List) -> bool {
+        if self.arriving.is_some() {
+            // Applied to entries that are about to be replaced, and the
+            // replacement was read before this happened. Neither is right,
+            // so say so and let the caller read it again afterwards.
+            self.stale = true;
+            return false;
+        }
+
+        let was = self.remembered();
+
+        for (path, found) in read {
+            // A path in another directory is not ours. inotify names the
+            // watched directory itself for some events, and that is not a
+            // row either.
+            if path.parent() != Some(self.path.as_path()) {
+                continue;
+            }
+
+            let at = self.entries.iter().position(|entry| entry.path == path);
+
+            match (found, at) {
+                // Still there: replace, so a changed size or time is picked
+                // up -- and so the row moves if the sort is by that.
+                (Some(entry), Some(at)) => self.entries[at] = entry,
+                (Some(entry), None) => self.entries.push(entry),
+                (None, Some(at)) => {
+                    self.entries.remove(at);
+                }
+                (None, None) => {}
+            }
+        }
+
+        // `entries` is near-sorted -- at most a handful of rows are out of
+        // place -- and Rust's stable sort walks existing runs, so this is far
+        // cheaper than it looks. What it buys is that `visible`, the cursor
+        // and the selection are all rebuilt by name, so none of the index
+        // shifting an insert causes has to be reasoned about here.
+        self.rebuild_from(list, was);
+        true
+    }
+
+    /// The listing finished: swap in what arrived, sort it, settle the cursor.
     pub fn finish(&mut self, list: &List) {
         self.listing = Listing::Ready;
-        self.rebuild(list);
+
+        // Remembered against the entries being replaced, not against the
+        // replacement -- the selection is indices into the old vector.
+        let was = self.remembered();
+        if let Some(arriving) = self.arriving.take() {
+            self.entries = arriving;
+        }
+
+        self.rebuild_from(list, was);
     }
 
     pub fn fail(&mut self, problem: String) {
         self.listing = Listing::Failed(problem);
+        // Including a replacement that was part-collected. A directory that
+        // cannot be read has no listing to show, old or new: keeping the last
+        // good one would say the files are still there.
+        self.arriving = None;
         self.entries.clear();
         self.visible.clear();
         self.cursor = 0;
         self.anchor = 0;
+    }
+
+    /// What the cursor and the selection were on, by name.
+    ///
+    /// Taken before `entries` is touched, because both are indices into it:
+    /// once the vector is replaced the numbers point at whatever happens to
+    /// be in those slots now.
+    fn remembered(&self) -> Remembered {
+        Remembered {
+            cursor: self
+                .placed
+                .then(|| self.at(self.cursor).map(|entry| entry.name.clone()))
+                .flatten(),
+            selected: self
+                .selection
+                .iter()
+                .filter_map(|index| self.entries.get(*index))
+                .map(|entry| entry.name.clone())
+                .collect(),
+        }
     }
 
     /// Sort and filter, keeping the cursor on the entry it was on.
@@ -172,16 +344,19 @@ impl Buffer {
     /// and a cursor that stays on a number rather than on a file jumps around
     /// whenever a directory changes underneath it.
     pub fn rebuild(&mut self, list: &List) {
-        let on = self
-            .placed
-            .then(|| self.at(self.cursor).map(|entry| entry.name.clone()))
-            .flatten();
-        let selected: HashSet<String> = self
-            .selection
-            .iter()
-            .filter_map(|index| self.entries.get(*index))
-            .map(|entry| entry.name.clone())
-            .collect();
+        let was = self.remembered();
+        self.rebuild_from(list, was);
+    }
+
+    /// [`Self::rebuild`], with what to look for passed in.
+    ///
+    /// Apart so a swapped-in listing can be remembered against the entries it
+    /// is replacing rather than against itself.
+    fn rebuild_from(&mut self, list: &List, was: Remembered) {
+        let Remembered {
+            cursor: on,
+            selected,
+        } = was;
 
         self.entries
             .sort_by(|left, right| entry::compare(left, right, list));
@@ -397,6 +572,32 @@ impl<'a> Filter<'a> {
     }
 }
 
+/// Read named paths on a thread of its own, and say what each is now.
+///
+/// `None` against a path means it is not there any more. Same reasoning as
+/// [`list`]: these are blocking syscalls, and on a stalled mount each one can
+/// take as long as it likes without the window noticing.
+pub fn examine(paths: BTreeSet<PathBuf>) -> Task<Vec<(PathBuf, Option<Entry>)>> {
+    Task::future(async move {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        std::thread::spawn(move || {
+            let read = paths
+                .into_iter()
+                .map(|path| {
+                    let found = Entry::read(path.clone()).ok();
+                    (path, found)
+                })
+                .collect();
+            // The receiver going means the buffer was closed or relisted, and
+            // there is nobody left to tell.
+            let _ = sender.send(read);
+        });
+
+        receiver.await.unwrap_or_default()
+    })
+}
+
 /// Read a directory on a thread of its own, a chunk at a time.
 ///
 /// A thread rather than an async task: `read_dir` and `stat` are blocking
@@ -484,6 +685,264 @@ mod tests {
         );
         buffer.finish(&List::default());
         buffer
+    }
+
+    /// A scratch directory of this test's own, so two tests never collide.
+    fn scratch(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("ricedir-reconcile-{name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("make the scratch directory");
+        root
+    }
+
+    /// What the worker hands back for a set of paths: each one, and what it
+    /// is now. This is [`examine`] without the thread.
+    fn examined<I: IntoIterator<Item = PathBuf>>(paths: I) -> Vec<(PathBuf, Option<Entry>)> {
+        paths
+            .into_iter()
+            .map(|path| {
+                let found = Entry::read(path.clone()).ok();
+                (path, found)
+            })
+            .collect()
+    }
+
+    /// The same, for an event naming one path.
+    fn one(path: PathBuf) -> Vec<(PathBuf, Option<Entry>)> {
+        examined([path])
+    }
+
+    /// Listed from a real directory, so `reconcile` has something to `stat`.
+    fn listed(root: &Path, names: &[&str]) -> Buffer {
+        let list = List::default();
+        let mut buffer = Buffer::new(root.to_path_buf(), list.view());
+        let entries = names
+            .iter()
+            .map(|name| Entry::read(root.join(name)).expect("the file was just made"))
+            .collect();
+        buffer.extend(entries, &list);
+        buffer.finish(&list);
+        buffer
+    }
+
+    /// One `stat` per named path, and the answer decides. Create, remove and
+    /// a metadata change all go the same way, without pairing anything.
+    #[test]
+    fn reconcile_reads_the_named_paths_and_nothing_else() {
+        let root = scratch("basics");
+        std::fs::write(root.join("stays"), b"x").expect("write");
+        std::fs::write(root.join("goes"), b"x").expect("write");
+
+        let list = List::default();
+        let mut buffer = listed(&root, &["stays", "goes"]);
+        assert_eq!(buffer.rows(), 2);
+
+        // The directory changes underneath: one arrives, one leaves, one
+        // grows.
+        std::fs::write(root.join("arrives"), b"x").expect("write");
+        std::fs::remove_file(root.join("goes")).expect("remove");
+        std::fs::write(root.join("stays"), b"much longer than before").expect("write");
+
+        let touched: BTreeSet<PathBuf> = ["arrives", "goes", "stays"]
+            .iter()
+            .map(|name| root.join(name))
+            .collect();
+        assert!(buffer.reconcile(examined(touched), &list));
+
+        let shown: Vec<&str> = buffer.shown().map(|e| e.name.as_str()).collect();
+        assert_eq!(shown, ["arrives", "stays"]);
+        assert_eq!(
+            buffer.at(1).map(|e| e.size),
+            Some(23),
+            "the size should have been re-read"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// notify 8 emits a rename three ways at once -- `From`, `To` and a
+    /// synthesised `Both`, all with one tracker id -- measured on this
+    /// machine. Re-reading is right for all of them, and applying the same
+    /// event twice has to change nothing.
+    #[test]
+    fn reconcile_handles_a_rename_however_it_is_reported() {
+        let root = scratch("rename");
+        std::fs::write(root.join("before"), b"x").expect("write");
+
+        let list = List::default();
+        let mut buffer = listed(&root, &["before"]);
+        std::fs::rename(root.join("before"), root.join("after")).expect("rename");
+
+        // Both paths in one set, which is what `Name(Both)` gives.
+        let both: BTreeSet<PathBuf> = [root.join("before"), root.join("after")]
+            .into_iter()
+            .collect();
+        buffer.reconcile(examined(both), &list);
+        let shown: Vec<&str> = buffer.shown().map(|e| e.name.as_str()).collect();
+        assert_eq!(shown, ["after"]);
+
+        // The `From` and `To` events for the same rename arrive as well.
+        // Applying them after the fact must not duplicate the row or lose it.
+        buffer.reconcile(one(root.join("before")), &list);
+        buffer.reconcile(one(root.join("after")), &list);
+        let shown: Vec<&str> = buffer.shown().map(|e| e.name.as_str()).collect();
+        assert_eq!(shown, ["after"], "applying it again changed nothing");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A path in another directory is not a row here. inotify names the
+    /// watched directory itself for some events, and that is not one either.
+    #[test]
+    fn reconcile_ignores_paths_that_are_not_in_this_directory() {
+        let root = scratch("elsewhere");
+        std::fs::write(root.join("mine"), b"x").expect("write");
+
+        let list = List::default();
+        let mut buffer = listed(&root, &["mine"]);
+
+        let strangers: BTreeSet<PathBuf> = [
+            root.clone(),
+            PathBuf::from("/etc/hostname"),
+            root.join("deeper").join("nested"),
+        ]
+        .into_iter()
+        .collect();
+        buffer.reconcile(examined(strangers), &list);
+
+        let shown: Vec<&str> = buffer.shown().map(|e| e.name.as_str()).collect();
+        assert_eq!(shown, ["mine"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The cursor and the selection are indices into `entries`, and an insert
+    /// shifts everything after it. Reconcile has to leave both on the files
+    /// they were on, not on the numbers.
+    #[test]
+    fn reconcile_keeps_the_cursor_and_the_selection() {
+        let root = scratch("cursor");
+        for name in ["b", "c", "d"] {
+            std::fs::write(root.join(name), b"x").expect("write");
+        }
+
+        let list = List::default();
+        let mut buffer = listed(&root, &["b", "c", "d"]);
+        buffer.toggle(2); // select `d`
+        buffer.move_to(1); // cursor on `c`
+
+        // `a` sorts before all of them, so every index shifts by one.
+        std::fs::write(root.join("a"), b"x").expect("write");
+        buffer.reconcile(one(root.join("a")), &list);
+
+        assert_eq!(
+            buffer.at(buffer.cursor).map(|e| e.name.as_str()),
+            Some("c"),
+            "the cursor should still be on its file"
+        );
+        let picked: Vec<&str> = buffer.selected().map(|e| e.name.as_str()).collect();
+        assert_eq!(picked, ["d"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A replacement listing is already on its way, so touching the entries
+    /// now would be undone by the swap -- and worse, would be applied to the
+    /// listing being replaced.
+    #[test]
+    fn reconcile_declines_while_a_relist_is_in_flight() {
+        let root = scratch("inflight");
+        std::fs::write(root.join("one"), b"x").expect("write");
+
+        let list = List::default();
+        let mut buffer = listed(&root, &["one"]);
+        buffer.start_arriving();
+
+        std::fs::write(root.join("two"), b"x").expect("write");
+        assert!(!buffer.reconcile(one(root.join("two")), &list));
+        assert_eq!(buffer.rows(), 1, "and it left the listing alone");
+
+        // Declining is not dropping. The replacement was read before this
+        // happened, so it is wrong too, and somebody has to be told to read
+        // the directory again -- otherwise the change is lost until F5.
+        assert!(buffer.take_stale(), "it should have said so");
+        assert!(!buffer.take_stale(), "and only once");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A relist keeps the old listing up until the new one is complete.
+    /// Clearing first blanks the tile for as long as the read takes, which on
+    /// a directory of 100,000 reads as the program losing the files.
+    #[test]
+    fn a_relist_shows_the_old_listing_until_the_new_one_lands() {
+        let list = List::default();
+        let mut buffer = buffer(&["a", "b", "c"]);
+        assert_eq!(buffer.rows(), 3);
+
+        buffer.start_arriving();
+        assert!(buffer.refreshing(), "and it says so");
+        assert_eq!(buffer.rows(), 3, "still the old three");
+
+        // Chunks land out of sight.
+        buffer.extend(vec![entry("x")], &list);
+        assert_eq!(buffer.rows(), 3, "still the old three");
+        buffer.extend(vec![entry("y")], &list);
+        assert_eq!(buffer.rows(), 3, "still the old three");
+
+        buffer.finish(&list);
+        assert!(!buffer.refreshing());
+        let shown: Vec<&str> = buffer.shown().map(|e| e.name.as_str()).collect();
+        assert_eq!(shown, ["x", "y"], "swapped all at once");
+    }
+
+    /// The cursor and the selection are indices into `entries`, so a swap has
+    /// to remember them against the vector being replaced. Reading them after
+    /// the swap points at whatever landed in those slots.
+    #[test]
+    fn a_swap_keeps_the_cursor_and_the_selection_by_name() {
+        let list = List::default();
+        let mut buffer = buffer(&["one", "two", "three"]);
+
+        // Sorted, that is: one, three, two. Select `three`, then put the
+        // cursor on `two` -- in that order, because `toggle` moves the cursor
+        // to the row it toggles.
+        buffer.toggle(1);
+        buffer.move_to(2);
+        assert_eq!(
+            buffer.at(buffer.cursor).map(|e| e.name.as_str()),
+            Some("two")
+        );
+
+        // The directory changed: `one` is gone, `four` arrived.
+        buffer.start_arriving();
+        buffer.extend(vec![entry("two"), entry("three"), entry("four")], &list);
+        buffer.finish(&list);
+
+        assert_eq!(
+            buffer.at(buffer.cursor).map(|e| e.name.as_str()),
+            Some("two"),
+            "the cursor followed its file"
+        );
+        let picked: Vec<&str> = buffer.selected().map(|e| e.name.as_str()).collect();
+        assert_eq!(picked, ["three"], "and so did the selection");
+    }
+
+    /// A directory that cannot be read has no listing to show, old or new.
+    /// Keeping the last good one would say the files are still there.
+    #[test]
+    fn a_failed_relist_drops_what_was_showing() {
+        let mut buffer = buffer(&["a", "b"]);
+        buffer.start_arriving();
+        buffer.extend(vec![entry("c")], &List::default());
+
+        buffer.fail(String::from("permission denied"));
+
+        assert_eq!(buffer.rows(), 0);
+        assert!(
+            !buffer.refreshing(),
+            "and the part-read replacement went too"
+        );
     }
 
     /// Hidden files leave the visible rows but stay in `entries`, so turning

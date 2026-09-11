@@ -660,7 +660,66 @@ landing before the list widget is even proven.
       watch on the old inode misses that entirely.
 
       Confirmed live: a file made in a terminal appears with no refresh.
-- [ ] **Change the list, do not rebuild it.** Watching works, and what it does
+- [x] **Change the list, do not rebuild it.** Done, and the four hazards below
+      turned out to be two hazards, one non-problem and one that was already
+      a live bug.
+
+      **One rule, and no pairing.** For every path the events named, read it
+      again and let the answer decide: it exists, so insert or replace; it
+      does not, so take it out. That covers create, remove, a metadata change
+      and every shape of rename, and applying the same event twice changes
+      nothing.
+
+      Pairing was expected to be the hard part and is not needed at all.
+      Measured with a probe against notify 8 on this machine, an in-directory
+      rename arrives *three* ways at once -- `Name(From)`, `Name(To)` and a
+      synthesised `Name(Both)` carrying both paths, all sharing a tracker id
+      -- while a move out gives only `From` and a move in only `To`.
+      Re-reading is right for all five without knowing which happened.
+
+      **Overflow was already being ignored.** notify reports it as
+      `EventKind::Other` with `Flag::Rescan`, and `changes_a_listing` drops
+      `Other` outright -- so the case that "turns a clever optimisation into a
+      bug people cannot reproduce" was live in the debounced-relist code
+      before any of this. `need_rescan()` is checked first now.
+
+      **The queue filling is its own kind of overflow, and the first fix for
+      it was wrong.** Each `touch` emits `Create` *and* `Modify(Metadata)`, so
+      900 new files is 1800 events and the channel fills. The first attempt
+      answered a failed `try_send` by sending `Rescan` down the same full
+      channel, which failed the same way and lost it silently: a directory of
+      900 files settled at 218 rows and stayed there. It is an
+      `Arc<AtomicBool>` now -- the one piece of genuinely shared mutable
+      state in ricedir -- set on a failed send and read when the burst
+      settles. Verified: 1 row, one burst, one `Rescan`, 901 rows.
+
+      **A change arriving mid-relist was also being dropped.** `reconcile`
+      declines then, because the entries it would touch are about to be
+      replaced and the replacement was read before the change happened.
+      Declining now marks the buffer `stale` and `Message::Listed(Done)`
+      reads the directory once more.
+
+      **What it costs.** Measured on 60,000 entries, ten single-file saves:
+      **67 CPU ticks reconciled against 160 relisted**, with an idle baseline
+      of 0. The syscalls are gone -- one `stat` instead of 60,000 -- and what
+      remains is `rebuild_from`: a near-sorted re-sort plus rebuilding
+      `visible` and the selection, all O(n). Going surgical on those indices
+      is the next win and was not taken, because the sort is cheap on a
+      near-sorted vector and rebuilding by name is what makes the cursor and
+      the selection survive without any index arithmetic to get wrong.
+
+      The real win is not the ticks: it is a network mount, where a `stat` is
+      milliseconds rather than microseconds and 60,000 of them per saved file
+      is the difference between usable and not.
+
+      **A trap the rig taught, again.** `wait-for-window.sh` returns on a
+      mapped window, and a buffer is only watched once its *first listing*
+      has finished. A burst fired before that happens with no watch in place,
+      nothing arrives, and the listing is legitimately wrong for ever. The
+      first three runs of the overflow test failed this way and looked like a
+      fault in the code.
+
+- [ ] **The old wording, for the record.** Watching works, and what it does
       with a change is blunt: `src/watch.rs` throws the event away and asks for
       a whole new listing. `Relist` in the menu does the same thing by hand.
       Fine for a directory of thirty. For one of 100,000 it is a full
@@ -689,13 +748,87 @@ landing before the list widget is even proven.
       Keep the full relist as the fallback for overflow, for an unreadable
       event, and for `Relist` in the menu, which is what somebody reaches for
       when they think the listing is wrong.
-- [ ] **A relist on becoming visible is not free.** Done above, and the cost
-      is real: showing a hidden buffer on a directory of 100,000 clears the
-      listing and reads it again, so the tile is empty for a moment. Painting
-      the old listing until the new one lands is the fix, and it wants the
-      same machinery as `## Undecided: how a job tells the window what
-      changed` -- a listing that arrives beside what is on screen rather than
-      instead of it. Left until that is settled.
+
+      That last paragraph is the one that survived contact unchanged. The
+      full relist is the fallback for a rescan, for too large a burst, and
+      for F5.
+- [x] **A relist no longer blanks the tile.** It used to replace the whole
+      `Buffer`, so a directory of 60,000 showed nothing for about a second --
+      which reads as the program losing the files rather than as it working.
+
+      `Buffer.arriving` collects the replacement out of sight and
+      [`Buffer::finish`] swaps it in when `Update::Done` lands. A buffer with
+      nothing showing yet has nothing to keep, so it still streams straight
+      into `entries` and paints as the chunks arrive: that is what makes a
+      slow mount bearable and it was worth not losing.
+
+      **The swap has to remember by name before it happens.** The cursor and
+      the selection are indices into `entries`, so reading them after the
+      vector is replaced points at whatever landed in those slots. `rebuild`
+      split into `remembered` and `rebuild_from` for this. A relist now keeps
+      both, which the old code threw away every time -- a watch event used to
+      move your cursor back to the top.
+
+      **Feedback is a count, not a spinner.** `60000 items, 1 selected ·
+      refreshing, 27136 read…`. Every chunk is already a `Message::Listed`,
+      so the number repaints itself with no timer subscription and no
+      animated glyph whose font support would have to be checked. It also
+      says how big the directory is turning out to be, which a spinner
+      cannot.
+
+      Measured in the rig on 60,000 entries: fourteen frames taken flat out
+      across one F5, and the old listing is up in every one of them.
+
+      Not a modal, deliberately. The tile being refreshed stays usable, the
+      other tiles are not involved, and on a first listing a modal would
+      cover the rows as they stream in.
+
+- [x] **A reading bar, for the mounts that are slow.** The count alone was
+      the wrong answer, and the question "how would this behave on an FTP or
+      sshfs mount" is what showed it: the count moves when a chunk lands, so
+      on a slow mount it moves rarely and on a hung one never. That is
+      exactly when a still window has to be told apart from a dead one.
+
+      A lit block sliding along twelve squares, in the status line, driven by
+      `iced::time::every(80ms)` -- subscribed only while a read is out, so an
+      idle window wakes for nothing. Quads and no glyph, so there is no font
+      support to check, and no rotation, which iced has no transform for.
+
+- [x] **Reading a changed path was on the Elm loop, which was a real fault.**
+      `reconcile` called `Entry::read` -- a blocking `symlink_metadata` --
+      inside `update`. Microseconds on a local disk, tens of milliseconds
+      each over sshfs, and for ever on a hung NFS mount, with the window
+      frozen behind it. It broke the project's own rule that file work never
+      runs on the loop, and it went in unnoticed an hour before the slow
+      mount question found it.
+
+      `buffer::examine` reads the paths on a thread and hands back
+      `(path, what it is now)` pairs; `Message::Examined` applies them, with
+      the generation checked the way a listing chunk is.
+
+- [ ] **Mounting from ricedir, and slow mounts generally.** Raised while
+      talking about the reading bar.
+
+      Mounted sshfs, NFS and FTP already appear in the places panel: they
+      come from `/proc/self/mountinfo` like anything else, and nothing in the
+      listing path cares what filesystem it is reading. So *browsing* them
+      works today. What is missing is everything around it.
+      - [ ] a read that never returns. A hung mount blocks `readdir` in
+            uninterruptible sleep, so the listing thread cannot be killed and
+            each relist leaks another one. A deadline, and a listing that
+            says "this mount is not answering" rather than reading for ever.
+      - [ ] mount and unmount from the places panel. `sshfs`, `mount.nfs`
+            and `curlftpfs` are ordinary programs and fit the argv rule
+            exactly, so this needs no D-Bus and no udisks -- which is the
+            usual reason a file manager grows a daemon dependency.
+      - [ ] remembering a connection, which means a host and a user in the
+            config and the password left to the ssh agent or to `~/.netrc`.
+            No credential storage in ricedir.
+      - [ ] a bigger `CHUNK` and a longer `SETTLE` when the buffer is on a
+            network filesystem, since both are tuned for a local disk.
+
+- [x] **F5 was a promise the toolbar made and nothing kept.** The relist
+      button's tooltip said `(F5)` and no key was bound. Now it is.
 - [x] **MIME resolution.** Parse `/usr/share/mime/globs2` (`weight:type:glob`,
       one per line, already sorted by weight) plus `aliases`, and fall back to
       a small hand-written magic sniffer for the couple of dozen signatures
@@ -1187,7 +1320,11 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
 - [ ] **Progress that does not flood the loop.** Workers send bytes-done at
       most 30 times a second per job, coalesced in the channel drain. A
       progress message per file would make a copy of 200k small files slower
-      than the copy itself.
+      than the copy itself. Throttled at the source, five jobs is 150 messages
+      a second, which costs nothing -- see `## Decided: how a job tells the
+      window what changed`. A worker never touches `App`: it owns a
+      `tokio::sync::mpsc::Sender` and nothing else, and `update` is the only
+      writer.
 - [ ] **Conflicts.** Skip, overwrite, keep both, newer only, and larger only,
       asked once with an apply-to-all, decided up front where the plan already
       knows there is a clash.
@@ -1217,9 +1354,90 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       rather than stopping the world with a modal, and a finished job stays
       until dismissed if it had any.
 
-## Undecided: how a job tells the window what changed
+## Decided: how a job tells the window what changed
 
-Raised on 2026-09-09, to be settled before M2 is built rather than during it.
+Raised on 2026-09-09, settled on 2026-09-10, before M2 is built rather than
+during it.
+
+**The decision, in one line.** Everything is a `Message`; `App.jobs` is where
+`update` keeps what the messages said; `update` is also the one place that
+emits a `protocol::Event` into a `tokio::sync::broadcast` for the socket.
+
+**Most of the problem dissolved on inspection.** A job largely does not need
+to tell the window what changed, because inotify already does. A copy writes
+files into a directory; if that directory is visible it is watched, so
+`watch.rs` fires, debounces 120 ms and relists. A delete makes rows vanish the
+same way. A destination nobody is looking at needs nothing at all, and
+`ShowBuffer` relists it when it comes back into view.
+
+What inotify cannot see is the only thing needing a new path, and all of it is
+*in-flight* state rather than change:
+
+- a file being deleted -- nothing arrives until it is gone, so the greying out
+  has no event
+- a file filling -- `Create` then `Modify`, but no "37% of the way through"
+- job lifecycle: started, paused, failed, finished
+- a scan verdict that blocked something
+
+**The traffic splits in two, and conflating them is what made every option
+look bad.**
+
+| | progress / in-flight | changes |
+| --- | --- | --- |
+| how often | 30/sec/job | one per file |
+| dropping one | fine, only the latest matters | fatal, the listing diverges |
+| ordering | irrelevant | required |
+| who reads it | jobs panel, row decoration | list, socket, agents |
+
+Progress as messages is where the 200k flood comes from; changes as a polled
+value is how an agent misses an event. Throttled at the source the way `## M2`
+already asks -- 30 a second per job -- five jobs is 150 messages a second,
+which is nothing. The 200k figure only ever applied to one message per *file*.
+
+**Why not the other three.** They were written up as four parallel options and
+they are not parallel:
+
+- *A registry the widgets read during `view`* cannot tell the socket, and `##
+  M3` rejects a polling loop for agents in as many words. Its stated cost was
+  overblown, though: the list is virtualised, so "which rows are affected" is
+  about forty lookups a frame and not 100k. That makes it the right *storage*
+  for progress, which is what `App.jobs` now is -- storage, not a second
+  transport.
+- *An event bus with subscribers* collapses into the message loop. An iced
+  widget cannot subscribe to anything: the runtime calls `update` and `draw`
+  and that is the whole interface. For the list to subscribe it would hold a
+  receiver and poll it in `view`, which is the registry with extra steps. The
+  bus is genuinely needed only for the consumer outside the loop -- socket
+  clients -- which is exactly where the broadcast goes.
+- *Per-entry state on the buffer* is a representation question, orthogonal to
+  all of it, and wrong here anyway: `Entry` is rebuilt by the listing thread on
+  every relist, and a job *causes* relists, so the flags would flicker unless
+  re-applied each time. The in-flight map is keyed by path and lives with the
+  job.
+
+**Why `broadcast` and not another mpsc.** Every subscriber gets its own copy
+and its own cursor, and a reader that falls behind the ring gets
+`RecvError::Lagged(n)` rather than blocking the sender. So a wedged agent is
+told "you missed n events, resync" instead of stalling the window, which is
+the property that matters when the readers are other people's programs. The
+brake in `## M3` then costs nothing: detaching an agent is dropping its
+receiver.
+
+**Kept deliberately separate.** The audit log and the trace strip are fed from
+the *request* side, not from events. They record what was asked, including
+requests that were refused, and a refusal produces no event.
+
+**The cost accepted.** Until `## M1`'s "change the list, do not rebuild it"
+lands, a copy into a directory of 100,000 still costs a full relist per 120 ms
+burst. That is an argument for finishing that item, not against this design.
+
+**What this asks of the code.** `protocol::Event` is new -- the protocol crate
+is request and response today and has no third shape. It has to be `Clone` for
+the broadcast, and it is the same enum whether the change came from inotify,
+from a job or from a person, so an agent cannot tell who moved the file and
+does not need to.
+
+### What was considered, for the record
 
 **What is wanted.** A copy or a delete of something large shows progress in the
 jobs panel. The rows it touches show it too: a file being deleted greys out, a
@@ -1231,9 +1449,11 @@ none of them may reach into the others: the jobs panel, the file list, and the
 socket. A job that calls `buffer.rebuild()` directly couples the engine to the
 widgets, and an agent watching over the socket would see nothing.
 
-**The options, with what each costs.** No decision yet.
+**The options, as they were written down before the decision.** Kept so the
+argument is not reopened from scratch, and because two of the "against" lines
+turned out to be wrong -- see the decision above.
 
-- [ ] **Everything through `Message`.** A job sends progress into the Elm loop
+- [x] **Everything through `Message`.** A job sends progress into the Elm loop
       and `update` puts it where it belongs. *For:* one path, no new
       machinery, and the socket taps the same place the window does. Against:
       `update` grows a branch per event kind, and a copy of 200k files means
@@ -1256,6 +1476,11 @@ widgets, and an agent watching over the socket would see nothing.
 **What to work out before choosing:** how the socket's event stream in M3 is
 fed, since whatever answers that probably answers this too; and whether a
 progress update is a message at all or a value the next frame reads.
+
+Both questions turned out to have the same answer, which is what settled it.
+The socket is fed from `update`, and a progress update is a message *and* a
+value the next frame reads -- the message carries it, `App.jobs` holds it,
+`view` reads it. They were never alternatives.
 
 ## M3 — the control surface
 
@@ -1324,6 +1549,15 @@ what the person is looking at.
       blocked something. Agents that react — sort a download when it lands,
       warn when something arrives that a rule dislikes — need this rather than
       a polling loop.
+
+      Shape settled in `## Decided: how a job tells the window what changed`:
+      one `protocol::Event`, emitted from `update` and only from `update`,
+      into a `tokio::sync::broadcast`. Same event whichever way the change
+      arrived — inotify, a job, or a person — so an agent cannot tell who
+      moved the file and has no reason to care. A subscriber that falls behind
+      the ring is told `Lagged(n)` and resyncs; it cannot stall the window,
+      which is the property that matters when the readers are somebody else's
+      programs.
 - [ ] **The audit log.** Every request appended to
       `$XDG_STATE_HOME/ricedir/agents.log`: timestamp, which agent, which
       action, the arguments, the verdict. Not optional, not configurable away,
