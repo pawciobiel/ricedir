@@ -40,7 +40,7 @@ For this reason ricedir has no headless mode. It will never have one.
 | --- | --- |
 | Listing a directory | Any size. 100,000 entries scroll as fast as 100. |
 | Tiles and buffers | Split, close, and point a tile at any open directory. |
-| Layouts | Detail rows, compact list, and a grid of icons. Each tile keeps its own. |
+| Layouts | A grid of icons, compact list, or detail rows. Each tile keeps its own, and a switch is remembered. |
 | Selection | Click, Ctrl-click, Shift-click, Ctrl-A, invert, and a rubber band. |
 | Places | Home, the XDG directories, mounted disks, and your bookmarks. |
 | Path bar | Breadcrumbs, and a text face you can select a part of and copy. |

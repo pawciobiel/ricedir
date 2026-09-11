@@ -69,6 +69,13 @@ pub enum Action {
     Activate(usize),
     /// Backspace: go to the parent directory.
     Leave,
+    /// Alt-Left and Alt-Right, through the buffer's own history.
+    Back,
+    Forward,
+    /// Show or hide the names that start with a dot, in this tile.
+    ShowHidden,
+    /// Put the path of what is selected on the clipboard.
+    CopyPath,
     SelectAll,
     /// `/` or Ctrl-F: show the filter box.
     Filter,
@@ -87,6 +94,8 @@ pub enum Action {
     Bookmark,
     /// Show the list of open directories, to point this tile at one.
     Buffers,
+    /// Show which key does what.
+    Keys,
     /// Turn the path bar over to its text face.
     TypePath,
     /// Read the directory again.
@@ -159,24 +168,33 @@ pub struct FileList<'a, Message> {
     /// `text_input` never captures the vertical arrows anyway, so a filter box
     /// and this list can both be live without fighting.
     focused: bool,
+    /// Which key does what. Read from the config, with the defaults under it.
+    keys: &'a crate::keys::Bindings,
     on_action: Box<dyn Fn(Action) -> Message + 'a>,
 }
 
 impl<'a, Message> FileList<'a, Message> {
+    /// Takes the whole config rather than a field per setting.
+    ///
+    /// Five of them were being passed one at a time, and each new setting
+    /// added another parameter to every call. The widget reads the theme,
+    /// the list settings, the bindings and the font size; nothing stops it
+    /// reading the handler table, but it has no reason to.
     pub fn new(
         buffer: &'a Buffer,
-        theme: &'a config::Theme,
-        list: &config::List,
-        text_size: f32,
+        config: &'a config::Config,
         icons: Option<iced::Font>,
         focused: bool,
         on_action: impl Fn(Action) -> Message + 'a,
     ) -> Self {
+        let list = &config.list;
+
         Self {
             buffer,
-            theme,
+            theme: &config.theme,
+            keys: &config.keys,
             row_height: list.row_height.max(1.0),
-            text_size,
+            text_size: config.window.font_size,
             // The buffer's, not the config's. The config only says what a
             // buffer starts as; after that each tile keeps its own view.
             layout: buffer.view.layout,
@@ -541,7 +559,12 @@ where
                 state.modifiers = *modifiers;
             }
 
-            Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modified_key,
+                modifiers,
+                ..
+            }) => {
                 if !self.focused || rows == 0 {
                     return;
                 }
@@ -578,91 +601,54 @@ where
                     return;
                 }
 
-                let action = match key {
-                    keyboard::Key::Named(key::Named::Enter) => Some(Action::Activate(cursor_row)),
-                    keyboard::Key::Named(key::Named::Backspace) => Some(Action::Leave),
-                    keyboard::Key::Named(key::Named::Escape) => Some(Action::Escape),
-                    // The toolbar's tooltip promised this and nothing bound
-                    // it. F5 is what every browser and every file manager
-                    // uses, so the promise was the right one to keep.
-                    keyboard::Key::Named(key::Named::F5) => Some(Action::Relist),
-                    keyboard::Key::Character(character)
-                        if character.as_str() == "a" && modifiers.command() =>
-                    {
-                        Some(Action::SelectAll)
-                    }
-                    keyboard::Key::Character(character)
-                        if character.as_str() == "i" && modifiers.command() =>
-                    {
-                        Some(Action::Invert)
-                    }
-                    // Ctrl-D bookmarks, which is what a browser taught
-                    // everybody. It is the directory being shown, not the
-                    // row under the cursor: that is the thing the address
-                    // bar of a browser would have had in it.
-                    keyboard::Key::Character(character)
-                        if character.as_str() == "d" && modifiers.command() =>
-                    {
-                        Some(Action::Bookmark)
-                    }
-                    // Ctrl-B for the buffer list, which is what emacs calls
-                    // it and what this half of the model came from.
-                    keyboard::Key::Character(character)
-                        if character.as_str() == "b" && modifiers.command() =>
-                    {
-                        Some(Action::Buffers)
-                    }
-                    // Ctrl-L for the address bar, which is what every browser
-                    // taught everybody.
-                    keyboard::Key::Character(character)
-                        if character.as_str() == "l" && modifiers.command() =>
-                    {
-                        Some(Action::TypePath)
-                    }
-                    // `/` because it is what every list in a terminal uses,
-                    // and Ctrl-F because it is what every window does.
-                    keyboard::Key::Character(character)
-                        if character.as_str() == "/" && !modifiers.command() =>
-                    {
-                        Some(Action::Filter)
-                    }
-                    keyboard::Key::Character(character)
-                        if character.as_str() == "f" && modifiers.command() =>
-                    {
-                        Some(Action::Filter)
-                    }
-                    // The backtick cycles, and the digits pick one directly.
-                    // Both are what a person reaches for; neither collides
-                    // with anything a filter box wants.
-                    keyboard::Key::Character(character)
-                        if character.as_str() == "`" && !modifiers.command() =>
-                    {
-                        Some(Action::Layout(None))
-                    }
-                    // Tab between tiles, the way every pane in every editor
-                    // moves. `text_input` does not capture it, so the filter
-                    // box being open makes no difference.
-                    keyboard::Key::Named(key::Named::Tab) if modifiers.shift() => {
-                        Some(Action::PreviousTile)
-                    }
-                    keyboard::Key::Named(key::Named::Tab) => Some(Action::NextTile),
+                // Tab is not in the bindings table. A table that can
+                // unbind it can leave a window whose tiles cannot be reached,
+                // and `text_input` does not capture it either.
+                if matches!(key, keyboard::Key::Named(key::Named::Tab)) {
+                    let action = if modifiers.shift() {
+                        Action::PreviousTile
+                    } else {
+                        Action::NextTile
+                    };
+                    shell.publish((self.on_action)(action));
+                    shell.capture_event();
+                    return;
+                }
 
-                    keyboard::Key::Character(character) if modifiers.command() => {
-                        match character.as_str() {
-                            "1" => Some(Action::Layout(Some(config::Layout::List))),
-                            "2" => Some(Action::Layout(Some(config::Layout::Detail))),
-                            "3" => Some(Action::Layout(Some(config::Layout::Icons))),
-                            // The two that look like what they do: a
-                            // backslash leans the way a vertical split does,
-                            // and a minus lies the way a horizontal one does.
-                            "\\" => Some(Action::SplitRight),
-                            "-" => Some(Action::SplitDown),
-                            "w" => Some(Action::CloseTile),
-                            _ => None,
+                // Everything else comes from the table, so a person can
+                // change it and an agent cannot reach past the registry.
+                let action = self
+                    .keys
+                    .action(key, modified_key, *modifiers)
+                    .map(|bound| {
+                        use crate::keys::Bound;
+                        match bound {
+                            Bound::Open => Action::Activate(cursor_row),
+                            Bound::Leave => Action::Leave,
+                            Bound::Back => Action::Back,
+                            Bound::Forward => Action::Forward,
+                            Bound::SelectAll => Action::SelectAll,
+                            Bound::Invert => Action::Invert,
+                            Bound::Filter => Action::Filter,
+                            Bound::ShowHidden => Action::ShowHidden,
+                            Bound::Relist => Action::Relist,
+                            Bound::EditPath => Action::TypePath,
+                            Bound::CopyPath => Action::CopyPath,
+                            Bound::Bookmark => Action::Bookmark,
+                            Bound::Buffers => Action::Buffers,
+                            Bound::NextLayout => Action::Layout(None),
+                            Bound::ListLayout => Action::Layout(Some(config::Layout::List)),
+                            Bound::DetailLayout => Action::Layout(Some(config::Layout::Detail)),
+                            Bound::IconLayout => Action::Layout(Some(config::Layout::Icons)),
+                            Bound::SplitRight => Action::SplitRight,
+                            Bound::SplitDown => Action::SplitDown,
+                            Bound::CloseTile => Action::CloseTile,
+                            Bound::NextTile => Action::NextTile,
+                            Bound::PreviousTile => Action::PreviousTile,
+                            Bound::Escape => Action::Escape,
+                            Bound::Keys => Action::Keys,
                         }
-                    }
-                    _ => None,
-                };
+                    });
 
                 if let Some(action) = action {
                     shell.publish((self.on_action)(action));

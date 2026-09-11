@@ -71,6 +71,8 @@ pub enum MenuKind {
     Place { index: usize },
     /// Every open directory, to point this tile at one of them.
     Buffers,
+    /// Which key does what. A table nobody can read is one nobody edits.
+    Keys,
     /// The toolbar's sort button.
     Sort,
     /// The toolbar's last button: everything the other buttons do, in words.
@@ -197,7 +199,7 @@ pub enum Message {
     Resized(iced::Size),
 }
 
-pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
+pub fn new(mut config: Config, start: PathBuf) -> (App, Task<Message>) {
     let (id, opened) = window::open(window::Settings {
         size: iced::Size::new(config.window.width, config.window.height),
         min_size: Some(iced::Size::new(480.0, 320.0)),
@@ -207,6 +209,17 @@ pub fn new(config: Config, start: PathBuf) -> (App, Task<Message>) {
     let notice = config.problem.clone();
     let config_font = config.list.icon_font.clone();
     let (config_width, config_height) = (config.window.width, config.window.height);
+    // What was last switched to wins over the built-in default, but never
+    // over a config that names a layout. Somebody who wrote `layout =
+    // "detail"` in a file means it, and a stray keystroke should not
+    // quietly overrule the file they edited.
+    let remembered = crate::state::State::load();
+    if let Some(layout) = remembered.layout
+        && !config.list.layout_named
+    {
+        config.list.layout = layout;
+    }
+
     let config_view = config.list.view();
     let mut app = App {
         config,
@@ -300,7 +313,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             let showing = app
                 .buffers
                 .get(index)
-                .map_or(app.config.list.layout, |found| found.view.layout);
+                .map_or_else(|| app.config.list.view(), |found| found.view);
 
             action::dispatch(app, translate(index, found, showing, app.pointer))
         }
@@ -554,9 +567,14 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 const fn translate(
     buffer: usize,
     found: list::Action,
-    current: crate::config::Layout,
+    view: crate::config::View,
     pointer: (f32, f32),
 ) -> Action {
+    let crate::config::View {
+        layout: current,
+        show_hidden: showing_hidden,
+    } = view;
+
     match found {
         list::Action::Select(row) => Action::Select { buffer, row },
         list::Action::Toggle(row) => Action::Toggle { buffer, row },
@@ -578,6 +596,15 @@ const fn translate(
         },
         list::Action::Activate(row) => Action::Activate { buffer, row },
         list::Action::Leave => Action::Leave { buffer },
+        list::Action::Back => Action::Back { buffer },
+        list::Action::Forward => Action::Forward { buffer },
+        list::Action::CopyPath => Action::CopyPath { buffer },
+        // The widget cannot read the flag it is toggling, so `translate`
+        // does: it has the buffer's view to hand and the widget does not.
+        list::Action::ShowHidden => Action::ShowHidden {
+            buffer,
+            showing: !showing_hidden,
+        },
         list::Action::Filter => Action::Filtering(true),
         list::Action::Layout(None) => Action::Layout {
             buffer,
@@ -593,6 +620,11 @@ const fn translate(
         list::Action::Bookmark => Action::Bookmark { buffer, path: None },
         list::Action::Buffers => Action::Menu {
             kind: MenuKind::Buffers,
+            buffer,
+            at: pointer,
+        },
+        list::Action::Keys => Action::Menu {
+            kind: MenuKind::Keys,
             buffer,
             at: pointer,
         },
@@ -809,6 +841,15 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
 
         Action::Layout { buffer, layout } => {
             with(app, buffer, |found| found.view.layout = layout);
+
+            // Remembered for the next run, in ricedir's own state file --
+            // never written back into the config, which is a file a person
+            // edits and comments.
+            crate::state::State {
+                layout: Some(layout),
+            }
+            .save();
+
             Task::none()
         }
 
@@ -1364,9 +1405,7 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
 fn tile<'a>(app: &'a App, index: usize, buffer: &'a Buffer, focused: bool) -> Element<'a, Message> {
     let list = FileList::new(
         buffer,
-        &app.config.theme,
-        &app.config.list,
-        app.config.window.font_size,
+        &app.config,
         app.icon_font,
         // Only the focused tile takes the keyboard, and not while a dialogue
         // is up: otherwise Escape would close the dialogue and clear the
@@ -1931,7 +1970,11 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
     let buffer = app.buffers.get(menu.buffer);
     let row = match menu.kind {
         MenuKind::Context { row } => row,
-        MenuKind::Place { .. } | MenuKind::Buffers | MenuKind::Sort | MenuKind::Toolbar => None,
+        MenuKind::Place { .. }
+        | MenuKind::Buffers
+        | MenuKind::Keys
+        | MenuKind::Sort
+        | MenuKind::Toolbar => None,
     };
     let entry = row.and_then(|row| buffer.and_then(|found| found.at(row)));
     let directory = entry.filter(|entry| entry.kind.is_directory());
@@ -2015,6 +2058,14 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
                 at: app.pointer,
             }),
         ));
+        items = items.push(item(
+            String::from("Keys\u{2026}  (?)"),
+            Message::Act(Action::Menu {
+                kind: MenuKind::Keys,
+                buffer: menu.buffer,
+                at: app.pointer,
+            }),
+        ));
     } else if menu.kind == MenuKind::Sort {
         use crate::config::Sort;
 
@@ -2043,6 +2094,15 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
             String::from("Reverse the order"),
             Message::Act(Action::ReverseSort),
         ));
+    } else if menu.kind == MenuKind::Keys {
+        // Read-only. Editing a binding means editing the config, and a
+        // half-built editor here would be worse than the file.
+        for (chord, action) in app.config.keys.listed() {
+            items = items.push(item(
+                format!("{chord}    {action}"),
+                Message::Act(Action::Escape),
+            ));
+        }
     } else if menu.kind == MenuKind::Buffers {
         // Every open directory, and how many tiles already show it. The count
         // is the thing worth saying: picking one that is already beside you
@@ -2211,7 +2271,7 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
     // The buffer list is wider than the rest because its lines are paths.
     // `short` takes `$HOME` off the front and the rest is as long as it is;
     // at the other menus' width every second line wrapped.
-    let wide: f32 = if menu.kind == MenuKind::Buffers {
+    let wide: f32 = if matches!(menu.kind, MenuKind::Buffers | MenuKind::Keys) {
         360.0
     } else {
         230.0
@@ -2223,7 +2283,7 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
     // which is where the buffer list first appeared, half of it off the
     // screen. So it is placed rather than followed: below the toolbar and
     // clear of the sidebar, which is inside the tile it acts on.
-    let asked_at = if menu.kind == MenuKind::Buffers {
+    let asked_at = if matches!(menu.kind, MenuKind::Buffers | MenuKind::Keys) {
         (SIDEBAR + 12.0, 40.0)
     } else {
         menu.at
@@ -2539,20 +2599,21 @@ mod tests {
         app.buffers
             .push(Buffer::new(PathBuf::from("/tmp/two"), start));
 
+        // Switched to something that is *not* the default, or the two tiles
+        // would look the same and the test could not tell them apart.
+        let was = app.buffers[0].view.layout;
+        assert_ne!(was, Layout::Detail, "pick a layout that is not the default");
+
         tell(
             &mut app,
             Message::Act(Action::Layout {
                 buffer: 1,
-                layout: Layout::Icons,
+                layout: Layout::Detail,
             }),
         );
 
-        assert_eq!(
-            app.buffers[0].view.layout,
-            Layout::List,
-            "the other tile moved"
-        );
-        assert_eq!(app.buffers[1].view.layout, Layout::Icons);
+        assert_eq!(app.buffers[0].view.layout, was, "the other tile moved");
+        assert_eq!(app.buffers[1].view.layout, Layout::Detail);
 
         // And the config it started from is untouched, so a new buffer still
         // opens the way the config says rather than the way the last click

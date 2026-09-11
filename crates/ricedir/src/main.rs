@@ -12,8 +12,10 @@ mod config;
 mod dialogue;
 mod entry;
 mod icon;
+mod keys;
 mod open;
 mod places;
+mod state;
 mod watch;
 mod widget;
 

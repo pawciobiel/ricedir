@@ -546,11 +546,10 @@ landing before the list widget is even proven.
 - [x] **Filter and sort.** A filter box that narrows as you type (substring by
       default, glob with a leading `:`), a hidden-files toggle, and a sort menu
       over name, size, modified, type and extension.
-- [ ] **A bindings table, with defaults a Windows user already knows.** Can
-      wait: the keys work today, they are just written into
-      `widget/list.rs` rather than read from the config. `## Decided before any
-      code` settled the shape — a flat table, no modes, no chords, no leader
-      key — so this is only the table and the reading of it.
+- [x] **A bindings table, with defaults a Windows user already knows.**
+      Built. The keys used to be written into `widget/list.rs`; they are read
+      from the config now. `## Decided before any code` settled the shape: a
+      flat table, no modes, no chords of two keys, no leader key.
 
       ```toml
       [keys]
@@ -597,13 +596,85 @@ landing before the list widget is even proven.
       anything. The rest can be read from the config as soon as somebody wants
       to change one.
 
-      - [ ] `Action::name()` and a `from_name`, so a line of config finds one
-      - [ ] parse `"ctrl+shift+n"` into a key and a set of modifiers
-      - [ ] the default table, in code, so an empty config still works
-      - [ ] a key the table does not know is reported by name, not ignored
-      - [ ] `Ctrl+Shift+C` for copy the path, since the plain one is copy
-      - [ ] a way to see the list: `?` or a menu item, because a table
-            nobody can read is a table nobody edits
+      - [x] `Bound::name()` and `from_name`, so a line of config finds one
+      - [x] parse `"ctrl+shift+n"` into a key and a set of modifiers
+      - [x] the default table, in code, so an empty config still works
+      - [x] a key the table does not know is reported by name, not ignored.
+            The notice line says `keys: \`quti\` is not an action`.
+      - [x] `Ctrl+Shift+C` for copy the path. The plain `Ctrl+C` is left
+            free, and becomes copy in M2.
+      - [x] a way to see the list: `?`, and an item in the toolbar menu
+
+      Done in `src/keys.rs`. Three things worth keeping:
+
+      **A binding cannot reach past the registry.** `Bound` holds only the
+      actions that take no argument, because a key has no pointer and no row
+      to name. `Open` acts on the cursor, which is the keyboard's own idea of
+      "this one".
+
+      **`?` needed both keys iced reports.** A press gives `key` with no
+      modifiers applied and `modified_key` with them applied, so `Shift+/`
+      arrives as `/` in the first and `?` in the second. The lookup tries the
+      plain one, then the modified one with shift dropped. Looking at only
+      the first made `?` unbindable, which the rig found at once -- the menu
+      simply did not open.
+
+      **Tab and the arrows are not in the table.** A table that can unbind
+      them can leave a window whose tiles cannot be reached, or a list nobody
+      can walk.
+
+      `"none"` on the right-hand side removes a default, which is the only
+      way to give a key back to the window manager.
+
+      Left for M2, when the actions exist: `Ctrl+C`, `Ctrl+X`, `Ctrl+V`,
+      `Delete`, `Shift+Delete`, `F2` and `Ctrl+Shift+N`.
+
+- [x] **Compared against eight other file managers.** mc was read from its
+      own `/etc/mc/mc.default.keymap`; Nautilus gave up its action names but
+      not its accelerators, which live in a compiled GResource. The rest is
+      from the documentation and should be checked before anyone acts on it.
+
+      There are two families. Dolphin, Nautilus, Thunar, PCManFM and COSMIC
+      Files follow Windows Explorer. Krusader, Total Commander and mc follow
+      Norton Commander: `F3` view, `F4` edit, `F5` copy, `F6` move,
+      `F7` mkdir, `F8` delete, `F10` quit. ricedir is in the first family,
+      which is what "defaults a newcomer already knows" has to mean.
+
+      `Ctrl+L`, `Ctrl+H`, `Ctrl+A`, `Alt+Left`/`Alt+Right`, `Backspace` and
+      `Alt+Up` all already matched. Two things came out of it:
+      - [x] `Ctrl+T` splits right. Every one of the five desktop managers
+            opens a tab with it, and ricedir has no tabs. A second view side
+            by side is the nearest thing, and the key now does something
+            rather than nothing.
+      - [x] `Ctrl+R` relists, beside `F5`. Dolphin uses `F5`; Nautilus,
+            Thunar and PCManFM use `Ctrl+R`. Both are bound, because the
+            table maps many chords to one action and nobody should have to
+            know which family ricedir came from.
+
+      Not taken: `Ctrl+1`/`2`/`3` stay as they are, although every other
+      manager puts icons on `Ctrl+1` and ricedir puts the list there.
+
+      Also noted and not acted on: `Ctrl+I` is Dolphin's filter bar and is
+      invert-selection here; both orthodox managers use numpad `*` to invert.
+
+- [x] **Icons is the default layout, and a switch is remembered.**
+      Icons because that is what every other file manager opens with, and a
+      newcomer should not have to find the switch.
+
+      Remembered in `$XDG_STATE_HOME/ricedir/state.toml`, not in the config.
+      The config is a file a person writes and comments; this is a file the
+      program writes. Writing one into the other loses the comments the
+      first time it happens.
+
+      **A config that names a layout wins over the remembered one.** Somebody
+      who wrote `layout = "detail"` meant it, and a stray keystroke must not
+      quietly overrule the file they edited. serde cannot tell a missing key
+      from one set to the default, so `parse` reads the text again as a
+      plain value to find out whether the key is there.
+
+      One value, not one per directory. A view remembered per folder is what
+      Windows Explorer does, and it is why people say their folders "change
+      by themselves".
 
 - [x] **The context menu.** Right click opens it where the click landed, with
       Open, Copy path, Add to places, Show hidden files and Relist. A click
@@ -719,7 +790,8 @@ landing before the list widget is even proven.
       first three runs of the overflow test failed this way and looked like a
       fault in the code.
 
-- [ ] **The old wording, for the record.** Watching works, and what it does
+  *The entry as it was written before the work, kept for the record. It is
+  not a task.* Watching works, and what it does
       with a change is blunt: `src/watch.rs` throws the event away and asks for
       a whole new listing. `Relist` in the menu does the same thing by hand.
       Fine for a directory of thirty. For one of 100,000 it is a full

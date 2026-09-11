@@ -24,6 +24,12 @@ pub struct Config {
     pub handler: Vec<Handler>,
     /// Checked in order; the strongest verdict wins.
     pub scan: Vec<Scan>,
+    /// Which key does what. The defaults, with the config applied on top.
+    ///
+    /// Not `Deserialize`: the file holds strings, and turning those into
+    /// chords and actions is where a typo has to be reported. See
+    /// [`crate::keys`].
+    pub keys: crate::keys::Bindings,
 
     /// Whether commands in this config may be run. See [`trustworthy`]. Not a
     /// config key; decided when the file is read.
@@ -48,6 +54,7 @@ impl Default for Config {
             // what makes the no-handler dialogue the normal first experience.
             handler: Vec::new(),
             scan: Vec::new(),
+            keys: crate::keys::Bindings::default(),
             // Nothing to distrust: there is no file.
             trusted: true,
             path: None,
@@ -66,6 +73,10 @@ pub(crate) struct Raw {
     open: Open,
     pub(crate) handler: Vec<Handler>,
     scan: Vec<Scan>,
+    /// `"ctrl+shift+n" = "new-folder"`. Read as plain strings here, because
+    /// a chord and an action name are both checked later, where a problem
+    /// can be reported to the person rather than dropped by serde.
+    keys: std::collections::HashMap<String, String>,
 }
 
 /// How a file is opened when a handler has to be chosen.
@@ -281,6 +292,14 @@ pub struct List {
     pub ignore_case: bool,
     /// How the entries are arranged.
     pub layout: Layout,
+    /// Whether the config actually said so.
+    ///
+    /// Not a config key. A file that names a layout means it, and the
+    /// remembered one must not overrule a file somebody edited on purpose.
+    /// serde cannot tell a missing key from one set to the default, so
+    /// [`parse`] looks for it in the text.
+    #[serde(skip)]
+    pub layout_named: bool,
     /// Whether a glyph is drawn before each name.
     pub icons: bool,
     /// The family the glyphs come from.
@@ -300,7 +319,8 @@ impl Default for List {
             sort: Sort::Name,
             sort_reversed: false,
             ignore_case: true,
-            layout: Layout::List,
+            layout: Layout::default(),
+            layout_named: false,
             icons: true,
             icon_font: Some(String::from("Symbols Nerd Font")),
         }
@@ -308,15 +328,24 @@ impl Default for List {
 }
 
 /// How the entries are arranged on screen.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+///
+/// `Serialize` as well, because this is the one config value ricedir writes
+/// back -- into its own state file, never into the config. See
+/// [`crate::state`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Layout {
-    /// One row each: glyph, name, size. What ricedir has always drawn.
-    #[default]
+    /// One row each: glyph, name, size.
     List,
     /// One row each, with more columns: modified, and the mode.
     Detail,
     /// A grid of larger glyphs with the name underneath.
+    ///
+    /// The default, because it is what every other file manager opens with
+    /// and a newcomer should not have to find the switch. Anyone who prefers
+    /// a list says so once: either in the config, or by switching, which is
+    /// remembered.
+    #[default]
     Icons,
 }
 
@@ -456,9 +485,24 @@ pub fn load(named: Option<PathBuf>) -> Config {
 /// without the fall-back-to-defaults behaviour that only makes sense at
 /// startup.
 pub fn parse(path: &Path, text: &str) -> Result<Config, String> {
-    let raw: Raw = toml::from_str(text).map_err(|error| error.to_string())?;
+    let mut raw: Raw = toml::from_str(text).map_err(|error| error.to_string())?;
+
+    // Whether the file *named* a layout, which serde cannot report: a key
+    // that is missing and a key set to the default both arrive as the
+    // default. Read again as a plain value to find out. It is a small file
+    // and this happens once.
+    raw.list.layout_named = toml::from_str::<toml::Value>(text)
+        .ok()
+        .and_then(|value| value.get("list")?.get("layout").cloned())
+        .is_some();
 
     let trusted = trustworthy(path);
+
+    // A bad binding is reported, never dropped. A key that silently stops
+    // working is the worst way for this to fail: nothing on screen says why,
+    // and the config looks right.
+    let (keys, problems) = crate::keys::Bindings::default().with(&raw.keys);
+    let problem = (!problems.is_empty()).then(|| format!("keys: {}", problems.join("; ")));
 
     Ok(Config {
         window: raw.window,
@@ -470,9 +514,10 @@ pub fn parse(path: &Path, text: &str) -> Result<Config, String> {
         // shows in the window, not only on stderr.
         handler: if trusted { raw.handler } else { Vec::new() },
         scan: if trusted { raw.scan } else { Vec::new() },
+        keys,
         trusted,
         path: Some(path.to_path_buf()),
-        problem: None,
+        problem,
     })
 }
 

@@ -114,3 +114,20 @@ verdict = "warn"
 #   timeout = 5
 #   block-on = [1]          # 0 clean, 1 infected, 2 error
 #   warn-on = [2]
+
+# --- keys ---------------------------------------------------------------
+#
+# A flat table. The left side is the key, the right side is the name of an
+# action. A name ricedir does not know is reported in the window, so a typo
+# is visible rather than silent. Press `?` to see every binding in force.
+#
+# Only the lines you write here change anything. The defaults stay.
+# `"none"` takes a default away, which is how you give a key back to the
+# window manager.
+#
+#   [keys]
+#   "f3" = "relist"
+#   "ctrl+d" = "none"
+#
+# Ctrl+C is left free on purpose. It becomes copy in M2, because every other
+# window on the desktop uses the plain one. Ctrl+Shift+C copies the *path*.
