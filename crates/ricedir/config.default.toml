@@ -59,6 +59,21 @@ urgent = "#f38ba8"        # a broken symlink, a blocked file, a failed job
 [open]
 fallback = "ask"
 
+# --- copying, moving and deleting ---------------------------------------
+#
+# `workers` is how many jobs run at once. The rest wait their turn.
+#
+# Two, because a copy is bound by the disk and not by the processor: eight at
+# once on one spindle is slower than two. A second one is still worth having,
+# so a copy of one large file does not hold up a copy of one small one.
+#
+# A job works out everything it will do before it moves a byte, and the panel
+# at the bottom left says what it is doing. Hold one, let it go again, or stop
+# it from there. A stopped job leaves the file it was part way through, and
+# says which one it is.
+[jobs]
+workers = 2
+
 # --- handlers -----------------------------------------------------------
 #
 # Checked in order, so put the specific ones first. Each needs `mime` or

@@ -96,6 +96,8 @@ pub enum Action {
     Buffers,
     /// Show which key does what.
     Keys,
+    /// Remove what is selected, for good. Asks first.
+    Delete,
     /// Turn the path bar over to its text face.
     TypePath,
     /// Read the directory again.
@@ -695,6 +697,7 @@ where
                             Bound::PreviousTile => Action::PreviousTile,
                             Bound::Escape => Action::Escape,
                             Bound::Keys => Action::Keys,
+                            Bound::Delete => Action::Delete,
                         }
                     });
 

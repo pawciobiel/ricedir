@@ -515,26 +515,20 @@ landing before the list widget is even proven.
             file format cannot answer, so it is not asked.
       - [x] reorder them *by dragging*.
 
-            A place could not be a drag source while it was a `button`.
-            `mouse_area` gives its content the event first and gives up if
-            it was captured, and `button` captures a press, so the
-            `on_press` never fired. The answer was to stop using a button: a
-            place is now drawn, and the hover colour, the hand cursor and
-            opening the place are each done by hand. Opening moved from the
-            press to the release, because until the button comes up the
-            press may still become a drag.
+            A `button` captures a press, so `mouse_area`'s `on_press` never
+            fired and a place could not be a drag source. A place is drawn
+            instead, with the hover colour, the hand cursor and the press
+            done by hand. Opening moved to the release: until the button
+            comes up the press may still become a drag.
 
-            **A drop marker pushed in mid-drag cannot be hit.** The first
-            version added the two-pixel line only while something was
-            dragged. That moved the row down, out from under the pointer,
-            which made the pointer leave it, which took the line away, which
-            moved the row back. The gap is there always and only its colour
-            changes.
+            **A drop marker pushed in mid-drag cannot be hit.** Adding the
+            line only while dragging moved the row out from under the
+            pointer, which took the line away, which moved it back. The gap
+            is always there and only its colour changes.
 
-            The strip below the last place is how something is moved to the
-            end, which "in front of the row you are over" cannot say. It is
-            always there, because a target that appears once you are already
-            dragging is a target nobody finds.
+            The strip below the last place is how something reaches the end,
+            which "in front of the row you are over" cannot say. Always
+            there: a target that appears mid-drag is one nobody finds.
 
             Every release is heard, not only the ones over the panel: a drag
             let go anywhere else has to be called off, and `mouse_area`
@@ -1108,17 +1102,13 @@ Two things the run found that no test had:
       being filtered would otherwise wipe the box on every change to it, which
       is precisely when somebody is looking for something.
 
-- [x] **The breadcrumbs leaked, briefly.** The first version made each
-      component a `&'static str` with `Box::leak`, in a `view` that runs every
-      frame. Caught by reading it back rather than by any tool, which is not a
-      way of catching anything.
+- [x] **The breadcrumbs leaked, briefly.** Each component was a
+      `&'static str` from `Box::leak`, in a `view` that runs every frame.
 
-      A test measures it now: resident memory after two thousand frames,
-      against resident memory forty thousand frames later. Put the leak back
-      and it fails at 186 bytes a frame, or 7.4 MB over the run, so it catches
-      the exact fault it was written for. It passes as the tree stands, which
-      is the first evidence that nothing else leaks per frame. Two seconds to
-      run.
+      A test measures it now: resident memory after 2,000 frames against
+      40,000 frames later. Put the leak back and it fails at 186 bytes a
+      frame. Two seconds to run, and the first evidence that nothing else
+      leaks per frame.
 
 ## M1 stage 3: the places panel
 
@@ -1287,24 +1277,19 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       -- are offered bare.
 
 - [x] **A handler that starts and immediately dies says nothing.** `spawn`
-      reported a process that would not *start*; emacs-nox started fine and
-      then exited, and ricedir said nothing, which from the other side of the
-      screen is a file that will not open.
+      reported only a process that would not *start*. emacs-nox started and
+      then exited, and ricedir said nothing -- which looks like a file that
+      will not open.
 
-      The child is now watched for 400 ms. It is still detached -- waiting on
-      a video player until the film ends is not an option -- but a non-zero
-      exit inside that window is reported with the first line the handler
-      printed. Exit 0 is success: `xdg-open` and `flatpak run` both hand the
-      file over and return.
+      The child is watched for 400 ms, then detached. A non-zero exit inside
+      that window is reported with the first line it printed. Exit 0 is
+      success: `xdg-open` and `flatpak run` both hand over and return.
 
-      stderr was already piped and never read, which is its own fault: a
-      player that writes more than a pipe holds would have blocked on its own
-      stderr and looked hung. The pipe is now drained to a sink for as long
-      as the child lives.
+      stderr was piped and never read. A player writing more than a pipe
+      holds would have blocked on it. It is drained to a sink now.
 
-      Verified in the rig. A handler that fails says "`the-quitter` started
-      and then stopped: cat: /nonexistent-ricedir-rig: No such file or
-      directory". One that keeps running says nothing at all.
+      Rig: a failing handler names what it printed; one that keeps running
+      says nothing.
 
 ## M1 stage 3: the toolbar, and where a menu goes
 
@@ -1384,43 +1369,32 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       dotfile and its button lit, the right stayed at 7.
 
 - [x] **The filter box and the path bar's text face followed the window, not
-      the buffer.** Reported from a real session: type a path, leave the box
-      open, split the tile, type a path in the new tile, then go back to the
-      first one -- and the path could not be edited, and the bar flashed when
-      anybody tried.
+      the buffer.** Reported from a real session: type a path, split the
+      tile, type in the new one, go back, and the first path could not be
+      edited and the bar flashed.
 
       `App` held one `typing_path` and one `filtering` for the whole window,
-      so a half-typed path was handed to whichever tile the keyboard moved to
-      next, and the edit button read the *other* tile's state and turned its
-      box off instead of turning this one on. Both are fields on `Buffer` now,
-      for the same reason the view is. `path_bar` is handed `focused` by the
-      tile that draws it rather than working it out from the buffer index --
-      two tiles can show one buffer, and both would have claimed it.
+      so the draft went to whichever tile took the keyboard next, and the
+      edit button read the other tile's state. Both are on `Buffer` now.
+      `path_bar` is handed `focused` by the tile that draws it: two tiles can
+      show one buffer and both would have claimed it.
 
-      Three faults fell out of the same report and are written up below,
-      because each would have gone on hiding behind the others.
+      Three more faults fell out of the same report.
 
-- [x] **Every list said "the button came up" on every release, even one
-      nowhere near it.** The list published `Dropped` from its release arm so
-      that a drop on the places panel would end the drag. But a widget hears
-      every event, not only its own, so with two tiles *both* lists said it,
-      and `Message::List` focuses the tile it came from. The keyboard
-      therefore landed wherever the last list happened to report from: a click
-      on a tile focused it and gave it straight back, which is what "it
-      flashes" was.
+- [x] **Every list said "the button came up" on every release.** The list
+      published `Dropped` so a drop on the places panel would end the drag.
+      A widget hears every event, not only its own, so with two tiles both
+      lists said it, and `Message::List` focuses the tile it came from. A
+      click on a tile focused it and gave it straight back -- the flash.
 
-      It is gone, action and all. The window hears every release through the
-      subscription now, which is strictly better -- it fires whether or not a
-      list is under the pointer -- and one mechanism cannot disagree with
-      itself.
+      Gone, action and all. The subscription hears every release, whether or
+      not a list is under the pointer.
 
 - [x] **A tile whose box holds no keyboard is a dead tile.** The path bar's
-      text face deliberately stops the list taking keys, because Tab is
-      completion there and with the list live it switched tiles instead. Move
-      the keyboard to another tile and back, though, and the `text_input` has
-      lost iced's focus while the list is still standing aside: the box is
-      drawn, and nothing at all takes a keystroke. Every change of tile now
-      hands the keyboard back to whichever box that tile has up.
+      text face stops the list taking keys, because Tab is completion there.
+      Move the keyboard away and back and the `text_input` has lost iced's
+      focus while the list is still standing aside: nothing takes a
+      keystroke. Every change of tile hands the keyboard back.
 
 - [x] **Closing the filter box cleared every filter in the window.** It
       looped over all the buffers, which un-narrowed the listing in the tile
@@ -1461,11 +1435,34 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
 
 ## M2 — the job engine
 
-- [ ] **The queue.** A job is a plan built before any byte moves: the full
+- [x] **The queue.** A job is a plan built before any byte moves: the full
       entry list, the total size, the conflict policy and the destination. One
       queue, a configurable number of workers, and per-job pause, resume and
       cancel. Cancelling leaves a partial file behind and says so, rather than
       pretending it can undo a half-written copy.
+
+      `jobs/mod.rs`. Copy only, because it only ever creates. Reached from
+      the entry menu as "copy to the other tile", which needs no clipboard.
+      `[jobs] workers` defaults to two: a copy is bound by the disk.
+
+      - Parents come before their children in the step list.
+      - The walk is on a thread. 100,000 entries would hold the window.
+      - Pause and cancel are an `Arc<AtomicU8>`, as in `watch.rs`. Cancel
+        beats pause, or a held job could never be stopped.
+      - A destination that exists is counted and skipped. Skip, overwrite and
+        keep both are a question for a person -- see the conflicts item. A
+        directory that exists is merged into.
+      - A directory cannot be copied into itself or into anything inside it.
+      - `create_new`, so a destination made between the plan and the write is
+        not overwritten.
+
+      **The `Kind::File` guard in `dispatch` is gone.** It refused every
+      writing action, a person's included. The wire still cannot ask for one:
+      `Action::of` makes no `File` action, and a test says so. M3 must add an
+      origin at `dispatch` before it opens the socket.
+
+      Rig: 57 MB byte for byte with the link copied as a link; 3 GB to 32%,
+      53%, done; held at 1.3 GB; cancelled at 1.8 GB and named the part file.
 - [ ] **Progress that does not flood the loop.** Workers send bytes-done at
       most 30 times a second per job, coalesced in the channel drain. A
       progress message per file would make a copy of 200k small files slower
@@ -1474,6 +1471,25 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       window what changed`. A worker never touches `App`: it owns a
       `tokio::sync::mpsc::Sender` and nothing else, and `update` is the only
       writer.
+- [x] **Delete, for good, before the trash exists.** A file manager that
+      cannot remove anything is not usable daily.
+
+      `Shift+Delete`, which is what every desktop means by "not to the
+      trash". Plain `Delete` stays unbound until there is one. A dialogue
+      asks first and says there is no undo.
+
+      **One step per thing chosen, not one per file.** Removing entries one
+      at a time by path can be redirected: swap a directory half way down for
+      a symlink between the plan and the delete, and `a/b/c` resolves
+      somewhere else. `std::fs::remove_dir_all` uses `openat` and `unlinkat`
+      against that race. The plan still walks the tree, to say how big it is.
+
+      The cost: progress and cancel land between things, not inside one. Per
+      entry waits for the item below.
+
+      Rig: a symlink was unlinked and its target stayed; cancel changed
+      nothing; a directory went with its contents.
+
 - [ ] **Conflicts.** Skip, overwrite, keep both, newer only, and larger only,
       asked once with an apply-to-all, decided up front where the plan already
       knows there is a clash.
@@ -1502,11 +1518,9 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       bar, rate, time left, and cancel. Errors collect into a list on the job
       rather than stopping the world with a modal, and a finished job stays
       until dismissed if it had any.
-- [ ] **Screenshots, into `docs/`.** Moved here from M1 on purpose. A picture
-      of a program that can only look at files shows half of it, and the
-      pictures would have to be taken again as soon as copy, move and delete
-      arrive. The sequence that produces them belongs in a script beside
-      `dev/rig.conf`, not in a shell history.
+- [ ] **Screenshots, into `docs/`.** Moved here from M1: pictures of a
+      program that can only look at files would need taking again. The
+      sequence belongs in a script beside `dev/rig.conf`.
 
 ## Decided: how a job tells the window what changed
 
@@ -1831,6 +1845,25 @@ what the person is looking at.
 
 Deliberately after correctness, but not optional: the reason to use this rather
 than the one already installed is partly that it looks good.
+
+- [ ] **Hide and show the left panel.** A key and a toolbar button, remembered
+      in `state.toml`. 180 pixels is a lot of a small screen. Places,
+      bookmarks and jobs go together: they are one panel.
+
+- [ ] **An icon beside each place and each bookmark.** A house, a folder, a
+      disk. `icon.rs` already holds the glyphs.
+
+- [ ] **Devices on the left panel, and a switch for them.** Mounted disks
+      show today. An *unmounted* one does not, and a USB stick that is
+      plugged in and not yet mounted is exactly when somebody opens a file
+      manager.
+
+      Two settings: whether the group appears at all, and which devices count
+      -- an allow-list, the way `places::REAL` already filters filesystems.
+      Fifteen loop devices would otherwise bury the one that matters.
+
+      From `/sys/block` and `/proc/partitions`, not udisks: no D-Bus.
+      Mounting one is `M3`; this only shows that it is there.
 
 - [ ] **Animation, using `iced::animation::Animation`.** It is in 0.14 as a
       re-export of `lilt`: `easing()`, `quick()`/`slow()`, `delay()`, `go(state,

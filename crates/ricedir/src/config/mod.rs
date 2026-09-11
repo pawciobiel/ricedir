@@ -20,6 +20,7 @@ pub struct Config {
     pub theme: Theme,
     pub list: List,
     pub open: Open,
+    pub jobs: Jobs,
     /// Checked in order; the first that matches opens the file.
     pub handler: Vec<Handler>,
     /// Checked in order; the strongest verdict wins.
@@ -50,6 +51,7 @@ impl Default for Config {
             theme: Theme::default(),
             list: List::default(),
             open: Open::default(),
+            jobs: Jobs::default(),
             // Nothing to open anything with until a config says so, which is
             // what makes the no-handler dialogue the normal first experience.
             handler: Vec::new(),
@@ -71,12 +73,31 @@ pub(crate) struct Raw {
     theme: Theme,
     list: List,
     open: Open,
+    jobs: Jobs,
     pub(crate) handler: Vec<Handler>,
     scan: Vec<Scan>,
     /// `"ctrl+shift+n" = "new-folder"`. Read as plain strings here, because
     /// a chord and an action name are both checked later, where a problem
     /// can be reported to the person rather than dropped by serde.
     keys: std::collections::HashMap<String, String>,
+}
+
+/// How copying, moving and deleting behave.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Jobs {
+    /// How many jobs run at once. The rest wait.
+    ///
+    /// Two, because a copy is bound by the disk and not by the processor:
+    /// eight at once on one spindle is slower than two, and a second job is
+    /// still worth having so a big copy does not hold up a small one.
+    pub workers: usize,
+}
+
+impl Default for Jobs {
+    fn default() -> Self {
+        Self { workers: 2 }
+    }
 }
 
 /// How a file is opened when a handler has to be chosen.
@@ -509,6 +530,7 @@ pub fn parse(path: &Path, text: &str) -> Result<Config, String> {
         theme: raw.theme,
         list: raw.list,
         open: raw.open,
+        jobs: raw.jobs,
         // A config others can write is a config that must not name programs
         // to run, so the tables are dropped rather than stored. The refusal
         // shows in the window, not only on stderr.

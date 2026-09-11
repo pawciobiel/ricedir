@@ -48,9 +48,11 @@ For this reason ricedir has no headless mode. It will never have one.
 | Watching | A change on disk updates the listing. No refresh needed. |
 | Opening files | The handler table and the scan chain, with four refusals. |
 | Menus | On a file, on empty space, and on a place. Each one is different. |
+| Copying | Into the tile beside this one. Hold, let go, or stop a job while it runs. |
+| Deleting | For good, and it asks first. There is no trash yet. |
 
-Not built yet: copy, move, delete, trash, undo (M2), the agent socket and MCP
-(M3), thumbnails (M7).
+Not built yet: move, trash, undo (M2), the agent socket and MCP (M3),
+thumbnails (M7).
 
 ## How it is built
 
@@ -195,6 +197,7 @@ Look at these instead if ricedir is not what you want:
 [Yazi](https://github.com/sxyazi/yazi) is a fast one in a terminal.
 [COSMIC Files](https://github.com/pop-os/cosmic-files) is built on iced and
 already exists.
+[Waydir](https://github.com/Waydir/Waydir) is another one for Wayland.
 
 ## Contributing
 

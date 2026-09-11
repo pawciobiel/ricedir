@@ -14,6 +14,7 @@ use crate::action::{self, Action};
 use crate::buffer::{self, Buffer, Listing};
 use crate::config::Config;
 use crate::dialogue::{self, Choice, Dialogue};
+use crate::jobs;
 use crate::open::{self, Plan, scan};
 use crate::places::{self, Place};
 use crate::widget::list::{self, FileList};
@@ -193,6 +194,12 @@ pub struct App {
     /// Kept whether or not a drag is going on: it draws the hovered row as
     /// well as saying where a drop would land.
     over_place: Option<usize>,
+    /// Every job, running, waiting or finished.
+    ///
+    /// Storage, not transport. A worker never touches this: it sends what it
+    /// did down a channel and `update` writes it here, which keeps one
+    /// writer. See `## Decided: how a job tells the window what changed`.
+    jobs: jobs::Queue,
     /// Home, the user directories, the mounts and the bookmarks.
     ///
     /// Read once at startup and after a bookmark is added. A disk appearing is
@@ -265,6 +272,8 @@ pub enum Message {
     Pointer(f32, f32),
     /// The window changed size.
     Resized(iced::Size),
+    /// A job said something: its plan arrived, or it got somewhere.
+    Job(jobs::Message),
 }
 
 pub fn new(mut config: Config, start: PathBuf) -> (App, Task<Message>) {
@@ -289,6 +298,9 @@ pub fn new(mut config: Config, start: PathBuf) -> (App, Task<Message>) {
     }
 
     let config_view = config.list.view();
+    // At least one, or a config that said nought would take jobs on and
+    // never start any of them.
+    let workers = config.jobs.workers.max(1);
     let mut app = App {
         config,
         buffers: vec![Buffer::new(start, config_view)],
@@ -301,6 +313,7 @@ pub fn new(mut config: Config, start: PathBuf) -> (App, Task<Message>) {
         pointer: (0.0, 0.0),
         size: iced::Size::new(config_width, config_height),
         places: places::list(),
+        jobs: jobs::Queue::new(workers),
         tick: 0,
         dragging: None,
         pressed: None,
@@ -445,6 +458,44 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
 
         Message::Dialogue(choice) => chose(app, choice),
+
+        Message::Job(jobs::Message::Planned(id, made)) => {
+            // Say what it will do, or why it will not. A plan that found
+            // nothing, or a destination that is not there, is the answer to
+            // a question somebody asked and has to reach them.
+            match &made {
+                Ok(plan) if !plan.clashes.is_empty() => {
+                    let clashes = plan.clashes.len();
+                    app.notice = Some(format!(
+                        "{}; {clashes} already there and left alone",
+                        plan.describe()
+                    ));
+                }
+                Ok(plan) => app.notice = Some(plan.describe()),
+                Err(why) => app.notice = Some(why.clone()),
+            }
+
+            app.jobs.planned(id, made);
+            app.jobs.start_ready().map(Message::Job)
+        }
+
+        Message::Job(jobs::Message::Said(id, said)) => {
+            let ended = matches!(said, jobs::Update::Ended(_));
+            let freed = app.jobs.update(id, said);
+
+            // A job that ended says what it left behind. The listing looks
+            // after itself: the destination is watched if anybody is looking
+            // at it, so the new files arrive the way any other change does.
+            if ended && let Some(job) = app.jobs.get(id) {
+                app.notice = Some(job.ending());
+            }
+
+            if freed {
+                app.jobs.start_ready().map(Message::Job)
+            } else {
+                Task::none()
+            }
+        }
 
         Message::Pointer(x, y) => {
             app.pointer = (x, y);
@@ -769,6 +820,7 @@ const fn translate(
         list::Action::NextTile => Action::NextTile,
         list::Action::PreviousTile => Action::PreviousTile,
         list::Action::Escape => Action::Escape { buffer },
+        list::Action::Delete => Action::Delete { buffer },
         list::Action::Bookmark => Action::Bookmark { buffer, path: None },
         list::Action::Buffers => Action::Menu {
             kind: MenuKind::Buffers,
@@ -1340,6 +1392,45 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
 
         Action::Relist { buffer } => relist(app, buffer),
 
+        Action::Copy { buffer, into } => {
+            let Some(sources) = chosen(app, buffer) else {
+                return refuse(app, String::from("nothing is selected"));
+            };
+
+            let (_, planning) = app.jobs.add(jobs::Work::Copy, sources, into);
+            planning.map(Message::Job)
+        }
+
+        Action::Delete { buffer } => {
+            let Some(paths) = chosen(app, buffer) else {
+                return refuse(app, String::from("nothing is selected"));
+            };
+
+            // Asked, never assumed. This is the only thing between a
+            // keystroke and work nobody can get back.
+            app.dialogue = Some(Dialogue::Deleting { paths, buffer });
+            Task::none()
+        }
+
+        Action::PauseJob { job } => {
+            app.jobs.pause(job);
+            Task::none()
+        }
+        Action::ResumeJob { job } => {
+            app.jobs.resume(job);
+            Task::none()
+        }
+        Action::CancelJob { job } => {
+            app.jobs.cancel(job);
+            // A job cancelled before it started frees a worker at once. One
+            // already running frees it when its thread notices.
+            app.jobs.start_ready().map(Message::Job)
+        }
+        Action::DismissJob { job } => {
+            app.jobs.dismiss(job);
+            Task::none()
+        }
+
         Action::Escape { buffer } => {
             // One key for "put away whatever is in front of me", in the order
             // things are stacked. The menu and the dialogue are window-wide;
@@ -1597,6 +1688,18 @@ fn chose(app: &mut App, choice: Choice) -> Task<Message> {
         (Choice::Dismiss, _) => {
             app.typed.clear();
             Task::none()
+        }
+
+        (Choice::Delete, Dialogue::Deleting { paths, buffer }) => {
+            // The destination is nowhere. A delete job carries the directory
+            // it came from so the panel row has somewhere to point at.
+            let from = app
+                .buffers
+                .get(buffer)
+                .map_or_else(PathBuf::new, |found| found.path.clone());
+
+            let (_, planning) = app.jobs.add(jobs::Work::Delete, paths, from);
+            planning.map(Message::Job)
         }
 
         (Choice::Anyway, Dialogue::Warned { plan, .. }) => start(*plan),
@@ -2646,6 +2749,28 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
             }),
         ));
 
+        // Into the tile beside this one, which is what a two-panel file
+        // manager has always meant by "copy". Offered only when there is
+        // another tile, because otherwise there is nowhere to name.
+        if let Some((into, name)) = beside(app, menu.buffer) {
+            items = items.push(item(
+                format!("Copy to {name}"),
+                Message::Act(Action::Copy {
+                    buffer: menu.buffer,
+                    into,
+                }),
+            ));
+        }
+
+        // Last, and with the ellipsis that says it asks first. A destructive
+        // item beside "Open" is how a menu costs somebody a file.
+        items = items.push(item(
+            String::from("Delete for good\u{2026}  (Shift+Delete)"),
+            Message::Act(Action::Delete {
+                buffer: menu.buffer,
+            }),
+        ));
+
         if let Some(entry) = directory {
             items = items.push(item(
                 format!("Add {} to places", entry.name),
@@ -2798,9 +2923,15 @@ fn sidebar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
     let mut previous = None;
 
     for (at, place) in app.places.iter().enumerate() {
-        // A rule between the four groups, so the panel reads as a short list
-        // of short lists rather than one long one.
-        if previous.is_some_and(|kind| kind != place.kind) {
+        // Bookmarks get a heading of their own. The ones above are what the
+        // system says is here; these are what a person put there, and one
+        // list of both made it look as though home could be removed too.
+        if place.kind == places::Kind::Bookmark && previous != Some(places::Kind::Bookmark) {
+            list = list.push(iced::widget::Space::new().height(10));
+            list = list.push(heading("BOOKMARKS"));
+        } else if previous.is_some_and(|kind| kind != place.kind) {
+            // A gap between the other groups, so the panel reads as a short
+            // list of short lists rather than one long one.
             list = list.push(iced::widget::Space::new().height(6));
         }
         previous = Some(place.kind);
@@ -2860,11 +2991,67 @@ fn sidebar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
             .on_exit(Message::PlaceLeft(end)),
     );
 
-    let jobs = column![
-        heading("JOBS"),
-        container(text("nothing running").size(12).color(dim)).padding([0, 10]),
-    ]
-    .width(Length::Fill);
+    let mut jobs = column![heading("JOBS")].width(Length::Fill);
+
+    if app.jobs.is_empty() {
+        jobs = jobs.push(container(text("nothing running").size(12).color(dim)).padding([0, 10]));
+    }
+
+    for job in app.jobs.iter() {
+        // A bar behind the words rather than beside them: 180 pixels is not
+        // enough for both, and the words are the part that says what failed.
+        let filled = job.fraction().clamp(0.0, 1.0);
+        let bar = container(
+            iced::widget::Space::new()
+                .width(Length::FillPortion((filled * 1000.0) as u16 + 1))
+                .height(2),
+        )
+        .style(move |_: &iced::Theme| container::Style {
+            background: Some(accent.into()),
+            ..container::Style::default()
+        });
+        let rest = iced::widget::Space::new()
+            .width(Length::FillPortion(((1.0 - filled) * 1000.0) as u16 + 1))
+            .height(2);
+
+        let mut buttons = row![].spacing(4);
+        if job.state.running() {
+            let held = job.state == jobs::State::Paused;
+            buttons = buttons.push(small(
+                theme,
+                if held { "go" } else { "hold" },
+                if held {
+                    Message::Act(Action::ResumeJob { job: job.id })
+                } else {
+                    Message::Act(Action::PauseJob { job: job.id })
+                },
+            ));
+        }
+        buttons = buttons.push(small(
+            theme,
+            if job.state.over() { "clear" } else { "stop" },
+            if job.state.over() {
+                Message::Act(Action::DismissJob { job: job.id })
+            } else {
+                Message::Act(Action::CancelJob { job: job.id })
+            },
+        ));
+
+        jobs = jobs.push(
+            container(column![
+                row![
+                    text(job.describe())
+                        .size(12)
+                        .color(foreground)
+                        .width(Length::Fill),
+                    buttons,
+                ]
+                .align_y(iced::Alignment::Center),
+                row![bar, rest],
+            ])
+            .padding([2, 10]),
+        );
+    }
 
     container(
         column![
@@ -2877,11 +3064,88 @@ fn sidebar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
     )
     .width(Length::Fixed(SIDEBAR))
     .height(Length::Fill)
+    // A gutter down the left edge. Without it the first letter of every
+    // place sits against the side of the window, which reads as a fault
+    // rather than as a margin.
+    .padding(iced::Padding {
+        left: 6.0,
+        ..iced::Padding::ZERO
+    })
     .style(move |_: &iced::Theme| container::Style {
         background: Some(theme.background.color().into()),
         ..container::Style::default()
     })
     .into()
+}
+
+/// What a job in this buffer would act on.
+///
+/// What is selected, or the row the cursor is on when nothing is -- which is
+/// what every file manager does, and it is why pressing a key with nothing
+/// selected still works. `None` means there is nothing at all, which is worth
+/// saying rather than doing quietly.
+fn chosen(app: &App, buffer: usize) -> Option<Vec<PathBuf>> {
+    let found = app.buffers.get(buffer)?;
+
+    let mut paths: Vec<PathBuf> = found.selected().map(|entry| entry.path.clone()).collect();
+    if paths.is_empty() {
+        paths.extend(found.at(found.cursor).map(|entry| entry.path.clone()));
+    }
+
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// The directory the next tile is showing, and a short name for it.
+///
+/// `None` when there is only one tile, or when the next one is showing the
+/// same directory: copying a thing on top of itself is not an offer.
+fn beside(app: &App, buffer: usize) -> Option<(PathBuf, String)> {
+    let here = app.buffers.get(buffer)?;
+
+    // One window today, and the next tile round from this one. When a second
+    // window arrives, "beside" has to mean the same window as the menu.
+    let tiles = app.windows.values().next()?;
+    let order: Vec<usize> = tiles.panes.iter().map(|(_, index)| *index).collect();
+    let at = order.iter().position(|index| *index == buffer)?;
+    let next = *order.get((at + 1) % order.len())?;
+
+    let there = app.buffers.get(next)?;
+    if there.path == here.path {
+        return None;
+    }
+
+    let name = there.path.file_name().map_or_else(
+        || there.path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    Some((there.path.clone(), name))
+}
+
+/// A small word that acts, for the job rows.
+///
+/// A word rather than a glyph: the panel is 180 pixels wide and "hold" is
+/// unambiguous where a pause symbol beside a stop symbol is two guesses.
+fn small<'a>(
+    theme: &crate::config::Theme,
+    what: &'a str,
+    message: Message,
+) -> Element<'a, Message> {
+    use iced::widget::button;
+
+    let dim = theme.dim.color();
+    button(text(what).size(11))
+        .padding([0, 4])
+        .style(move |_: &iced::Theme, status| button::Style {
+            background: None,
+            text_color: if matches!(status, button::Status::Hovered) {
+                iced::Color::WHITE
+            } else {
+                dim
+            },
+            ..button::Style::default()
+        })
+        .on_press(message)
+        .into()
 }
 
 /// The filter box, so it can be focused when it appears.
@@ -3045,6 +3309,7 @@ mod tests {
             pointer: (0.0, 0.0),
             size: iced::Size::new(1100.0, 700.0),
             places: Vec::new(),
+            jobs: jobs::Queue::new(2),
             tick: 0,
             dragging: None,
             pressed: None,

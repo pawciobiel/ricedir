@@ -211,6 +211,43 @@ pub enum Action {
         buffer: usize,
     },
 
+    // --- jobs: about the queue, not about a file ---------------------------
+    /// Hold a running job, let a held one go, or stop one for good.
+    ///
+    /// `Kind::View`, not `Kind::File`: these change the queue. The work they
+    /// hold up was accepted when the job was made.
+    PauseJob {
+        job: crate::jobs::Id,
+    },
+    ResumeJob {
+        job: crate::jobs::Id,
+    },
+    CancelJob {
+        job: crate::jobs::Id,
+    },
+    /// Take a finished job off the panel.
+    DismissJob {
+        job: crate::jobs::Id,
+    },
+
+    // --- file: changes what is on the disk ---------------------------------
+    /// Copy what is selected into another directory.
+    ///
+    /// Nothing moves when this arrives. It makes a job, and the job works out
+    /// a plan first -- see [`crate::jobs`].
+    Copy {
+        buffer: usize,
+        into: PathBuf,
+    },
+    /// Remove what is selected, for good.
+    ///
+    /// Asks first, and the dialogue is not a formality: there is no trash and
+    /// no undo, so the question is the only thing between a keystroke and
+    /// somebody's work. The job is made when they answer.
+    Delete {
+        buffer: usize,
+    },
+
     // --- opening ----------------------------------------------------------
     /// Enter a directory, or open a file through the scan chain and the
     /// handler table. Never a shortcut past either.
@@ -257,7 +294,14 @@ impl Action {
             | Self::Drag { .. }
             | Self::ShowBuffer { .. }
             | Self::CloseBuffer { .. }
-            | Self::Relist { .. } => Kind::View,
+            | Self::Relist { .. }
+            | Self::PauseJob { .. }
+            | Self::ResumeJob { .. }
+            | Self::CancelJob { .. }
+            | Self::DismissJob { .. } => Kind::View,
+
+            // The ones that change what is on the disk.
+            Self::Copy { .. } | Self::Delete { .. } => Kind::File,
 
             // A bookmark writes a file, but ricedir's own, not one of the
             // person's. Nothing in the plan mechanism is about protecting
@@ -313,15 +357,16 @@ impl Action {
 /// the socket. `app::update` holds the message plumbing; this holds what the
 /// messages mean.
 pub fn dispatch(app: &mut App, action: Action) -> Task<Message> {
-    // A `File` action must never reach the plumbing below without a plan and a
-    // person. None exists yet -- M4 adds them -- so the check is here from the
-    // start rather than being remembered later.
-    if action.kind() == Kind::File {
-        return crate::app::refuse(
-            app,
-            String::from("that would change a file, and plans arrive in M4"),
-        );
-    }
+    // A `File` action needs a plan and a person. The person is the only one
+    // who can get here: this door is reached from a key, a click or a menu,
+    // and the wire reaches the window only through `Action::of`, which
+    // cannot make a `File` action at all -- see the test below and the one
+    // in the protocol crate. When M3 opens the socket, an origin has to
+    // arrive here before that stops being true.
+    //
+    // The plan is the job's own: `Action::Copy` moves nothing. It builds a
+    // plan on a thread, and the window can say what will happen before it
+    // does. M4 adds the half where an agent asks and a person accepts.
 
     // Any action but opening a menu closes the one that is open. A menu that
     // outlives the thing it was about is a menu that acts on the wrong file.
@@ -424,16 +469,59 @@ mod tests {
             Action::NextTile,
             Action::PreviousTile,
             Action::Relist { buffer: 0 },
+            Action::PauseJob {
+                job: crate::jobs::Id(0),
+            },
+            Action::ResumeJob {
+                job: crate::jobs::Id(0),
+            },
+            Action::CancelJob {
+                job: crate::jobs::Id(0),
+            },
+            Action::DismissJob {
+                job: crate::jobs::Id(0),
+            },
+            Action::Copy {
+                buffer: 0,
+                into: PathBuf::from("/tmp"),
+            },
+            Action::Delete { buffer: 0 },
             Action::Activate { buffer: 0, row: 0 },
         ];
 
+        // Only the ones that really write may say so. A `File` kind is what
+        // M4's plan mechanism will hang off, so an action that claims it by
+        // accident would be asking a person to accept a selection change.
         for action in actions {
-            let kind = action.kind();
-            assert_ne!(
-                kind,
-                Kind::File,
-                "{action:?} claims to write, and nothing in M1 may"
+            let writes = matches!(action, Action::Copy { .. } | Action::Delete { .. });
+            assert_eq!(
+                action.kind() == Kind::File,
+                writes,
+                "{action:?} declares the wrong kind"
             );
+        }
+    }
+
+    /// The wire cannot ask for a file to be changed. That is what lets
+    /// `dispatch` act on a `File` action without an origin: nothing but a
+    /// person can put one there until M3 and M4 arrive together.
+    #[test]
+    fn no_request_becomes_a_file_action() {
+        for request in [
+            Request::Selection,
+            Request::Buffers,
+            Request::Cursor,
+            Request::Go {
+                path: PathBuf::from("/tmp"),
+            },
+            Request::Filter {
+                text: String::from("x"),
+            },
+        ] {
+            let Ok(action) = Action::of(&request, 0) else {
+                continue;
+            };
+            assert_ne!(action.kind(), Kind::File, "`{}` writes", request.name());
         }
     }
 

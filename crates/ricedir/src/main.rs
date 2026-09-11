@@ -12,6 +12,7 @@ mod config;
 mod dialogue;
 mod entry;
 mod icon;
+mod jobs;
 mod keys;
 mod open;
 mod places;

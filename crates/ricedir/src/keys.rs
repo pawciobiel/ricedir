@@ -47,6 +47,11 @@ pub enum Bound {
     PreviousTile,
     Escape,
     Keys,
+    /// Remove for good. No trash yet, so the plain Delete key is left
+    /// unbound: every desktop means "to the trash" by it, and doing
+    /// something else under a key people already know is how files go
+    /// missing.
+    Delete,
 }
 
 impl Bound {
@@ -77,6 +82,7 @@ impl Bound {
             Self::PreviousTile => "previous-tile",
             Self::Escape => "escape",
             Self::Keys => "keys",
+            Self::Delete => "delete",
         }
     }
 
@@ -107,6 +113,7 @@ impl Bound {
         Self::PreviousTile,
         Self::Escape,
         Self::Keys,
+        Self::Delete,
     ];
 
     /// Find an action by the name a config line used.
@@ -299,6 +306,10 @@ impl Default for Bindings {
             ("ctrl+w", Bound::CloseTile),
             ("escape", Bound::Escape),
             ("?", Bound::Keys),
+            // Shift and Delete is what every file manager means by "do not
+            // put it in the trash". There is no trash, so it is the only
+            // one bound.
+            ("shift+delete", Bound::Delete),
         ];
 
         let bindings = table

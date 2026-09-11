@@ -36,6 +36,12 @@ pub enum Dialogue {
     },
     /// The type is one the fallback may never guess at.
     Refused { path: PathBuf, mime: String },
+    /// About to delete, for good.
+    ///
+    /// The one dialogue here that is not about opening a file. There is no
+    /// trash yet and no undo, so this is the only thing standing between a
+    /// keystroke and somebody's work.
+    Deleting { paths: Vec<PathBuf>, buffer: usize },
 }
 
 /// What the person chose.
@@ -51,24 +57,54 @@ pub enum Choice {
     Named,
     /// Type a program name.
     Typing(String),
+    /// Delete what was named, for good.
+    Delete,
     Dismiss,
 }
 
 impl Dialogue {
-    const fn path(&self) -> &PathBuf {
+    const fn path(&self) -> Option<&PathBuf> {
         match self {
             Self::NoHandler { path, .. }
             | Self::Warned { path, .. }
             | Self::Blocked { path, .. }
-            | Self::Refused { path, .. } => path,
+            | Self::Refused { path, .. } => Some(path),
+            // It is about several, and the view names them itself.
+            Self::Deleting { .. } => None,
         }
     }
 
     fn name(&self) -> String {
-        self.path().file_name().map_or_else(
-            || self.path().display().to_string(),
+        let Some(path) = self.path() else {
+            return String::new();
+        };
+
+        path.file_name().map_or_else(
+            || path.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         )
+    }
+}
+
+/// The names, short enough to read, and how many were left out.
+///
+/// Three and a count. A list of nine hundred filenames is not a thing anybody
+/// checks before pressing a button, so it would make the dialogue worse.
+fn named(paths: &[PathBuf]) -> String {
+    let shown: Vec<String> = paths
+        .iter()
+        .take(3)
+        .map(|path| {
+            path.file_name().map_or_else(
+                || path.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+
+    match paths.len().saturating_sub(shown.len()) {
+        0 => shown.join(", "),
+        more => format!("{}, and {more} more", shown.join(", ")),
     }
 }
 
@@ -130,6 +166,26 @@ pub fn view<'a>(dialogue: &'a Dialogue, theme: &Theme, typed: &'a str) -> Elemen
                 "Edit that rule in your config if this was wrong."
             )),
             button(text("Close").size(13)).on_press(Choice::Dismiss),
+        ]
+        .spacing(10)
+        .into(),
+
+        Dialogue::Deleting { paths, .. } => column![
+            heading(format!(
+                "Delete {} thing{} for good?",
+                paths.len(),
+                if paths.len() == 1 { "" } else { "s" }
+            )),
+            detail(named(paths)),
+            detail(String::from(
+                "There is no trash yet, so this cannot be undone. A directory \
+                 goes with everything inside it."
+            )),
+            row![
+                button(text("Delete for good").size(13)).on_press(Choice::Delete),
+                button(text("Cancel").size(13)).on_press(Choice::Dismiss),
+            ]
+            .spacing(8),
         ]
         .spacing(10)
         .into(),
