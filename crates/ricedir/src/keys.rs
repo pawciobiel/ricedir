@@ -47,6 +47,8 @@ pub enum Bound {
     PreviousTile,
     Escape,
     Keys,
+    /// Show or hide the panel down the left.
+    Sidebar,
     /// Remove for good. No trash yet, so the plain Delete key is left
     /// unbound: every desktop means "to the trash" by it, and doing
     /// something else under a key people already know is how files go
@@ -83,6 +85,7 @@ impl Bound {
             Self::Escape => "escape",
             Self::Keys => "keys",
             Self::Delete => "delete",
+            Self::Sidebar => "sidebar",
         }
     }
 
@@ -114,6 +117,7 @@ impl Bound {
         Self::Escape,
         Self::Keys,
         Self::Delete,
+        Self::Sidebar,
     ];
 
     /// Find an action by the name a config line used.
@@ -310,6 +314,8 @@ impl Default for Bindings {
             // put it in the trash". There is no trash, so it is the only
             // one bound.
             ("shift+delete", Bound::Delete),
+            // Nautilus and Dolphin both put the side panel here.
+            ("f9", Bound::Sidebar),
         ];
 
         let bindings = table

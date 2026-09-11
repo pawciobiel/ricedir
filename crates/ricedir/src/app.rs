@@ -139,6 +139,14 @@ const SIDEBAR: f32 = 180.0;
 const SPLIT_RIGHT: char = '\u{eb56}';
 const SPLIT_DOWN: char = '\u{eb57}';
 
+/// The places panel, on show and hidden.
+///
+/// `cod-layout_sidebar_left` and `cod-layout_sidebar_left_off`, read out of
+/// the font's own glyph names rather than remembered, and then rendered to
+/// be sure. The same codicon family as the two above.
+const SIDEBAR_ON: char = '\u{ebf3}';
+const SIDEBAR_OFF: char = '\u{ec02}';
+
 pub struct App {
     config: Config,
     /// Every open directory. Tiles will hold indices into this, exactly as
@@ -194,6 +202,11 @@ pub struct App {
     /// Kept whether or not a drag is going on: it draws the hovered row as
     /// well as saying where a drop would land.
     over_place: Option<usize>,
+    /// Whether the panel down the left is on show.
+    ///
+    /// One window's worth, not one per tile: it is one panel. Remembered
+    /// between runs in `state.toml`.
+    sidebar: bool,
     /// Every job, running, waiting or finished.
     ///
     /// Storage, not transport. A worker never touches this: it sends what it
@@ -313,6 +326,7 @@ pub fn new(mut config: Config, start: PathBuf) -> (App, Task<Message>) {
         pointer: (0.0, 0.0),
         size: iced::Size::new(config_width, config_height),
         places: places::list(),
+        sidebar: remembered.sidebar.unwrap_or(true),
         jobs: jobs::Queue::new(workers),
         tick: 0,
         dragging: None,
@@ -397,7 +411,10 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 .get(index)
                 .map_or_else(|| app.config.list.view(), |found| found.view);
 
-            let acted = action::dispatch(app, translate(index, found, showing, app.pointer));
+            let acted = action::dispatch(
+                app,
+                translate(index, found, showing, app.pointer, app.sidebar),
+            );
 
             if moved {
                 Task::batch([acted, refocus(app, index)])
@@ -769,6 +786,7 @@ const fn translate(
     found: list::Action,
     view: crate::config::View,
     pointer: (f32, f32),
+    sidebar: bool,
 ) -> Action {
     let crate::config::View {
         layout: current,
@@ -821,6 +839,7 @@ const fn translate(
         list::Action::PreviousTile => Action::PreviousTile,
         list::Action::Escape => Action::Escape { buffer },
         list::Action::Delete => Action::Delete { buffer },
+        list::Action::Sidebar => Action::Sidebar { showing: !sidebar },
         list::Action::Bookmark => Action::Bookmark { buffer, path: None },
         list::Action::Buffers => Action::Menu {
             kind: MenuKind::Buffers,
@@ -1008,6 +1027,20 @@ fn finish_drag(app: &mut App) -> Task<Message> {
     }
 
     Task::none()
+}
+
+/// Write what should survive the next start.
+///
+/// Everything at once, because the file holds one table: writing only the
+/// field that changed would drop the other one. `None` for the layout means
+/// keep whatever was last remembered, which is what a config that names a
+/// layout leaves in there.
+fn remember_view(app: &App, layout: Option<crate::config::Layout>) {
+    crate::state::State {
+        layout: layout.or_else(|| crate::state::State::load().layout),
+        sidebar: Some(app.sidebar),
+    }
+    .save();
 }
 
 /// Which buffer the focused tile of one window is showing.
@@ -1268,11 +1301,14 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             // Remembered for the next run, in ricedir's own state file --
             // never written back into the config, which is a file a person
             // edits and comments.
-            crate::state::State {
-                layout: Some(layout),
-            }
-            .save();
+            remember_view(app, Some(layout));
 
+            Task::none()
+        }
+
+        Action::Sidebar { showing } => {
+            app.sidebar = showing;
+            remember_view(app, None);
             Task::none()
         }
 
@@ -1838,18 +1874,29 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
 
     // Places above, jobs below, the tiles in the rest. Fixed furniture: a file
     // manager whose panels move around is one nobody can be shown how to use.
-    let page = row![
-        sidebar(app, focused),
+    //
+    // The panel goes altogether or not at all, divider included. Leaving the
+    // line behind would be a rule down the side of the window with nothing
+    // on the other side of it.
+    let mut page = row![];
+
+    if app.sidebar {
+        page = page.push(sidebar(app, focused));
         // One pixel of `muted`, full height. A `Space` with no height makes
         // the container collapse to nothing, which is a divider you cannot
         // see -- it was written that way once.
-        container(iced::widget::Space::new())
-            .width(1)
-            .height(Length::Fill)
-            .style(move |_: &iced::Theme| container::Style {
-                background: Some(app.config.theme.muted.color().into()),
-                ..container::Style::default()
-            }),
+        page = page.push(
+            container(iced::widget::Space::new())
+                .width(1)
+                .height(Length::Fill)
+                .style(move |_: &iced::Theme| container::Style {
+                    background: Some(app.config.theme.muted.color().into()),
+                    ..container::Style::default()
+                }),
+        );
+    }
+
+    let page = page.push(
         // `muted` behind the grid, so the gaps `pane_grid` leaves between
         // tiles are lines rather than nothing.
         container(grid)
@@ -1859,9 +1906,9 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
                 background: Some(app.config.theme.muted.color().into()),
                 ..container::Style::default()
             }),
-    ]
-    .width(Length::Fill)
-    .height(Length::Fill);
+    );
+
+    let page = page.width(Length::Fill).height(Length::Fill);
 
     // A menu sits over the page, and under a dialogue.
     let page: Element<'_, Message> = match &app.menu {
@@ -2258,6 +2305,15 @@ fn toolbar(app: &App, index: usize, view: crate::config::View) -> Element<'_, Me
             Message::Act(Action::ShowHidden {
                 buffer: index,
                 showing: !view.show_hidden,
+            }),
+        ),
+        tool(
+            app,
+            if app.sidebar { SIDEBAR_ON } else { SIDEBAR_OFF },
+            String::from("Places panel  (F9)"),
+            app.sidebar,
+            Message::Act(Action::Sidebar {
+                showing: !app.sidebar,
             }),
         ),
         tool(
@@ -3309,6 +3365,7 @@ mod tests {
             pointer: (0.0, 0.0),
             size: iced::Size::new(1100.0, 700.0),
             places: Vec::new(),
+            sidebar: true,
             jobs: jobs::Queue::new(2),
             tick: 0,
             dragging: None,
@@ -3763,6 +3820,20 @@ mod tests {
 
         tell(&mut app, Message::EscapedPath(window));
         assert!(app.buffers[0].typing_path.is_none());
+    }
+
+    /// F9 turns the panel off and on again. A toggle that only worked one
+    /// way would take the panel away and keep it.
+    #[test]
+    fn the_panel_goes_and_comes_back() {
+        let mut app = app();
+        assert!(app.sidebar, "it starts on show");
+
+        tell(&mut app, Message::List(0, list::Action::Sidebar));
+        assert!(!app.sidebar);
+
+        tell(&mut app, Message::List(0, list::Action::Sidebar));
+        assert!(app.sidebar);
     }
 
     /// Two buffers, so the per-tile state has somewhere to leak to.

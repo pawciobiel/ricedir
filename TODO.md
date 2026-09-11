@@ -1493,6 +1493,24 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
 - [ ] **Conflicts.** Skip, overwrite, keep both, newer only, and larger only,
       asked once with an apply-to-all, decided up front where the plan already
       knows there is a clash.
+- [ ] **Drag between tiles.** Onto a directory in another tile puts it in
+      there; onto empty space puts it in that tile's directory. Copy by
+      default, move with a modifier -- Shift is what GTK and Qt use, and
+      Ctrl is copy, so follow them rather than invent.
+
+      The parts are built: `Dragging` names its source, the 6 px threshold
+      tells a click from a drag, and `Action::Copy { buffer, into }` already
+      takes a destination. What is missing is the target half -- a listing
+      has to say which row the pointer is over -- and move itself.
+
+      Read the modifier at the drop, not at the press. People reach for
+      Shift after they have started dragging.
+
+      A drag between filesystems cannot be a rename, so a move there is a
+      copy and a delete. Say which it will be before it starts.
+
+      Inside this window only. winit cannot drag out to another application
+      on Wayland.
 - [ ] **Not walking off the edge.** `*at` syscalls through `rustix` so a
       recursive delete cannot be redirected by a symlink swapped in mid-walk:
       `openat` with `O_NOFOLLOW|O_DIRECTORY` down the tree, `unlinkat` with
@@ -1846,12 +1864,31 @@ what the person is looking at.
 Deliberately after correctness, but not optional: the reason to use this rather
 than the one already installed is partly that it looks good.
 
-- [ ] **Hide and show the left panel.** A key and a toolbar button, remembered
-      in `state.toml`. 180 pixels is a lot of a small screen. Places,
-      bookmarks and jobs go together: they are one panel.
+- [x] **Hide and show the left panel.** `F9`, which is where Nautilus and
+      Dolphin put it, and a toolbar button. Remembered in `state.toml`.
+
+      The divider goes with it, or the window keeps a rule down its side with
+      nothing behind it. `state.toml` holds one table, so writing one field
+      means writing them all -- see `remember_view`.
+
+      The glyphs are `cod-layout_sidebar_left` and its `_off`, read out of
+      the font's own glyph names with `fontTools` rather than guessed. That
+      is the cheap way to obey the rule about never guessing a codepoint.
 
 - [ ] **An icon beside each place and each bookmark.** A house, a folder, a
       disk. `icon.rs` already holds the glyphs.
+
+- [ ] **A third width: the panel as a thin strip of icons.** A small bar above
+      PLACES with a chevron at its right end. `<` narrows the panel to the
+      icons alone; `>` opens it again. F9 keeps doing gone and back.
+
+      Three widths, so `State::sidebar` stops being a `bool`. Make it an enum
+      before writing any of this, or the state file gets a second field that
+      means the same thing.
+
+      Needs the icons above first: a thin strip with no icons in it is a
+      column of clipped words. A name on hover as well, or the strip says
+      nothing.
 
 - [ ] **Devices on the left panel, and a switch for them.** Mounted disks
       show today. An *unmounted* one does not, and a USB stick that is

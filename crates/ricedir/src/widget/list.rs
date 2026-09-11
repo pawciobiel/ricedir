@@ -98,6 +98,8 @@ pub enum Action {
     Keys,
     /// Remove what is selected, for good. Asks first.
     Delete,
+    /// Show or hide the panel down the left.
+    Sidebar,
     /// Turn the path bar over to its text face.
     TypePath,
     /// Read the directory again.
@@ -698,6 +700,7 @@ where
                             Bound::Escape => Action::Escape,
                             Bound::Keys => Action::Keys,
                             Bound::Delete => Action::Delete,
+                            Bound::Sidebar => Action::Sidebar,
                         }
                     });
 

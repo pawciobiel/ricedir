@@ -210,6 +210,14 @@ pub enum Action {
     Relist {
         buffer: usize,
     },
+    /// Show or hide the panel down the left.
+    ///
+    /// The whole panel: places, bookmarks and the jobs list are one thing,
+    /// and hiding half of it would leave a strip with nothing in it.
+    /// Remembered between runs, beside the layout.
+    Sidebar {
+        showing: bool,
+    },
 
     // --- jobs: about the queue, not about a file ---------------------------
     /// Hold a running job, let a held one go, or stop one for good.
@@ -295,6 +303,7 @@ impl Action {
             | Self::ShowBuffer { .. }
             | Self::CloseBuffer { .. }
             | Self::Relist { .. }
+            | Self::Sidebar { .. }
             | Self::PauseJob { .. }
             | Self::ResumeJob { .. }
             | Self::CancelJob { .. }
@@ -469,6 +478,7 @@ mod tests {
             Action::NextTile,
             Action::PreviousTile,
             Action::Relist { buffer: 0 },
+            Action::Sidebar { showing: true },
             Action::PauseJob {
                 job: crate::jobs::Id(0),
             },

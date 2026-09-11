@@ -47,6 +47,9 @@ pub struct State {
     /// their folders "forget" or "change by themselves": the state grows
     /// without bound and nothing on screen says which rule won.
     pub layout: Option<Layout>,
+    /// Whether the panel down the left was on show. `None` means it was
+    /// never changed, so it starts on.
+    pub sidebar: Option<bool>,
 }
 
 impl State {
@@ -101,6 +104,7 @@ mod tests {
     fn a_remembered_layout_round_trips() {
         let saved = State {
             layout: Some(Layout::Detail),
+            sidebar: Some(false),
         };
         let text = toml::to_string(&saved).expect("should write");
         let read: State = toml::from_str(&text).expect("should read");
