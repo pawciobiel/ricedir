@@ -81,7 +81,10 @@ pub enum Action {
         text: String,
     },
     /// Show or hide the filter box. A person only: an agent filters by text.
-    Filtering(bool),
+    Filtering {
+        buffer: usize,
+        showing: bool,
+    },
     /// Turn the path bar over to its text face, or back to its breadcrumbs.
     ///
     /// A person only. An agent already names a path in `Go` and has nothing
@@ -91,7 +94,14 @@ pub enum Action {
         typing: bool,
     },
     /// Put away whatever is in front. A person only.
-    Escape,
+    ///
+    /// The buffer is which tile asked. The menu and the dialogue are
+    /// window-wide and ignore it; the filter box and the path bar's text
+    /// face belong to one directory, and Escape has to put away the one in
+    /// front of the person rather than somebody else's.
+    Escape {
+        buffer: usize,
+    },
     /// Show a menu at a point on screen. A person only: a pointer and a
     /// button are the only things that have a point.
     Menu {
@@ -118,6 +128,28 @@ pub enum Action {
     Bookmark {
         buffer: usize,
         path: Option<PathBuf>,
+    },
+    /// Pick up what a row names, to drop it somewhere.
+    ///
+    /// The row rather than the paths: the widget knows a number and the
+    /// buffer knows what is at it. Dragging a row that is *not* selected
+    /// picks up that one, which is what every file manager does; dragging
+    /// one that is picks up the whole selection.
+    ///
+    /// Inside this window only. winit cannot drag out to another
+    /// application on Wayland, which is a limit of the platform rather than
+    /// a thing to work around.
+    Drag {
+        buffer: usize,
+        row: usize,
+    },
+    /// Move a place to another position in the panel.
+    ///
+    /// Only a bookmark can move: the rest of the panel is home, the XDG
+    /// directories and the mounts, and their order is not ours.
+    MovePlace {
+        from: PathBuf,
+        before: Option<PathBuf>,
     },
     /// Take one back out again.
     ///
@@ -208,9 +240,9 @@ impl Action {
             | Self::Forward { .. }
             | Self::Leave { .. }
             | Self::Filter { .. }
-            | Self::Filtering(_)
+            | Self::Filtering { .. }
             | Self::TypingPath { .. }
-            | Self::Escape
+            | Self::Escape { .. }
             | Self::Menu { .. }
             | Self::SortBy(_)
             | Self::ReverseSort
@@ -222,6 +254,7 @@ impl Action {
             | Self::NextTile
             | Self::PreviousTile
             | Self::OpenBeside { .. }
+            | Self::Drag { .. }
             | Self::ShowBuffer { .. }
             | Self::CloseBuffer { .. }
             | Self::Relist { .. } => Kind::View,
@@ -229,7 +262,7 @@ impl Action {
             // A bookmark writes a file, but ricedir's own, not one of the
             // person's. Nothing in the plan mechanism is about protecting
             // ricedir from itself, so it acts at once like any other view.
-            Self::Bookmark { .. } | Self::Unbookmark { .. } => Kind::View,
+            Self::Bookmark { .. } | Self::Unbookmark { .. } | Self::MovePlace { .. } => Kind::View,
 
             // Opening runs a program. It is not a file *write*, so it is not
             // `Kind::File`, but it is the one view-shaped action with a scan
@@ -335,12 +368,15 @@ mod tests {
                 buffer: 0,
                 text: String::new(),
             },
-            Action::Filtering(true),
+            Action::Filtering {
+                buffer: 0,
+                showing: true,
+            },
             Action::TypingPath {
                 buffer: 0,
                 typing: true,
             },
-            Action::Escape,
+            Action::Escape { buffer: 0 },
             Action::Menu {
                 kind: crate::app::MenuKind::Context { row: Some(0) },
                 buffer: 0,
@@ -364,6 +400,11 @@ mod tests {
             },
             Action::Unbookmark {
                 path: PathBuf::from("/tmp"),
+            },
+            Action::Drag { buffer: 0, row: 0 },
+            Action::MovePlace {
+                from: PathBuf::from("/tmp"),
+                before: None,
             },
             Action::OpenBeside {
                 path: PathBuf::from("/tmp"),

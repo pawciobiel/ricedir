@@ -247,17 +247,33 @@ fn flatpak_installed(id: &str) -> bool {
     found
 }
 
-/// Start a handler, and leave it to get on with it.
+/// How long a handler is watched before it is left alone.
+///
+/// Long enough to catch a program that starts and gives up -- `emacs-nox`
+/// wanting a terminal takes about 20 ms to say so -- and short enough that
+/// nobody waits for the ordinary case, where nothing is reported at all.
+const WATCH: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How much of a failing handler's stderr is read.
+///
+/// One short message is what the notice line can show. The rest is a build
+/// log or a usage screen, and neither belongs in a strip at the top of a
+/// window.
+const SAID: u64 = 4096;
+
+/// Start a handler, watch it briefly, then leave it to get on with it.
 ///
 /// Detached on purpose: these launch editors and video players, and waiting
-/// on one would hold the window for as long as somebody watched a film.
-/// stderr is piped so a handler that fails immediately can say why in the
-/// notice line rather than into a terminal nobody is looking at.
+/// on one would hold the window for as long as somebody watched a film. But
+/// `spawn` reports only a program that will not *start*. `emacs-nox` started
+/// perfectly and then exited, because it wanted a terminal, and ricedir said
+/// nothing at all -- which looks exactly like a file that will not open. So
+/// the child is watched for [`WATCH`] and a quick failure is reported with
+/// whatever it printed.
 ///
-/// Not `async`: there is nothing to wait for. It still has to be called from
-/// inside the tokio runtime, because `tokio::process::Command` registers the
-/// child with the reactor.
-pub fn spawn(plan: &Plan) -> Result<(), String> {
+/// Async now, and it must be: waiting on the loop is the one thing that is
+/// never allowed.
+pub async fn spawn(plan: &Plan) -> Result<(), String> {
     let Plan::Run {
         name,
         program,
@@ -284,10 +300,64 @@ pub fn spawn(plan: &Plan) -> Result<(), String> {
     // never its grandchildren, which ricebar measured the hard way.
     command.process_group(0);
 
-    match command.spawn() {
-        Ok(_) => Ok(()),
-        Err(error) => Err(format!("`{name}` would not start: {error}")),
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Err(format!("`{name}` would not start: {error}")),
+    };
+    let errors = child.stderr.take();
+
+    // `Child::wait` is cancel safe, so the timeout may drop it and the child
+    // is still there to be waited on afterwards.
+    match tokio::time::timeout(WATCH, child.wait()).await {
+        // Still running, which is the ordinary case. Nothing more to say.
+        Err(_) => {
+            tokio::spawn(async move {
+                // The pipe is drained rather than abandoned. A player that
+                // writes more than a pipe holds would otherwise block on its
+                // own stderr, and look like it had hung.
+                if let Some(mut errors) = errors {
+                    let mut sink = tokio::io::sink();
+                    let _ = tokio::io::copy(&mut errors, &mut sink).await;
+                }
+                let _ = child.wait().await;
+            });
+            Ok(())
+        }
+
+        Ok(Err(error)) => Err(format!("`{name}` could not be waited for: {error}")),
+
+        // A handler that opens a window and returns is doing its job:
+        // `xdg-open` and `flatpak run` both do exactly this.
+        Ok(Ok(status)) if status.success() => Ok(()),
+
+        Ok(Ok(status)) => {
+            let said = complaint(errors).await;
+            let how = status.code().map_or_else(
+                || String::from("it was killed"),
+                |code| format!("code {code}"),
+            );
+
+            Err(match said {
+                Some(said) => format!("`{name}` started and then stopped: {said}"),
+                None => format!("`{name}` started and then stopped ({how})"),
+            })
+        }
     }
+}
+
+/// The first thing a failing handler printed, if it printed anything.
+async fn complaint(errors: Option<tokio::process::ChildStderr>) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    let errors = errors?;
+    let mut read = Vec::new();
+    errors.take(SAID).read_to_end(&mut read).await.ok()?;
+
+    String::from_utf8_lossy(&read)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -498,6 +568,82 @@ mod tests {
 
         assert_eq!(program, OsString::from("xdg-open"));
         assert_eq!(arguments.first(), Some(&OsString::from("--")));
+    }
+
+    /// What `run` is handed in these: a program and its arguments, with no
+    /// file involved, because what is under test is the child and not the
+    /// path.
+    fn runs(program: &str, arguments: &[&str]) -> Plan {
+        Plan::Run {
+            name: String::from(program),
+            program: OsString::from(program),
+            arguments: arguments.iter().map(OsString::from).collect(),
+            directory: None,
+        }
+    }
+
+    /// The fault this was written for. `emacs-nox` started perfectly and then
+    /// exited because it wanted a terminal, and ricedir said nothing -- which
+    /// from the other side of the screen is a file that will not open.
+    #[tokio::test]
+    async fn a_handler_that_stops_at_once_is_reported() {
+        let problem = spawn(&runs("false", &[]))
+            .await
+            .expect_err("a handler that exits 1 is a failure");
+
+        assert!(
+            problem.contains("started and then stopped"),
+            "unhelpful: {problem}"
+        );
+    }
+
+    /// And it says what the handler said, because "it stopped" on its own
+    /// sends nobody anywhere.
+    #[tokio::test]
+    async fn what_it_printed_is_what_is_reported() {
+        // `cat` on a path that is not there prints one short line and exits
+        // non-zero, which is the shape of every handler that gives up.
+        let problem = spawn(&runs("cat", &["/nonexistent-ricedir-test"]))
+            .await
+            .expect_err("cat on a missing file fails");
+
+        assert!(
+            problem.contains("/nonexistent-ricedir-test"),
+            "stderr was dropped: {problem}"
+        );
+    }
+
+    /// A handler that opens a window and keeps running is the ordinary case.
+    /// It must not be waited for, and it must not be reported.
+    #[tokio::test]
+    async fn a_handler_that_keeps_running_is_left_alone() {
+        let started = std::time::Instant::now();
+        let result = spawn(&runs("sleep", &["30"])).await;
+
+        assert!(result.is_ok(), "a running handler is not a failure");
+        assert!(
+            started.elapsed() < WATCH * 3,
+            "waited {:?}, which is waiting for the film to end",
+            started.elapsed()
+        );
+    }
+
+    /// Exit 0 in the first moment is success, not failure. `xdg-open` and
+    /// `flatpak run` both hand the file over and return.
+    #[tokio::test]
+    async fn a_handler_that_hands_over_and_returns_is_fine() {
+        assert!(spawn(&runs("true", &[])).await.is_ok());
+    }
+
+    /// A program that is not installed is still reported the old way, before
+    /// there is any child to watch.
+    #[tokio::test]
+    async fn a_handler_that_is_not_there_is_reported() {
+        let problem = spawn(&runs("ricedir-no-such-program", &[]))
+            .await
+            .expect_err("a missing program cannot start");
+
+        assert!(problem.contains("would not start"), "unhelpful: {problem}");
     }
 
     /// A config others can write names no programs at all, so every file

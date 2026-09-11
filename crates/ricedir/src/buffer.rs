@@ -85,6 +85,23 @@ pub struct Buffer {
 
     /// What the filter box says. Empty means everything.
     pub filter: String,
+    /// Whether the filter box is on screen for this directory.
+    ///
+    /// Hidden until asked for, because a box that is always there is a box
+    /// that is always in the way.
+    pub filtering: bool,
+
+    /// The path being typed, when this directory's path bar is showing its
+    /// text face. `None` is the breadcrumbs.
+    ///
+    /// The draft, not the path: what is typed has to survive being wrong. A
+    /// half-finished path names nothing, and replacing the buffer's own path
+    /// with it would relist on every keystroke.
+    ///
+    /// Per buffer for the same reason the view is. It was one field on the
+    /// window once, and then a tile split while a path was half typed handed
+    /// the draft to whichever tile the keyboard moved to next.
+    pub typing_path: Option<String>,
 
     /// How this directory is arranged, and whether the dotfiles show.
     ///
@@ -129,6 +146,8 @@ impl Buffer {
             anchor: 0,
             selection: HashSet::new(),
             filter: String::new(),
+            filtering: false,
+            typing_path: None,
             history: Vec::new(),
             future: Vec::new(),
             generation: 0,

@@ -127,7 +127,22 @@ pub enum Action {
     },
     /// Ctrl-I: select what is not selected.
     Invert,
+    /// A press on a row, and the pointer has moved far enough to mean it.
+    ///
+    /// The row is named so that dragging something not selected drags that
+    /// one rather than whatever happened to be selected before.
+    DragRow(usize),
 }
+
+/// How far the pointer moves before a press on a row becomes a drag.
+///
+/// A press both selects and may begin a drag, so the two cannot be told
+/// apart until the pointer moves. Without a threshold a shaky hand turns
+/// every click into a drag.
+///
+/// Public because the places panel asks the same question about its own
+/// rows, and two thresholds that happened to agree would stop agreeing.
+pub const DRAG: f32 = 6.0;
 
 /// How long after a click a second one on the same row counts as a double.
 ///
@@ -152,6 +167,9 @@ struct State {
     /// coordinates -- the offset is already added in, so scrolling mid-drag
     /// keeps the band over the same files rather than the same pixels.
     band: Option<(Point, Point)>,
+    /// A row that was pressed, and where, while it is still undecided
+    /// whether this is a click or the start of a drag.
+    from_row: Option<(usize, Point)>,
 }
 
 pub struct FileList<'a, Message> {
@@ -512,6 +530,13 @@ where
                         // before anything happens to it.
                         state.clicked = (!again).then_some((row, now));
 
+                        // Where a drag would have started, if the pointer
+                        // moves far enough. Selecting on press and dragging
+                        // from the same press is what every file manager
+                        // does, so the two cannot be told apart until the
+                        // pointer has moved.
+                        state.from_row = Some((row, point));
+
                         Some(if again {
                             Action::Activate(row)
                         } else if state.modifiers.command() {
@@ -533,6 +558,18 @@ where
             }
 
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                // A press on a row, and now the pointer has moved far
+                // enough: this is a drag, not a click. The threshold is what
+                // stops a shaky hand turning every click into one.
+                if let Some((row, started)) = state.from_row
+                    && let Some(now) = cursor.position()
+                    && started.distance(now) > DRAG
+                {
+                    state.from_row = None;
+                    shell.publish((self.on_action)(Action::DragRow(row)));
+                    return;
+                }
+
                 let Some((from, _)) = state.band else {
                     return;
                 };
@@ -550,9 +587,20 @@ where
             }
 
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                state.from_row = None;
+
                 if state.band.take().is_some() {
                     shell.request_redraw();
                 }
+
+                // Nothing is published. A drag is ended by the window, which
+                // hears every release wherever it lands. This used to say so
+                // itself, and every list in the window said it at once --
+                // including the ones the release was nowhere near. Each of
+                // those messages focused its own tile, so with two tiles the
+                // keyboard ended up wherever the last list happened to
+                // report from, and a click on a tile flashed it and gave it
+                // straight back.
             }
 
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {

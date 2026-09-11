@@ -44,6 +44,50 @@ impl Tiles {
     }
 }
 
+/// What is being dragged.
+///
+/// Where it would land is `App::over_place`, which the panel keeps up to date
+/// whether or not anything is being dragged, because it is also what draws
+/// the row under the pointer as hovered.
+#[derive(Debug, Clone)]
+pub struct Dragging {
+    /// Directories only. A file cannot be a place, and picking one up would
+    /// promise a drop that is refused at the end.
+    pub paths: Vec<PathBuf>,
+    pub source: Source,
+}
+
+/// Where a drag started, which is what decides what a drop means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// A row in a listing. Dropping it on the panel adds a bookmark.
+    List,
+    /// A place already in the panel. Dropping it on another reorders them.
+    Place,
+}
+
+/// A press on a place, held until it is known whether it was a click.
+///
+/// A press both opens a place and may begin a drag, so the two are told apart
+/// the way the listing tells them apart: by the pointer moving [`DRAG`]
+/// pixels. Until it does, nothing has happened yet.
+#[derive(Debug, Clone)]
+struct Pressed {
+    /// Which place, as an index into `App::places`.
+    place: usize,
+    /// The tile that would go there, if this turns out to be a click.
+    buffer: usize,
+    /// Where the pointer was when the button went down.
+    at: (f32, f32),
+    /// Whether it has since moved far enough to be a drag.
+    dragged: bool,
+}
+
+// How far the pointer moves before a press becomes a drag. The list widget's
+// own threshold, because it is the same question, and two answers would be
+// felt as the window behaving differently on each side of the divider.
+use list::DRAG;
+
 /// A menu, and where it was asked for.
 #[derive(Debug, Clone)]
 pub struct Menu {
@@ -109,16 +153,8 @@ pub struct App {
     dialogue: Option<Dialogue>,
     /// What has been typed into the dialogue's program box.
     typed: String,
-    /// Whether the filter box is on screen. Hidden until asked for, because a
-    /// box that is always there is a box that is always in the way.
-    filtering: bool,
-    /// The path being typed, when the path bar is showing its text face.
-    ///
-    /// The draft rather than the buffer's path: what is typed has to survive
-    /// being wrong -- a half-finished path names nothing, and replacing the
-    /// buffer's own path with it would relist on every keystroke. It belongs
-    /// to the focused tile, the way the filter box does.
-    typing_path: Option<String>,
+    // The filter box and the path bar's text face belong to the buffer, not
+    // to the window. See `Buffer::filtering` and `Buffer::typing_path`.
     /// The face the glyphs come from, resolved once at startup.
     ///
     /// `Font::with_name` wants a `&'static str` and the family comes from a
@@ -141,6 +177,22 @@ pub struct App {
     size: iced::Size,
     /// Which step the reading bar is on. Moves only while a read is out.
     tick: usize,
+    /// What is being dragged, if anything.
+    ///
+    /// Inside this window only. `window::Event::FileDropped` brings files
+    /// *in* from other applications; winit cannot drag them out on Wayland.
+    dragging: Option<Dragging>,
+    /// A press on a place that is not yet a click or a drag.
+    pressed: Option<Pressed>,
+    /// The place the pointer is over, as an index into `places`.
+    ///
+    /// `places.len()` means the strip under the last one, which is how
+    /// something is dropped at the end. `None` means the pointer is not on
+    /// the panel at all.
+    ///
+    /// Kept whether or not a drag is going on: it draws the hovered row as
+    /// well as saying where a drop would land.
+    over_place: Option<usize>,
     /// Home, the user directories, the mounts and the bookmarks.
     ///
     /// Read once at startup and after a bookmark is added. A disk appearing is
@@ -167,19 +219,35 @@ pub enum Message {
     Tick,
     /// The filter box was typed into.
     Filter(usize, String),
-    /// Show or hide the filter box.
-    Filtering(bool),
+    /// Show or hide the filter box, in one buffer.
+    Filtering(usize, bool),
     /// The path bar's text face: what has been typed, and going there or back.
-    PathTyped(String),
+    PathTyped(usize, String),
     TypingPath(usize, bool),
     /// The typed path was submitted.
     PathSubmitted(usize),
     /// Escape, from the subscription rather than the list. Only the path
     /// bar's text face uses it; everything else Escape does still comes
     /// through the list widget.
-    EscapedPath,
+    ///
+    /// The window, because the subscription knows no tile. It reaches the
+    /// buffer the focused tile of that window is showing, which is the one
+    /// whose text face is on screen.
+    EscapedPath(window::Id),
     /// Tab, likewise: complete the path being typed.
-    CompletePath,
+    CompletePath(window::Id),
+    /// The pointer went down on a place. Not yet a click: it may be a drag.
+    PlacePressed {
+        place: usize,
+        buffer: usize,
+    },
+    /// The pointer moved onto a place, or off one. The index is into
+    /// `App::places`, and one past the end is the strip below them.
+    PlaceEntered(usize),
+    PlaceLeft(usize),
+    /// The left button came up, anywhere. This finishes a drag and settles
+    /// whether a press on a place was a click.
+    Released,
     /// A breadcrumb, or back, forward, up.
     Go(usize, PathBuf),
     Back(usize),
@@ -228,14 +296,15 @@ pub fn new(mut config: Config, start: PathBuf) -> (App, Task<Message>) {
         notice,
         dialogue: None,
         typed: String::new(),
-        filtering: false,
-        typing_path: None,
         icon_font: config_font.as_deref().map(icon_font),
         menu: None,
         pointer: (0.0, 0.0),
         size: iced::Size::new(config_width, config_height),
         places: places::list(),
         tick: 0,
+        dragging: None,
+        pressed: None,
+        over_place: None,
     };
 
     // The id comes back before the window exists, so the tiles can be tied to
@@ -308,14 +377,20 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             // sees them and the keyboard would stay on whichever tile had it
             // -- you could select a row in one tile and then find the arrows
             // moving a cursor in the other.
-            focus_showing(app, index);
+            let moved = focus_showing(app, index);
 
             let showing = app
                 .buffers
                 .get(index)
                 .map_or_else(|| app.config.list.view(), |found| found.view);
 
-            action::dispatch(app, translate(index, found, showing, app.pointer))
+            let acted = action::dispatch(app, translate(index, found, showing, app.pointer));
+
+            if moved {
+                Task::batch([acted, refocus(app, index)])
+            } else {
+                acted
+            }
         }
 
         Message::Act(action) => action::dispatch(app, action),
@@ -373,6 +448,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
 
         Message::Pointer(x, y) => {
             app.pointer = (x, y);
+            pick_up_place(app);
             Task::none()
         }
 
@@ -386,10 +462,10 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
 
-        Message::TileClicked(pane) => {
-            focus_tile(app, pane);
-            Task::none()
-        }
+        Message::TileClicked(pane) => match focus_tile(app, pane) {
+            Some(buffer) => refocus(app, buffer),
+            None => Task::none(),
+        },
 
         Message::TileDragged(pane_grid::DragEvent::Dropped { pane, target }) => {
             for tiles in app.windows.values_mut() {
@@ -450,8 +526,12 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             },
         ),
 
-        Message::Filtering(showing) => {
-            app.filtering = showing;
+        Message::Filtering(index, showing) => {
+            let list = app.config.list.clone();
+            let Some(buffer) = app.buffers.get_mut(index) else {
+                return Task::none();
+            };
+            buffer.filtering = showing;
 
             if showing {
                 // A box that appears without focus is a box that swallows the
@@ -462,32 +542,30 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 return iced::widget::operation::focus(filter_id());
             }
 
-            if !showing {
-                // Leaving the box behind with text in it would leave the
-                // listing narrowed and nothing on screen saying why.
-                let list = app.config.list.clone();
-                for buffer in &mut app.buffers {
-                    if !buffer.filter.is_empty() {
-                        buffer.filter.clear();
-                        buffer.rebuild(&list);
-                    }
-                }
+            // Leaving the box behind with text in it would leave the listing
+            // narrowed and nothing on screen saying why. This buffer only:
+            // clearing every filter in the window used to undo the narrowing
+            // in the tile beside it, which nobody asked about.
+            if !buffer.filter.is_empty() {
+                buffer.filter.clear();
+                buffer.rebuild(&list);
             }
             Task::none()
         }
 
         Message::TypingPath(index, typing) => {
+            let Some(buffer) = app.buffers.get_mut(index) else {
+                return Task::none();
+            };
+
             if !typing {
-                app.typing_path = None;
+                buffer.typing_path = None;
                 return Task::none();
             }
 
             // Starts as the path it is showing, so the common thing -- take a
             // piece of this path -- needs no typing at all.
-            let Some(buffer) = app.buffers.get(index) else {
-                return Task::none();
-            };
-            app.typing_path = Some(buffer.path.to_string_lossy().into_owned());
+            buffer.typing_path = Some(buffer.path.to_string_lossy().into_owned());
 
             // Focused *and* selected: turning the bar over to copy half a
             // path should not need a drag from one end first.
@@ -495,34 +573,103 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 .chain(iced::widget::operation::select_all(path_id()))
         }
 
-        Message::PathTyped(text) => {
-            app.typing_path = Some(text);
+        Message::PathTyped(index, text) => {
+            if let Some(buffer) = app.buffers.get_mut(index) {
+                buffer.typing_path = Some(text);
+            }
             Task::none()
         }
 
-        Message::EscapedPath => {
+        Message::PlacePressed { place, buffer } => {
+            app.pressed = Some(Pressed {
+                place,
+                buffer,
+                at: app.pointer,
+                dragged: false,
+            });
+            Task::none()
+        }
+
+        Message::PlaceEntered(at) => {
+            app.over_place = Some(at);
+            Task::none()
+        }
+
+        Message::PlaceLeft(at) => {
+            // Only if it is still the one being left. Leaving one row and
+            // entering the next arrive in whichever order the widgets were
+            // built in, and clearing unconditionally would lose the new one.
+            if app.over_place == Some(at) {
+                app.over_place = None;
+            }
+            Task::none()
+        }
+
+        Message::Released => {
+            let dropped = finish_drag(app);
+
+            // A press that never moved far enough is a click, and a click on
+            // a place opens it. On release rather than on press, because
+            // until the button comes up it may still become a drag.
+            match app.pressed.take() {
+                Some(pressed) if !pressed.dragged => {
+                    let Some(place) = app.places.get(pressed.place) else {
+                        return dropped;
+                    };
+                    let path = place.path.clone();
+                    Task::batch([
+                        dropped,
+                        action::dispatch(
+                            app,
+                            Action::Go {
+                                buffer: pressed.buffer,
+                                path,
+                            },
+                        ),
+                    ])
+                }
+                _ => dropped,
+            }
+        }
+
+        Message::EscapedPath(window) => {
             // Only this. Every other thing Escape puts away still comes
             // through the list widget's own `Action::Escape`.
-            app.typing_path = None;
+            if let Some(index) = focused_buffer(app, window)
+                && let Some(buffer) = app.buffers.get_mut(index)
+            {
+                buffer.typing_path = None;
+            }
             Task::none()
         }
 
-        Message::CompletePath => {
-            let Some(typed) = &app.typing_path else {
+        Message::CompletePath(window) => {
+            let Some(index) = focused_buffer(app, window) else {
                 return Task::none();
             };
-            let Some(longer) = complete(typed) else {
+            let Some(longer) = app
+                .buffers
+                .get(index)
+                .and_then(|buffer| buffer.typing_path.as_deref())
+                .and_then(complete)
+            else {
                 return Task::none();
             };
 
-            app.typing_path = Some(longer);
+            if let Some(buffer) = app.buffers.get_mut(index) {
+                buffer.typing_path = Some(longer);
+            }
             // The caret goes to the end, or the next keystroke lands in the
             // middle of what was just filled in.
             iced::widget::operation::move_cursor_to_end(path_id())
         }
 
         Message::PathSubmitted(index) => {
-            let Some(text) = app.typing_path.take() else {
+            let Some(text) = app
+                .buffers
+                .get_mut(index)
+                .and_then(|buffer| buffer.typing_path.take())
+            else {
                 return Task::none();
             };
 
@@ -532,7 +679,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             // what was typed still in it. Going nowhere and clearing the box
             // would look like the keystroke was lost.
             if !path.is_dir() {
-                app.typing_path = Some(text);
+                if let Some(buffer) = app.buffers.get_mut(index) {
+                    buffer.typing_path = Some(text);
+                }
                 return refuse(app, format!("{} is not a directory", path.display()));
             }
 
@@ -605,7 +754,10 @@ const fn translate(
             buffer,
             showing: !showing_hidden,
         },
-        list::Action::Filter => Action::Filtering(true),
+        list::Action::Filter => Action::Filtering {
+            buffer,
+            showing: true,
+        },
         list::Action::Layout(None) => Action::Layout {
             buffer,
             layout: current.next(),
@@ -616,7 +768,7 @@ const fn translate(
         list::Action::CloseTile => Action::CloseTile,
         list::Action::NextTile => Action::NextTile,
         list::Action::PreviousTile => Action::PreviousTile,
-        list::Action::Escape => Action::Escape,
+        list::Action::Escape => Action::Escape { buffer },
         list::Action::Bookmark => Action::Bookmark { buffer, path: None },
         list::Action::Buffers => Action::Menu {
             kind: MenuKind::Buffers,
@@ -628,6 +780,7 @@ const fn translate(
             buffer,
             at: pointer,
         },
+        list::Action::DragRow(row) => Action::Drag { buffer, row },
         list::Action::TypePath => Action::TypingPath {
             buffer,
             typing: true,
@@ -669,23 +822,177 @@ fn icon_font(family: &str) -> iced::Font {
     iced::Font::with_name(String::leak(family.to_owned()))
 }
 
-/// Give one tile the keyboard.
+/// Turn a held press on a place into a drag, once the pointer has moved.
+///
+/// Past the threshold the press is a drag whatever comes of it, so a release
+/// after this no longer opens the place. That holds even when nothing is
+/// picked up: a pointer dragged off the home directory did not mean to go
+/// there.
+fn pick_up_place(app: &mut App) {
+    let Some(pressed) = app.pressed.as_ref() else {
+        return;
+    };
+    if pressed.dragged {
+        return;
+    }
+
+    let (place, at) = (pressed.place, pressed.at);
+    if (app.pointer.0 - at.0).hypot(app.pointer.1 - at.1) < DRAG {
+        return;
+    }
+
+    if let Some(pressed) = app.pressed.as_mut() {
+        pressed.dragged = true;
+    }
+
+    // Only a bookmark moves. Home, the user directories and a mounted disk
+    // are in the panel because the system says they are, and ricedir has no
+    // order of its own to move one into.
+    let Some(place) = app.places.get(place) else {
+        return;
+    };
+    if place.kind != places::Kind::Bookmark {
+        return;
+    }
+
+    app.dragging = Some(Dragging {
+        paths: vec![place.path.clone()],
+        source: Source::Place,
+    });
+}
+
+/// Where a dragged place would land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Lands {
+    /// In front of this bookmark.
+    Before(PathBuf),
+    /// After all of them, which is what the strip below the panel is for.
+    AtTheEnd,
+    /// Nowhere: the row under the pointer is not one ricedir puts in order.
+    Nowhere,
+}
+
+/// Where a place dragged onto row `over` would land.
+fn lands(places: &[Place], over: usize, from: &Path) -> Lands {
+    // Past the last place, which is the strip that means "the end".
+    let Some(target) = places.get(over) else {
+        return Lands::AtTheEnd;
+    };
+
+    // Home, the user directories and a mounted disk are in the panel because
+    // the system says so. There is no order of ours to drop one into.
+    if target.kind != places::Kind::Bookmark || target.path == from {
+        return Lands::Nowhere;
+    }
+
+    Lands::Before(target.path.clone())
+}
+
+/// Whether the marker belongs above this row.
+fn lands_here(app: &App, at: usize) -> bool {
+    let Some(dragging) = &app.dragging else {
+        return false;
+    };
+
+    dragging.source == Source::Place
+        && app.over_place == Some(at)
+        && dragging
+            .paths
+            .first()
+            .is_some_and(|from| lands(&app.places, at, from) != Lands::Nowhere)
+}
+
+/// End a drag, and do whatever it turned out to be.
+///
+/// Both ends report a release -- the list widget captures its own, and the
+/// subscription sees every one -- so this takes the drag rather than reading
+/// it, and whichever arrives second finds nothing left to do.
+fn finish_drag(app: &mut App) -> Task<Message> {
+    let Some(dragging) = app.dragging.take() else {
+        return Task::none();
+    };
+
+    // Dropped somewhere that is not the panel. Nothing happens, quietly:
+    // a drag that lands nowhere is how a drag is called off.
+    let Some(over) = app.over_place else {
+        return Task::none();
+    };
+
+    match dragging.source {
+        Source::List => {
+            let mut added = 0;
+            for path in &dragging.paths {
+                if places::bookmark(path).is_ok() {
+                    added += 1;
+                }
+            }
+
+            app.places = places::list();
+            app.notice = Some(match added {
+                0 => String::from("nothing was added to your places"),
+                1 => format!("{} is in your places", dragging.paths[0].display()),
+                many => format!("{many} directories are in your places"),
+            });
+        }
+
+        Source::Place => {
+            let Some(from) = dragging.paths.first() else {
+                return Task::none();
+            };
+
+            let moved = match lands(&app.places, over, from) {
+                Lands::Nowhere => return Task::none(),
+                Lands::AtTheEnd => places::move_bookmark(from, None),
+                Lands::Before(before) => places::move_bookmark(from, Some(&before)),
+            };
+
+            match moved {
+                Ok(()) => app.places = places::list(),
+                Err(error) => {
+                    app.notice = Some(format!("could not reorder the places: {error}"));
+                }
+            }
+        }
+    }
+
+    Task::none()
+}
+
+/// Which buffer the focused tile of one window is showing.
+///
+/// The subscription reports a key with a window and no tile, so this is how a
+/// keystroke that belongs to the path bar finds the directory it is about.
+fn focused_buffer(app: &App, window: window::Id) -> Option<usize> {
+    let tiles = app.windows.get(&window)?;
+    tiles.panes.get(tiles.focus).copied()
+}
+
+/// Give one tile the keyboard, and say which buffer it landed on.
+///
+/// `None` when the keyboard was already there, so a caller can tell a move
+/// from a click on the tile that already had it.
 ///
 /// Every window is asked, because a `Pane` belongs to exactly one of them and
 /// there is no cheaper way to say which from a click alone.
-fn focus_tile(app: &mut App, pane: pane_grid::Pane) {
+fn focus_tile(app: &mut App, pane: pane_grid::Pane) -> Option<usize> {
     for tiles in app.windows.values_mut() {
-        if tiles.panes.get(pane).is_some() {
-            tiles.focus = pane;
+        let Some(buffer) = tiles.panes.get(pane).copied() else {
+            continue;
+        };
+        if tiles.focus == pane {
+            return None;
         }
+        tiles.focus = pane;
+        return Some(buffer);
     }
+    None
 }
 
 /// Give the keyboard to whichever tile is showing this buffer.
 ///
 /// The first one found: two tiles can show one buffer, and then either will
 /// do -- they are the same listing and the same cursor.
-fn focus_showing(app: &mut App, buffer: usize) {
+fn focus_showing(app: &mut App, buffer: usize) -> bool {
     for tiles in app.windows.values_mut() {
         let found = tiles
             .panes
@@ -694,10 +1001,32 @@ fn focus_showing(app: &mut App, buffer: usize) {
             .map(|(pane, _)| *pane);
 
         if let Some(pane) = found {
+            let moved = tiles.focus != pane;
             tiles.focus = pane;
-            return;
+            return moved;
         }
     }
+    false
+}
+
+/// Give the keyboard back to whatever box the tile now in front has up.
+///
+/// A tile showing the path bar's text face draws a box the list deliberately
+/// will not compete with, so if nothing holds iced's text focus that tile is
+/// dead: the box takes no keys, and neither does the list behind it. Moving
+/// the keyboard away and back used to leave it exactly like that.
+fn refocus(app: &App, buffer: usize) -> Task<Message> {
+    let Some(found) = app.buffers.get(buffer) else {
+        return Task::none();
+    };
+
+    if found.typing_path.is_some() {
+        return iced::widget::operation::focus(path_id());
+    }
+    if found.filtering {
+        return iced::widget::operation::focus(filter_id());
+    }
+    Task::none()
 }
 
 /// Put away the context menu, if one is open.
@@ -726,7 +1055,7 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
         // before they ever reach here.
         Action::Selection | Action::Buffers | Action::Cursor => Task::none(),
 
-        Action::Filtering(showing) => Task::done(Message::Filtering(showing)),
+        Action::Filtering { buffer, showing } => Task::done(Message::Filtering(buffer, showing)),
 
         Action::TypingPath { buffer, typing } => Task::done(Message::TypingPath(buffer, typing)),
 
@@ -809,6 +1138,48 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
                 }
                 Err(error) => {
                     app.notice = Some(format!("could not write the bookmark: {error}"));
+                }
+            }
+            Task::none()
+        }
+
+        Action::Drag { buffer, row } => {
+            let Some(found) = app.buffers.get(buffer) else {
+                return Task::none();
+            };
+
+            // A row inside the selection drags the whole selection; a row
+            // outside it drags only that one. Every file manager does this,
+            // and the alternative -- dragging whatever was selected an hour
+            // ago -- is how people move the wrong files.
+            let paths: Vec<PathBuf> = if found.is_selected(row) {
+                found.selected().map(|entry| entry.path.clone()).collect()
+            } else {
+                found
+                    .at(row)
+                    .map(|entry| entry.path.clone())
+                    .into_iter()
+                    .collect()
+            };
+
+            // Directories only. A file cannot be a place, so picking one up
+            // would promise a drop that is refused when it lands.
+            let paths: Vec<PathBuf> = paths.into_iter().filter(|path| path.is_dir()).collect();
+
+            if !paths.is_empty() {
+                app.dragging = Some(Dragging {
+                    paths,
+                    source: Source::List,
+                });
+            }
+            Task::none()
+        }
+
+        Action::MovePlace { from, before } => {
+            match crate::places::move_bookmark(&from, before.as_deref()) {
+                Ok(()) => app.places = places::list(),
+                Err(error) => {
+                    app.notice = Some(format!("could not reorder the places: {error}"));
                 }
             }
             Task::none()
@@ -939,10 +1310,11 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             if let Some((_, sibling)) = window.panes.close(window.focus) {
                 window.focus = sibling;
             }
+            let now = window.buffer();
 
             // The buffer stays open. That is the point of buffers: closing a
             // tile costs nothing and reopening the directory is instant.
-            Task::none()
+            refocus(app, now)
         }
 
         Action::NextTile | Action::PreviousTile => {
@@ -962,25 +1334,28 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
                 (at + 1) % order.len()
             };
             window.focus = order[next];
-            Task::none()
+            let now = window.buffer();
+            refocus(app, now)
         }
 
         Action::Relist { buffer } => relist(app, buffer),
 
-        Action::Escape => {
+        Action::Escape { buffer } => {
             // One key for "put away whatever is in front of me", in the order
-            // things are stacked.
+            // things are stacked. The menu and the dialogue are window-wide;
+            // the last two belong to the tile that asked.
             if app.menu.take().is_some() {
                 return Task::none();
             }
             if app.dialogue.is_some() {
                 return Task::done(Message::Dialogue(Choice::Dismiss));
             }
-            if app.typing_path.is_some() {
-                app.typing_path = None;
+            if let Some(found) = app.buffers.get_mut(buffer)
+                && found.typing_path.take().is_some()
+            {
                 return Task::none();
             }
-            Task::done(Message::Filtering(false))
+            Task::done(Message::Filtering(buffer, false))
         }
 
         Action::Select { buffer, row } => {
@@ -1186,8 +1561,12 @@ fn scanned(app: &App, path: PathBuf) -> Task<Message> {
 }
 
 /// Start a handler, and report only a failure.
+///
+/// The answer arrives late on purpose: `open::spawn` watches the child for a
+/// moment, so a handler that starts and gives up straight away is reported
+/// rather than lost.
 fn start(plan: Plan) -> Task<Message> {
-    Task::perform(async move { open::spawn(&plan) }, Message::Spawned)
+    Task::perform(async move { open::spawn(&plan).await }, Message::Spawned)
 }
 
 /// Turn a plan that cannot run into the dialogue that asks about it.
@@ -1418,19 +1797,19 @@ fn tile<'a>(app: &'a App, index: usize, buffer: &'a Buffer, focused: bool) -> El
         // those keys: Tab is completion, and with the list live it switched
         // tiles instead. Escape then has to come from the subscription, since
         // the list is no longer there to report it.
-        focused && app.dialogue.is_none() && app.typing_path.is_none(),
+        focused && app.dialogue.is_none() && buffer.typing_path.is_none(),
         move |action| Message::List(index, action),
     );
 
-    let mut page = column![path_bar(app, index, buffer)];
+    let mut page = column![path_bar(app, index, buffer, focused)];
 
-    if app.filtering && focused {
+    if buffer.filtering && focused {
         page = page.push(
             container(
                 iced::widget::text_input("filter, or :glob", &buffer.filter)
                     .id(filter_id())
                     .on_input(move |text| Message::Filter(index, text))
-                    .on_submit(Message::Filtering(false))
+                    .on_submit(Message::Filtering(index, false))
                     .size(14)
                     .padding(6),
             )
@@ -1519,11 +1898,17 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
     fn moved(
         event: iced::Event,
         _status: iced::event::Status,
-        _window: window::Id,
+        window: window::Id,
     ) -> Option<Message> {
         match event {
             iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                 Some(Message::Pointer(position.x, position.y))
+            }
+            // Every release, wherever it lands. A drag that ends outside the
+            // panel has to be called off, and the panel never hears about
+            // one: `mouse_area` reports a release only over itself.
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)) => {
+                Some(Message::Released)
             }
             // The path bar's text face takes the keyboard away from the list,
             // so nothing else is left to report Escape while it is open.
@@ -1531,13 +1916,13 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                 ..
-            }) => Some(Message::EscapedPath),
+            }) => Some(Message::EscapedPath(window)),
             // Tab, for the same reason. `text_input` does not capture it
             // either, so without this it would reach nothing at all.
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
                 ..
-            }) => Some(Message::CompletePath),
+            }) => Some(Message::CompletePath(window)),
             _ => None,
         }
     }
@@ -1579,7 +1964,12 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
 ///
 /// Each component is a button rather than one long string, because the thing
 /// people want from a path bar is to jump three levels up without typing.
-fn path_bar<'a>(app: &'a App, index: usize, buffer: &'a Buffer) -> Element<'a, Message> {
+fn path_bar<'a>(
+    app: &'a App,
+    index: usize,
+    buffer: &'a Buffer,
+    focused: bool,
+) -> Element<'a, Message> {
     use iced::widget::button;
 
     let dim = app.config.theme.dim.color();
@@ -1630,15 +2020,16 @@ fn path_bar<'a>(app: &'a App, index: usize, buffer: &'a Buffer) -> Element<'a, M
     // somebody asked for text -- a row of buttons gives nothing to drag
     // across, and taking `~/workspace/rust` out of a longer path to
     // paste into a terminal is a thing people do constantly.
-    let focused = app
-        .windows
-        .values()
-        .any(|window| window.panes.get(window.focus).copied() == Some(index));
-
-    let middle: Element<'a, Message> = match &app.typing_path {
+    //
+    // Only the focused tile draws the box, because `path_id` is one id and
+    // two widgets wearing it would fight over the keyboard. `focused` comes
+    // from the pane this is drawn in, not from which buffer the window
+    // points at: two tiles can show one buffer, and both would have claimed
+    // it.
+    let middle: Element<'a, Message> = match &buffer.typing_path {
         Some(typed) if focused => iced::widget::text_input("path", typed)
             .id(path_id())
-            .on_input(Message::PathTyped)
+            .on_input(move |text| Message::PathTyped(index, text))
             .on_submit(Message::PathSubmitted(index))
             .size(14)
             .padding([2, 6])
@@ -1684,10 +2075,10 @@ fn path_bar<'a>(app: &'a App, index: usize, buffer: &'a Buffer) -> Element<'a, M
             app,
             '\u{f044}',
             String::from("Edit the path  (Ctrl+L)"),
-            app.typing_path.is_some() && focused,
+            buffer.typing_path.is_some() && focused,
             Message::Act(Action::TypingPath {
                 buffer: index,
-                typing: app.typing_path.is_none(),
+                typing: buffer.typing_path.is_none(),
             }),
         ),
         toolbar(app, index, buffer.view)
@@ -2048,7 +2439,10 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
         ));
         items = items.push(item(
             String::from("Filter\u{2026}"),
-            Message::Act(Action::Filtering(true)),
+            Message::Act(Action::Filtering {
+                buffer: menu.buffer,
+                showing: true,
+            }),
         ));
         items = items.push(item(
             String::from("Open directories\u{2026}  (Ctrl+B)"),
@@ -2100,7 +2494,9 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
         for (chord, action) in app.config.keys.listed() {
             items = items.push(item(
                 format!("{chord}    {action}"),
-                Message::Act(Action::Escape),
+                Message::Act(Action::Escape {
+                    buffer: menu.buffer,
+                }),
             ));
         }
     } else if menu.kind == MenuKind::Buffers {
@@ -2176,6 +2572,43 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
         ));
 
         if place.kind == places::Kind::Bookmark {
+            // Reordering lives here rather than only in a drag. The file is
+            // an order and nothing else respected it; a menu item respects
+            // it from the keyboard too, and a drag can be added later
+            // without changing what it does.
+            let marks: Vec<&Place> = app
+                .places
+                .iter()
+                .filter(|one| one.kind == places::Kind::Bookmark)
+                .collect();
+            let at = marks.iter().position(|one| one.path == place.path);
+
+            if let Some(at) = at
+                && at > 0
+            {
+                items = items.push(item(
+                    String::from("Move up"),
+                    Message::Act(Action::MovePlace {
+                        from: place.path.clone(),
+                        before: Some(marks[at - 1].path.clone()),
+                    }),
+                ));
+            }
+
+            if let Some(at) = at
+                && at + 1 < marks.len()
+            {
+                // In front of the one after next, or at the end when there
+                // is no such place.
+                items = items.push(item(
+                    String::from("Move down"),
+                    Message::Act(Action::MovePlace {
+                        from: place.path.clone(),
+                        before: marks.get(at + 2).map(|one| one.path.clone()),
+                    }),
+                ));
+            }
+
             items = items.push(item(
                 String::from("Remove from places"),
                 Message::Act(Action::Unbookmark {
@@ -2322,23 +2755,43 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
             .width(Length::Fill)
             .height(Length::Fill),
     )
-    .on_press(Message::Act(Action::Escape))
-    .on_right_press(Message::Act(Action::Escape))
+    .on_press(Message::Act(Action::Escape {
+        buffer: menu.buffer,
+    }))
+    .on_right_press(Message::Act(Action::Escape {
+        buffer: menu.buffer,
+    }))
     .into()
 }
 
 /// The panel down the left: places at the top, jobs at the bottom.
 fn sidebar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
-    use iced::widget::{button, scrollable};
+    use iced::widget::{mouse_area, scrollable};
 
     let theme = &app.config.theme;
     let dim = theme.dim.color();
     let foreground = theme.foreground.color();
+    let accent = theme.accent.color();
 
     let heading = |what: &'a str| {
         container(text(what).size(11).color(dim))
             .padding([8, 10])
             .width(Length::Fill)
+    };
+
+    // The line that says where a dragged place would land.
+    //
+    // The two pixels are always there and only the colour changes. Pushing a
+    // line in mid-drag moved the row out from under the pointer, which made
+    // the pointer leave it, which took the line away again, which moved the
+    // row back: a drop target that flickered and could not be hit.
+    let marker = move |lit: bool| {
+        container(iced::widget::Space::new().width(Length::Fill).height(2)).style(
+            move |_: &iced::Theme| container::Style {
+                background: lit.then(|| accent.into()),
+                ..container::Style::default()
+            },
+        )
     };
 
     let mut list = column![].width(Length::Fill);
@@ -2352,34 +2805,60 @@ fn sidebar<'a>(app: &'a App, index: usize) -> Element<'a, Message> {
         }
         previous = Some(place.kind);
 
-        let entry = button(text(place.label.clone()).size(13))
-            .width(Length::Fill)
-            .padding([3, 10])
-            .style(move |_: &iced::Theme, status| button::Style {
-                background: None,
-                text_color: if matches!(status, button::Status::Hovered) {
-                    iced::Color::WHITE
-                } else {
-                    foreground
-                },
-                ..button::Style::default()
-            })
-            .on_press(Message::Act(Action::Go {
-                buffer: index,
-                path: place.path.clone(),
-            }));
+        list = list.push(marker(lands_here(app, at)));
 
-        // `button` has no right press, and `mouse_area`'s does not say where
-        // it happened. The tracked pointer answers that: it is the same
-        // position, one event earlier.
-        list = list.push(iced::widget::mouse_area(entry).on_right_press(Message::Act(
-            Action::Menu {
-                kind: MenuKind::Place { index: at },
-                buffer: index,
-                at: app.pointer,
-            },
-        )));
+        // Drawn, not a `button`. `mouse_area` gives its content the event
+        // first and gives up if it was captured, and `button` captures a
+        // press -- so with a button in here the `on_press` below would never
+        // fire and a place could not be picked up. Everything the button did
+        // is done by hand: the hover colour, the hand cursor, and opening the
+        // place, which now happens on release because until the button comes
+        // up this may still turn into a drag.
+        let hovered = app.over_place == Some(at);
+        let row = container(text(place.label.clone()).size(13).color(if hovered {
+            iced::Color::WHITE
+        } else {
+            foreground
+        }))
+        .width(Length::Fill)
+        .padding([3, 10]);
+
+        // `mouse_area`'s right press does not say where it happened. The
+        // tracked pointer answers that: it is the same position, one event
+        // earlier.
+        list = list.push(
+            mouse_area(row)
+                .interaction(iced::mouse::Interaction::Pointer)
+                .on_press(Message::PlacePressed {
+                    place: at,
+                    buffer: index,
+                })
+                .on_enter(Message::PlaceEntered(at))
+                .on_exit(Message::PlaceLeft(at))
+                .on_right_press(Message::Act(Action::Menu {
+                    kind: MenuKind::Place { index: at },
+                    buffer: index,
+                    at: app.pointer,
+                })),
+        );
     }
+
+    // The strip under the last place. It is how a bookmark is moved to the
+    // end, which "drop in front of the one you are over" cannot express, and
+    // it is always there rather than appearing mid-drag: a target that shows
+    // up only once you are dragging is a target nobody finds.
+    let end = app.places.len();
+    let tail = column![
+        marker(lands_here(app, end)),
+        iced::widget::Space::new().width(Length::Fill).height(40),
+    ]
+    .width(Length::Fill);
+
+    list = list.push(
+        mouse_area(tail)
+            .on_enter(Message::PlaceEntered(end))
+            .on_exit(Message::PlaceLeft(end)),
+    );
 
     let jobs = column![
         heading("JOBS"),
@@ -2561,14 +3040,15 @@ mod tests {
             notice: None,
             dialogue: None,
             typed: String::new(),
-            filtering: false,
-            typing_path: None,
             icon_font: None,
             menu: None,
             pointer: (0.0, 0.0),
             size: iced::Size::new(1100.0, 700.0),
             places: Vec::new(),
             tick: 0,
+            dragging: None,
+            pressed: None,
+            over_place: None,
         }
     }
 
@@ -2894,16 +3374,16 @@ mod tests {
     #[test]
     fn escape_closes_the_menu_first() {
         let mut app = app();
-        app.filtering = true;
+        app.buffers[0].filtering = true;
         app.menu = Some(Menu {
             kind: MenuKind::Context { row: Some(0) },
             buffer: 0,
             at: (0.0, 0.0),
         });
 
-        tell(&mut app, Message::Act(Action::Escape));
+        tell(&mut app, Message::Act(Action::Escape { buffer: 0 }));
         assert!(app.menu.is_none(), "the menu went");
-        assert!(app.filtering, "and the filter box stayed");
+        assert!(app.buffers[0].filtering, "and the filter box stayed");
     }
 
     /// Hiding hidden files must rebuild every buffer, not only the one in
@@ -2989,12 +3469,12 @@ mod tests {
     #[test]
     fn submitting_a_path_that_is_not_there_says_so() {
         let mut app = app();
-        app.typing_path = Some(String::from("/tmp/definitely-not-a-directory-here"));
+        app.buffers[0].typing_path = Some(String::from("/tmp/definitely-not-a-directory-here"));
 
         tell(&mut app, Message::PathSubmitted(0));
 
         assert_eq!(
-            app.typing_path.as_deref(),
+            app.buffers[0].typing_path.as_deref(),
             Some("/tmp/definitely-not-a-directory-here"),
             "what was typed should still be there"
         );
@@ -3012,10 +3492,104 @@ mod tests {
     #[test]
     fn escape_leaves_the_path_text_face() {
         let mut app = app();
-        app.typing_path = Some(String::from("/tmp/half-typed"));
+        let window = window::Id::unique();
+        app.windows.insert(window, Tiles::new(0));
+        app.buffers[0].typing_path = Some(String::from("/tmp/half-typed"));
 
-        tell(&mut app, Message::EscapedPath);
-        assert!(app.typing_path.is_none());
+        tell(&mut app, Message::EscapedPath(window));
+        assert!(app.buffers[0].typing_path.is_none());
+    }
+
+    /// Two buffers, so the per-tile state has somewhere to leak to.
+    fn two_buffers() -> App {
+        let mut app = app();
+        app.buffers.push(Buffer::new(
+            PathBuf::from("/tmp/two"),
+            Config::default().list.view(),
+        ));
+        app
+    }
+
+    /// A half-typed path belongs to the directory, not to the window.
+    ///
+    /// It was one field on `App`. Splitting a tile while a path was half
+    /// typed then handed the draft to whichever tile the keyboard moved to
+    /// next, and coming back found the box gone.
+    #[test]
+    fn a_half_typed_path_stays_with_its_own_tile() {
+        let mut app = two_buffers();
+
+        tell(
+            &mut app,
+            Message::Act(Action::TypingPath {
+                buffer: 0,
+                typing: true,
+            }),
+        );
+        tell(&mut app, Message::PathTyped(0, String::from("/tmp/half")));
+
+        assert_eq!(app.buffers[0].typing_path.as_deref(), Some("/tmp/half"));
+        assert!(
+            app.buffers[1].typing_path.is_none(),
+            "the tile beside it is not typing anything"
+        );
+    }
+
+    /// And Escape puts away the box in front of the person rather than the
+    /// one in the tile beside it.
+    #[test]
+    fn escape_leaves_only_the_tile_that_asked() {
+        let mut app = two_buffers();
+        app.buffers[0].typing_path = Some(String::from("/tmp/one"));
+        app.buffers[1].typing_path = Some(String::from("/tmp/two"));
+
+        tell(&mut app, Message::Act(Action::Escape { buffer: 1 }));
+
+        assert!(app.buffers[1].typing_path.is_none());
+        assert_eq!(app.buffers[0].typing_path.as_deref(), Some("/tmp/one"));
+    }
+
+    /// The filter box is the same shape, and closing one used to clear every
+    /// filter in the window -- which un-narrowed a listing nobody had asked
+    /// about.
+    #[test]
+    fn closing_the_filter_box_clears_only_its_own_buffer() {
+        let mut app = two_buffers();
+        app.buffers[0].filtering = true;
+        app.buffers[0].filter = String::from("one");
+        app.buffers[1].filtering = true;
+        app.buffers[1].filter = String::from("two");
+
+        tell(&mut app, Message::Filtering(0, false));
+
+        assert!(!app.buffers[0].filtering);
+        assert!(app.buffers[0].filter.is_empty());
+        assert!(app.buffers[1].filtering, "the other box stayed");
+        assert_eq!(app.buffers[1].filter, "two", "and so did its text");
+    }
+
+    /// A tile split while a path is half typed gives the new tile a clean
+    /// path bar. It shows a new directory; somebody else's draft is not what
+    /// it should open with.
+    #[test]
+    fn a_new_tile_starts_with_breadcrumbs() {
+        let mut app = app();
+        app.windows.insert(window::Id::unique(), Tiles::new(0));
+        app.buffers[0].typing_path = Some(String::from("/tmp/half"));
+
+        tell(
+            &mut app,
+            Message::Act(Action::Split(pane_grid::Axis::Vertical)),
+        );
+
+        let made = app.buffers.last().expect("the split made a buffer");
+        assert!(made.typing_path.is_none());
+        assert!(!made.filtering);
+        assert_eq!(
+            app.buffers[0].typing_path.as_deref(),
+            Some("/tmp/half"),
+            "and the tile that was typing kept its draft"
+        );
     }
 
     /// Pointing a tile at a buffer that is already open is the other half of
@@ -3202,5 +3776,207 @@ mod tests {
         let mut app = app();
         tell(&mut app, Message::List(9, list::Action::SelectAll));
         tell(&mut app, Message::Listed(9, 0, buffer::Update::Done));
+    }
+
+    /// Home, then two bookmarks. Enough to say what may be reordered and
+    /// what may not.
+    fn with_places() -> App {
+        let mut app = app();
+        app.places = vec![
+            Place {
+                label: String::from("Home"),
+                path: PathBuf::from("/home/someone"),
+                kind: places::Kind::Home,
+            },
+            Place {
+                label: String::from("alpha"),
+                path: PathBuf::from("/tmp/alpha"),
+                kind: places::Kind::Bookmark,
+            },
+            Place {
+                label: String::from("beta"),
+                path: PathBuf::from("/tmp/beta"),
+                kind: places::Kind::Bookmark,
+            },
+        ];
+        app
+    }
+
+    /// The button going down on a place, in the one tile these tests have.
+    const fn press(place: usize) -> Message {
+        Message::PlacePressed { place, buffer: 0 }
+    }
+
+    /// A place opens on release, not on press. Until the button comes up the
+    /// press may still turn into a drag, and opening it at the start of a
+    /// drag would move the listing out from under the person dragging.
+    #[test]
+    fn a_place_opens_when_the_button_comes_up() {
+        let mut app = with_places();
+        let was = app.buffers[0].path.clone();
+
+        tell(&mut app, press(1));
+        assert_eq!(app.buffers[0].path, was, "not yet");
+
+        tell(&mut app, Message::Released);
+        assert_eq!(app.buffers[0].path, PathBuf::from("/tmp/alpha"));
+    }
+
+    /// A hand that shakes is still a click. Anything under the threshold
+    /// opens the place, as it always did.
+    #[test]
+    fn a_small_wobble_is_still_a_click() {
+        let mut app = with_places();
+
+        tell(&mut app, press(1));
+        tell(&mut app, Message::Pointer(DRAG - 1.0, 0.0));
+        assert!(app.dragging.is_none(), "not far enough to be a drag");
+
+        tell(&mut app, Message::Released);
+        assert_eq!(app.buffers[0].path, PathBuf::from("/tmp/alpha"));
+    }
+
+    /// And past the threshold it is a drag, so the release must not also
+    /// open the place. Doing both is how a reorder ends somewhere else.
+    #[test]
+    fn a_dragged_place_is_not_also_opened() {
+        let mut app = with_places();
+        let was = app.buffers[0].path.clone();
+
+        tell(&mut app, press(1));
+        tell(&mut app, Message::Pointer(0.0, DRAG + 1.0));
+
+        let dragging = app.dragging.clone().expect("a drag started");
+        assert_eq!(dragging.source, Source::Place);
+        assert_eq!(dragging.paths, [PathBuf::from("/tmp/alpha")]);
+
+        tell(&mut app, Message::Released);
+        assert_eq!(app.buffers[0].path, was, "it was dragged, not clicked");
+    }
+
+    /// Home cannot be dragged anywhere -- but the press is still spent, so
+    /// dragging off it does not open it either.
+    #[test]
+    fn a_place_that_is_not_a_bookmark_cannot_be_picked_up() {
+        let mut app = with_places();
+        let was = app.buffers[0].path.clone();
+
+        tell(&mut app, press(0));
+        tell(&mut app, Message::Pointer(0.0, DRAG + 1.0));
+        assert!(app.dragging.is_none());
+
+        tell(&mut app, Message::Released);
+        assert_eq!(app.buffers[0].path, was);
+    }
+
+    /// Leaving one row and entering the next arrive in whichever order the
+    /// widgets were built in. A clear that did not check which row it was
+    /// about would lose the row just entered, and the marker with it.
+    #[test]
+    fn leaving_the_row_behind_does_not_clear_the_new_one() {
+        let mut app = with_places();
+
+        tell(&mut app, Message::PlaceEntered(2));
+        tell(&mut app, Message::PlaceLeft(1));
+        assert_eq!(app.over_place, Some(2));
+
+        tell(&mut app, Message::PlaceLeft(2));
+        assert_eq!(app.over_place, None);
+    }
+
+    /// Where a drop would land, over each kind of row.
+    #[test]
+    fn a_drop_lands_only_where_ricedir_keeps_an_order() {
+        let places = with_places().places;
+        let alpha = Path::new("/tmp/alpha");
+
+        assert_eq!(
+            lands(&places, 2, alpha),
+            Lands::Before(PathBuf::from("/tmp/beta"))
+        );
+
+        // The strip below the last place, which is the only way to say "after
+        // all of them".
+        assert_eq!(lands(&places, places.len(), alpha), Lands::AtTheEnd);
+
+        // Home is in the panel because the system says so.
+        assert_eq!(lands(&places, 0, alpha), Lands::Nowhere);
+
+        // And onto itself is not a move.
+        assert_eq!(lands(&places, 1, alpha), Lands::Nowhere);
+    }
+
+    /// Resident memory, in bytes.
+    ///
+    /// Field two of `/proc/self/statm` is the resident page count. Only the
+    /// difference between two readings is used, so the page size being taken
+    /// as 4 KiB changes nothing but the units.
+    fn resident() -> usize {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|statm| statm.split_whitespace().nth(1)?.parse::<usize>().ok())
+            .unwrap_or(0)
+            * 4096
+    }
+
+    /// Nothing `view` builds may be leaked, because `view` runs every frame.
+    ///
+    /// The breadcrumbs were: the first version made each path component a
+    /// `&'static str` with `Box::leak`, which in a function that runs sixty
+    /// times a second grows for as long as the window is open. That was
+    /// found by reading the code back, which is not a way of finding
+    /// anything. This measures instead.
+    ///
+    /// Two readings, both after the allocator has settled, so what is being
+    /// compared is growth and not the first thousand frames warming up.
+    #[test]
+    fn building_the_window_does_not_leak() {
+        const WARM: usize = 2_000;
+        const FRAMES: usize = 40_000;
+        /// One leaked path component per frame is about 30 bytes, so this
+        /// catches a leak of a hundredth of that and still leaves room for
+        /// the allocator to keep a page or two back.
+        const ALLOWED: usize = 1 << 20;
+
+        let mut app = with_places();
+        let window = window::Id::unique();
+        app.windows.insert(window, Tiles::new(0));
+
+        // A deep path, because the breadcrumbs are one widget per component
+        // and a leak there is proportional to how many there are.
+        app.buffers[0].path = PathBuf::from("/home/someone/one/two/three/four/five");
+
+        for _ in 0..WARM {
+            drop(view(&app, window));
+        }
+        let before = resident();
+
+        for _ in 0..FRAMES {
+            drop(view(&app, window));
+        }
+        let grew = resident().saturating_sub(before);
+
+        assert!(
+            grew < ALLOWED,
+            "{grew} bytes over {FRAMES} frames, which is {} a frame",
+            grew / FRAMES
+        );
+    }
+
+    /// A drag released away from the panel is called off, and nothing is
+    /// written. This is how a drag is cancelled, so it has to be silent.
+    #[test]
+    fn a_drag_released_off_the_panel_does_nothing() {
+        let mut app = with_places();
+
+        tell(&mut app, press(1));
+        tell(&mut app, Message::Pointer(300.0, 300.0));
+        assert!(app.dragging.is_some());
+
+        // Nowhere near a place: `over_place` is what the panel sets, and the
+        // pointer never reached it.
+        tell(&mut app, Message::Released);
+        assert!(app.dragging.is_none());
+        assert!(app.notice.is_none(), "cancelling is not a complaint");
     }
 }

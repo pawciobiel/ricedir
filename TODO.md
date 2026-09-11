@@ -480,7 +480,7 @@ landing before the list widget is even proven.
 - [x] **Add to favourite places, from the menu.** `Action::Bookmark { path }`,
       offered on a directory by name and on the current directory otherwise.
       The panel refreshes and the notice line says which path went in.
-- [ ] **Add to favourite places, the other ways in.** Removal first: without
+- [x] **Add to favourite places, the other ways in.** Removal first: without
       it a mistake is permanent.
       - [x] `Action::Unbookmark { path }`, and rewriting the file without
             that line. Comments and blank lines survive -- the file is one a
@@ -498,9 +498,47 @@ landing before the list widget is even proven.
             `path`: `None` means the directory being shown. One action rather
             than two, because the only difference is which path -- and
             `translate` has no path to hand, only a buffer index.
-      - [ ] drag a directory from the list onto the panel
-      - [ ] reorder them by dragging, since the file is an order and nothing
-            else respects it yet
+      - [x] drag a directory from the list onto the panel. A press on a row
+            both selects and may begin a drag, so the two are told apart by
+            the pointer moving 6 px. Dragging a row that is *not* selected
+            picks up that one; dragging one that is picks up the whole
+            selection. Files are dropped from the set before the drag
+            starts, because a file cannot be a place and picking one up
+            would promise a drop that is refused when it lands.
+      - [x] reorder them, through `Move up` and `Move down` in the places
+            menu. The file is an order and nothing respected it.
+            `places::reordered` is a pure function, so it is tested without
+            touching `XDG_CONFIG_HOME`.
+
+            Comments stay where they are and the bookmark lines move around
+            them. Deciding which line a comment belongs to is a question the
+            file format cannot answer, so it is not asked.
+      - [x] reorder them *by dragging*.
+
+            A place could not be a drag source while it was a `button`.
+            `mouse_area` gives its content the event first and gives up if
+            it was captured, and `button` captures a press, so the
+            `on_press` never fired. The answer was to stop using a button: a
+            place is now drawn, and the hover colour, the hand cursor and
+            opening the place are each done by hand. Opening moved from the
+            press to the release, because until the button comes up the
+            press may still become a drag.
+
+            **A drop marker pushed in mid-drag cannot be hit.** The first
+            version added the two-pixel line only while something was
+            dragged. That moved the row down, out from under the pointer,
+            which made the pointer leave it, which took the line away, which
+            moved the row back. The gap is there always and only its colour
+            changes.
+
+            The strip below the last place is how something is moved to the
+            end, which "in front of the row you are over" cannot say. It is
+            always there, because a target that appears once you are already
+            dragging is a target nobody finds.
+
+            Every release is heard, not only the ones over the panel: a drag
+            let go anywhere else has to be called off, and `mouse_area`
+            reports a release only over itself.
 - [x] **Path bar, the breadcrumbs half.** Each component is a button, built
       from `Path::components` rather than by splitting the string, so a name
       with a slash-looking character in it cannot fool them. Back, forward and
@@ -878,27 +916,6 @@ landing before the list widget is even proven.
       `(path, what it is now)` pairs; `Message::Examined` applies them, with
       the generation checked the way a listing chunk is.
 
-- [ ] **Mounting from ricedir, and slow mounts generally.** Raised while
-      talking about the reading bar.
-
-      Mounted sshfs, NFS and FTP already appear in the places panel: they
-      come from `/proc/self/mountinfo` like anything else, and nothing in the
-      listing path cares what filesystem it is reading. So *browsing* them
-      works today. What is missing is everything around it.
-      - [ ] a read that never returns. A hung mount blocks `readdir` in
-            uninterruptible sleep, so the listing thread cannot be killed and
-            each relist leaks another one. A deadline, and a listing that
-            says "this mount is not answering" rather than reading for ever.
-      - [ ] mount and unmount from the places panel. `sshfs`, `mount.nfs`
-            and `curlftpfs` are ordinary programs and fit the argv rule
-            exactly, so this needs no D-Bus and no udisks -- which is the
-            usual reason a file manager grows a daemon dependency.
-      - [ ] remembering a connection, which means a host and a user in the
-            config and the password left to the ssh agent or to `~/.netrc`.
-            No credential storage in ricedir.
-      - [ ] a bigger `CHUNK` and a longer `SETTLE` when the buffer is on a
-            network filesystem, since both are tuned for a local disk.
-
 - [x] **F5 was a promise the toolbar made and nothing kept.** The relist
       button's tooltip said `(F5)` and no key was bound. Now it is.
 - [x] **MIME resolution.** Parse `/usr/share/mime/globs2` (`weight:type:glob`,
@@ -1063,11 +1080,6 @@ Two things the run found that no test had:
       quietly written nothing. It now falls back to the extension, and says
       plainly when there is neither.
 
-- [ ] **The screenshots are not in the repository yet.** They belong in
-      `docs/` once there is a README section to put them in, and the sequence
-      that produces them belongs in a script beside `dev/rig.conf` rather than
-      in a shell history.
-
 ## M1 stage 3: what the keyboard found
 
 - [x] **A box that appears without focus swallows what is typed into it.**
@@ -1096,10 +1108,17 @@ Two things the run found that no test had:
       being filtered would otherwise wipe the box on every change to it, which
       is precisely when somebody is looking for something.
 
-- [ ] **The breadcrumbs leaked, briefly.** The first version made each
+- [x] **The breadcrumbs leaked, briefly.** The first version made each
       component a `&'static str` with `Box::leak`, in a `view` that runs every
-      frame. Caught by reading it back rather than by any tool. Worth a look
-      for others: nothing else in the tree leaks per frame, but nothing checks.
+      frame. Caught by reading it back rather than by any tool, which is not a
+      way of catching anything.
+
+      A test measures it now: resident memory after two thousand frames,
+      against resident memory forty thousand frames later. Put the leak back
+      and it fails at 186 bytes a frame, or 7.4 MB over the run, so it catches
+      the exact fault it was written for. It passes as the tree stands, which
+      is the first evidence that nothing else leaks per frame. Two seconds to
+      run.
 
 ## M1 stage 3: the places panel
 
@@ -1267,10 +1286,25 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       own window -- `gnome-text-editor`, `gedit`, `kate`, `mousepad`, `code`
       -- are offered bare.
 
-- [ ] **A handler that starts and immediately dies says nothing.** `spawn`
-      reports a process that will not *start*; emacs-nox started fine and then
-      exited. Watch the child briefly and report a quick non-zero exit, the
-      way ricebar reports "printed, then failed".
+- [x] **A handler that starts and immediately dies says nothing.** `spawn`
+      reported a process that would not *start*; emacs-nox started fine and
+      then exited, and ricedir said nothing, which from the other side of the
+      screen is a file that will not open.
+
+      The child is now watched for 400 ms. It is still detached -- waiting on
+      a video player until the film ends is not an option -- but a non-zero
+      exit inside that window is reported with the first line the handler
+      printed. Exit 0 is success: `xdg-open` and `flatpak run` both hand the
+      file over and return.
+
+      stderr was already piped and never read, which is its own fault: a
+      player that writes more than a pipe holds would have blocked on its own
+      stderr and looked hung. The pipe is now drained to a sink for as long
+      as the child lives.
+
+      Verified in the rig. A handler that fails says "`the-quitter` started
+      and then stopped: cat: /nonexistent-ricedir-rig: No such file or
+      directory". One that keeps running says nothing at all.
 
 ## M1 stage 3: the toolbar, and where a menu goes
 
@@ -1349,6 +1383,49 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       Measured in the rig with two tiles: the left showed 8 items with the
       dotfile and its button lit, the right stayed at 7.
 
+- [x] **The filter box and the path bar's text face followed the window, not
+      the buffer.** Reported from a real session: type a path, leave the box
+      open, split the tile, type a path in the new tile, then go back to the
+      first one -- and the path could not be edited, and the bar flashed when
+      anybody tried.
+
+      `App` held one `typing_path` and one `filtering` for the whole window,
+      so a half-typed path was handed to whichever tile the keyboard moved to
+      next, and the edit button read the *other* tile's state and turned its
+      box off instead of turning this one on. Both are fields on `Buffer` now,
+      for the same reason the view is. `path_bar` is handed `focused` by the
+      tile that draws it rather than working it out from the buffer index --
+      two tiles can show one buffer, and both would have claimed it.
+
+      Three faults fell out of the same report and are written up below,
+      because each would have gone on hiding behind the others.
+
+- [x] **Every list said "the button came up" on every release, even one
+      nowhere near it.** The list published `Dropped` from its release arm so
+      that a drop on the places panel would end the drag. But a widget hears
+      every event, not only its own, so with two tiles *both* lists said it,
+      and `Message::List` focuses the tile it came from. The keyboard
+      therefore landed wherever the last list happened to report from: a click
+      on a tile focused it and gave it straight back, which is what "it
+      flashes" was.
+
+      It is gone, action and all. The window hears every release through the
+      subscription now, which is strictly better -- it fires whether or not a
+      list is under the pointer -- and one mechanism cannot disagree with
+      itself.
+
+- [x] **A tile whose box holds no keyboard is a dead tile.** The path bar's
+      text face deliberately stops the list taking keys, because Tab is
+      completion there and with the list live it switched tiles instead. Move
+      the keyboard to another tile and back, though, and the `text_input` has
+      lost iced's focus while the list is still standing aside: the box is
+      drawn, and nothing at all takes a keystroke. Every change of tile now
+      hands the keyboard back to whichever box that tile has up.
+
+- [x] **Closing the filter box cleared every filter in the window.** It
+      looped over all the buffers, which un-narrowed the listing in the tile
+      beside it. Its own buffer only.
+
 - [x] **clippy `pedantic` and `nursery` are on.** 102 warnings the first time.
       Most were style opinions, and 17 of those are now `allow`ed in
       `[workspace.lints.clippy]` with the argument beside each one -- the
@@ -1425,6 +1502,11 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       bar, rate, time left, and cancel. Errors collect into a list on the job
       rather than stopping the world with a modal, and a finished job stays
       until dismissed if it had any.
+- [ ] **Screenshots, into `docs/`.** Moved here from M1 on purpose. A picture
+      of a program that can only look at files shows half of it, and the
+      pictures would have to be taken again as soon as copy, move and delete
+      arrive. The sequence that produces them belongs in a script beside
+      `dev/rig.conf`, not in a shell history.
 
 ## Decided: how a job tells the window what changed
 
@@ -1645,6 +1727,30 @@ what the person is looking at.
 - [ ] **The brake.** One toggle in the window that detaches every agent
       immediately, plus pause and detach per agent, plus a visible mark
       whenever any agent is attached. Findable without documentation.
+
+- [ ] **Mounting from ricedir, and slow mounts generally.** Raised while
+      talking about the reading bar, and moved here from `## M1`. It is not
+      browsing, which already works; it is the machinery around a mount that
+      answers slowly or not at all, and the first sub-item is a real fault
+      rather than a feature.
+
+      Mounted sshfs, NFS and FTP already appear in the places panel: they
+      come from `/proc/self/mountinfo` like anything else, and nothing in the
+      listing path cares what filesystem it is reading. So *browsing* them
+      works today. What is missing is everything around it.
+      - [ ] a read that never returns. A hung mount blocks `readdir` in
+            uninterruptible sleep, so the listing thread cannot be killed and
+            each relist leaks another one. A deadline, and a listing that
+            says "this mount is not answering" rather than reading for ever.
+      - [ ] mount and unmount from the places panel. `sshfs`, `mount.nfs`
+            and `curlftpfs` are ordinary programs and fit the argv rule
+            exactly, so this needs no D-Bus and no udisks -- which is the
+            usual reason a file manager grows a daemon dependency.
+      - [ ] remembering a connection, which means a host and a user in the
+            config and the password left to the ssh agent or to `~/.netrc`.
+            No credential storage in ricedir.
+      - [ ] a bigger `CHUNK` and a longer `SETTLE` when the buffer is on a
+            network filesystem, since both are tuned for a local disk.
 
 ## M4 — agents that act
 

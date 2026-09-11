@@ -37,6 +37,12 @@ toml = "1"
 # what carries results back into a subscription.
 tokio = { version = "1", features = ["io-util", "process", "sync", "time"] }
 
+[dev-dependencies]
+# A runtime, for the tests only. iced owns the real one, so ricedir itself
+# never builds one -- but a test that starts a handler needs a reactor for the
+# child to be registered with, and `tokio::process` panics without one.
+tokio = { version = "1", features = ["macros", "rt"] }
+
 # Pedantic and nursery, with the exceptions argued in the workspace file.
 [lints]
 workspace = true

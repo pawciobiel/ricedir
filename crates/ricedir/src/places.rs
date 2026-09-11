@@ -258,6 +258,69 @@ fn without(existing: &str, path: &Path) -> Option<String> {
     found.then_some(kept)
 }
 
+/// The file with one bookmark moved, or `None` if nothing would change.
+///
+/// `before` names the bookmark to land in front of. `None` means the end.
+///
+/// Comments move with nothing: they stay where they are, in order, and the
+/// bookmark lines are reordered around them. That is the only behaviour that
+/// does not need a rule for "which comment belongs to which line", a question
+/// the file format cannot answer.
+fn reordered(existing: &str, from: &Path, before: Option<&Path>) -> Option<String> {
+    let is = |line: &str, path: &Path| Path::new(line.trim()) == path;
+
+    if !existing.lines().any(|line| is(line, from)) {
+        return None;
+    }
+    if before.is_some_and(|before| before == from) {
+        return None;
+    }
+
+    let moved: Vec<&str> = existing
+        .lines()
+        .filter(|line| !is(line, from))
+        .collect::<Vec<_>>();
+
+    let mut out = String::new();
+    let mut placed = false;
+    for line in moved {
+        if let Some(before) = before
+            && is(line, before)
+            && !placed
+        {
+            out.push_str(&from.to_string_lossy());
+            out.push('\n');
+            placed = true;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if !placed {
+        out.push_str(&from.to_string_lossy());
+        out.push('\n');
+    }
+
+    (out != existing).then_some(out)
+}
+
+/// Move one bookmark in front of another, or to the end.
+pub fn move_bookmark(from: &Path, before: Option<&Path>) -> std::io::Result<()> {
+    let Some(file) = bookmarks_path() else {
+        return Ok(());
+    };
+    let Ok(existing) = std::fs::read_to_string(&file) else {
+        return Ok(());
+    };
+    let Some(moved) = reordered(&existing, from, before) else {
+        return Ok(());
+    };
+
+    let temporary = file.with_extension("tmp");
+    std::fs::write(&temporary, moved)?;
+    std::fs::rename(&temporary, &file)
+}
+
 /// Take one bookmark out, leaving everything else in the file alone.
 ///
 /// Written to a temporary file beside the real one and renamed over it, so an
@@ -446,6 +509,43 @@ XDG_PICTURES_DIR="$HOME/Pictures"
         let places = bookmarks(&kept);
         assert_eq!(places.len(), 1);
         assert_eq!(places[0].path, PathBuf::from("/srv/photos"));
+    }
+
+    /// Moving one bookmark in front of another, and to the end.
+    #[test]
+    fn a_bookmark_moves_where_it_is_asked() {
+        let text = "/a\n/b\n/c\n";
+
+        let up =
+            reordered(text, Path::new("/c"), Some(Path::new("/b"))).expect("c moves in front of b");
+        assert_eq!(up, "/a\n/c\n/b\n");
+
+        let end = reordered(text, Path::new("/a"), None).expect("a moves to the end");
+        assert_eq!(end, "/b\n/c\n/a\n");
+    }
+
+    /// Comments stay where they are. Deciding which line a comment belongs
+    /// to is a question the file format cannot answer, so it is not asked.
+    #[test]
+    fn reordering_leaves_the_comments_alone() {
+        let text = "# mine\n/a\n\n# work\n/b\n";
+        let moved = reordered(text, Path::new("/b"), Some(Path::new("/a"))).expect("b moves up");
+
+        assert_eq!(moved, "# mine\n/b\n/a\n\n# work\n");
+        assert_eq!(bookmarks(&moved).len(), 2, "and both are still bookmarks");
+    }
+
+    /// A move that changes nothing writes nothing. The caller uses `None` to
+    /// skip the write, so a no-op never rewrites the file.
+    #[test]
+    fn a_move_that_changes_nothing_is_declined() {
+        let text = "/a\n/b\n";
+        assert!(reordered(text, Path::new("/a"), Some(Path::new("/a"))).is_none());
+        assert!(reordered(text, Path::new("/missing"), None).is_none());
+        assert!(
+            reordered(text, Path::new("/b"), None).is_none(),
+            "already last"
+        );
     }
 
     /// A path that is not in the file must leave it alone rather than
