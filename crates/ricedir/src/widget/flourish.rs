@@ -68,6 +68,9 @@ const RING: f32 = 64.0;
 pub struct State {
     /// What is under the pointer right now, while a drag is on.
     pub held: Option<Held>,
+    /// Let go, but not yet agreed to. The icon waits where it landed while a
+    /// dialogue asks, so what is being decided about stays on screen.
+    pub pending: Option<Pending>,
     /// A drop that is still travelling, or springing back.
     pub flight: Option<Flight>,
     pub bursts: Vec<Burst>,
@@ -82,6 +85,7 @@ impl State {
     /// GPU awake for nothing.
     pub fn busy(&self, at: Instant) -> bool {
         self.held.is_some()
+            || self.pending.is_some()
             || self.flight.as_ref().is_some_and(|one| one.busy(at))
             || self.bursts.iter().any(|one| one.busy(at))
             || self.shakes.iter().any(|one| one.busy(at))
@@ -104,27 +108,60 @@ impl State {
             .map_or(0.0, |shake| shake.offset(at))
     }
 
-    /// Start everything that a drop onto a row sets off.
-    pub fn landed(&mut self, on: Point, tile: Option<usize>, at: Instant) {
-        let Some(held) = self.held.take() else {
+    /// Let go on a tile that will take it. The icon waits there.
+    ///
+    /// Nothing bursts yet. A drop is a question until somebody answers it --
+    /// copy or move, and then what to do about a name already taken -- and a
+    /// burst over an unanswered dialogue says the file has already moved.
+    pub fn asked(&mut self, on: Point, tile: usize) {
+        let Some(mut held) = self.held.take() else {
+            return;
+        };
+        held.at = on;
+        self.pending = Some(Pending { held, at: on, tile });
+    }
+
+    /// The work is really starting: land the icon, burst, and shake the tile.
+    pub fn accepted(&mut self, at: Instant) {
+        let Some(pending) = self.pending.take() else {
             return;
         };
 
-        self.flight = Some(Flight::to(&held, on, at));
-        self.bursts.push(Burst::at(on, at));
-        if let Some(buffer) = tile {
-            self.shakes.retain(|shake| shake.buffer != buffer);
-            self.shakes.push(Shake { buffer, since: at });
-        }
+        self.flight = Some(Flight::to(&pending.held, pending.at, at));
+        self.bursts.push(Burst::at(pending.at, at));
+        self.shakes.retain(|shake| shake.buffer != pending.tile);
+        self.shakes.push(Shake {
+            buffer: pending.tile,
+            since: at,
+        });
     }
 
-    /// A drop that went nowhere: the icon springs back and nothing bursts.
+    /// Answered with "no", or the plan came to nothing: spring back, quietly.
+    pub fn declined(&mut self, at: Instant) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        self.flight = Some(Flight::back(&pending.held, at));
+    }
+
+    /// A drop that went nowhere at all: the icon springs back and nothing
+    /// bursts. Nobody is being asked anything, so this needs no answer.
     pub fn refused(&mut self, at: Instant) {
         let Some(held) = self.held.take() else {
             return;
         };
         self.flight = Some(Flight::back(&held, at));
     }
+}
+
+/// Let go, and waiting for a person to say what it meant.
+#[derive(Debug, Clone)]
+pub struct Pending {
+    held: Held,
+    /// Where it was let go, which is where it will land or burst.
+    at: Point,
+    /// Which tile takes the shake.
+    tile: usize,
 }
 
 /// The icon in your hand.
@@ -628,6 +665,20 @@ where
                 );
             }
 
+            // Waiting to be answered. Drawn at full size and not following
+            // anything: it has been let go, and it sits where it landed so
+            // the dialogue is plainly about it.
+            if let Some(pending) = &self.state.pending {
+                self.draw_ghost(
+                    renderer,
+                    pending.at,
+                    1.0,
+                    pending.held.glyph,
+                    &pending.held.label,
+                    pending.held.count,
+                );
+            }
+
             if let Some(held) = &self.state.held {
                 let scale = held.grown.interpolate(0.6, 1.0, self.now);
                 self.draw_ghost(
@@ -689,18 +740,57 @@ mod tests {
         assert!(state.busy(Instant::now()));
     }
 
-    /// A drop sets off all three at once, and every one of them ends.
+    /// Letting go asks a question. Nothing bursts until it is answered: a
+    /// burst over an open dialogue says the file has already moved.
     #[test]
-    fn a_drop_starts_the_flight_the_burst_and_the_shake() {
+    fn letting_go_asks_and_does_not_burst() {
         let now = Instant::now();
         let mut state = State {
             held: Some(held(2)),
             ..State::default()
         };
 
-        state.landed(Point::new(400.0, 200.0), Some(1), now);
+        state.asked(Point::new(400.0, 200.0), 1);
 
         assert!(state.held.is_none(), "it is not in your hand any more");
+        assert!(state.pending.is_some(), "it is waiting to be answered");
+        assert!(state.flight.is_none(), "and it has not gone anywhere");
+        assert!(state.bursts.is_empty(), "nothing has burst");
+        assert!(state.shakes.is_empty(), "and nothing has shaken");
+        assert!(state.busy(now), "but the icon is on screen, so frames run");
+    }
+
+    /// Answered with "no": the icon goes home and still nothing bursts.
+    #[test]
+    fn a_declined_drop_goes_home_without_a_burst() {
+        let now = Instant::now();
+        let mut state = State {
+            held: Some(held(1)),
+            ..State::default()
+        };
+
+        state.asked(Point::new(400.0, 200.0), 1);
+        state.declined(now);
+
+        assert!(state.pending.is_none());
+        assert!(state.flight.is_some_and(|one| one.refused));
+        assert!(state.bursts.is_empty());
+        assert!(state.shakes.is_empty());
+    }
+
+    /// Answered with "yes": all three at once, and every one of them ends.
+    #[test]
+    fn accepting_starts_the_flight_the_burst_and_the_shake() {
+        let now = Instant::now();
+        let mut state = State {
+            held: Some(held(2)),
+            ..State::default()
+        };
+
+        state.asked(Point::new(400.0, 200.0), 1);
+        state.accepted(now);
+
+        assert!(state.pending.is_none());
         assert!(state.flight.is_some());
         assert_eq!(state.bursts.len(), 1);
         assert_eq!(state.shakes.len(), 1);

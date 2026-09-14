@@ -539,7 +539,15 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 });
             }
 
-            app.jobs.start_ready().map(Message::Job)
+            let started = app.jobs.start_ready().map(Message::Job);
+
+            // A plan that could not be built never runs, so the icon that was
+            // waiting for it goes home rather than sitting there.
+            if app.jobs.get(id).is_some_and(|job| job.state.over()) {
+                app.flourish.declined(std::time::Instant::now());
+            }
+
+            began(app, started)
         }
 
         Message::Job(jobs::Message::Said(id, said)) => {
@@ -1084,6 +1092,20 @@ fn lands_here(app: &App, at: usize) -> bool {
             .is_some_and(|from| lands(&app.places, at, from) != Lands::Nowhere)
 }
 
+/// Let the icon land, if the work it was asked about is really starting.
+///
+/// The burst waits for this rather than firing at the drop. Between the two
+/// stand the copy-or-move question and then the one about a name already
+/// taken, and a burst over either of those says the file has already moved.
+///
+/// Takes the task through, so a caller can wrap a `return` in it.
+fn began(app: &mut App, carry: Task<Message>) -> Task<Message> {
+    if app.jobs.iter().any(|job| job.state.running()) {
+        app.flourish.accepted(std::time::Instant::now());
+    }
+    carry
+}
+
 /// A drop on a listing: work out where it lands, and ask what it means.
 ///
 /// A row that is a directory takes the drop; anything else means the
@@ -1164,17 +1186,18 @@ fn finish_drag(app: &mut App) -> Task<Message> {
     {
         let (started, took) = drop_into(app, &dragging, buffer, row);
 
-        // The burst goes where the pointer is, which is where the person was
-        // looking. A drop the tile would not take springs back instead: a
-        // burst would say something landed when nothing did.
+        // The icon waits where the pointer is, which is where the person was
+        // looking. It does not burst yet: a drop is a question until it is
+        // answered, and the answer may still be "cancel". A tile that would
+        // not take it springs back at once, because nothing is being asked.
         let at = iced::Point::new(app.pointer.0, app.pointer.1);
         if took {
-            app.flourish.landed(at, Some(buffer), now);
+            app.flourish.asked(at, buffer);
         } else {
             app.flourish.refused(now);
         }
 
-        return started;
+        return began(app, started);
     }
 
     // Everything else: onto the panel, or onto nothing at all. The icon goes
@@ -1663,7 +1686,15 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
         Action::Resolve { job, how } => {
             app.jobs.resolve(job, how);
             app.dialogue = None;
-            app.jobs.start_ready().map(Message::Job)
+            let started = app.jobs.start_ready().map(Message::Job);
+
+            // "Skip everything" leaves a plan with nothing in it, which is
+            // not an arrival.
+            if app.jobs.get(job).is_some_and(|one| one.state.over()) {
+                app.flourish.declined(std::time::Instant::now());
+            }
+
+            began(app, started)
         }
 
         Action::Delete { buffer } => {
@@ -1979,11 +2010,15 @@ fn chose(app: &mut App, choice: Choice) -> Task<Message> {
         (Choice::Dismiss, Dialogue::Clashing { job, .. }) => {
             app.typed.clear();
             app.jobs.cancel(job);
+            app.flourish.declined(std::time::Instant::now());
             Task::none()
         }
 
         (Choice::Dismiss, _) => {
             app.typed.clear();
+            // Whatever was waiting on an answer did not get a yes. Nothing
+            // happens if nothing was waiting.
+            app.flourish.declined(std::time::Instant::now());
             Task::none()
         }
 

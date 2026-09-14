@@ -1961,14 +1961,22 @@ than the one already installed is partly that it looks good.
       random source. `draw` runs many times per burst, and dust that jumped
       between frames would be snow.
 
-      The overlay goes over the tiles and *under* the dialogue: an icon
-      flying across a modal reads worse than one behind it. So the burst is
-      dimmed by the dialogue's wash on an ordinary drop, and fully visible
-      when Ctrl or Shift answered the question instead.
+      **Nothing bursts until the work really starts.** Letting go parks the
+      icon where it landed and asks; the burst waits for a job to reach
+      `Running`, which is after the copy-or-move question *and* after the one
+      about a name already taken. A burst over an open dialogue says the file
+      has moved when it has not. Cancelling either one springs the icon back.
 
-      Rig: the ghost drawn with its glyph and name; dust and the shrinking
-      icon at the drop; 13 of 14 frames of the target tile different while it
-      shook, measured away from the burst.
+      A parked icon is also the clearest thing the dialogue could sit next
+      to: what is being decided about stays on screen, under the wash.
+
+      The overlay goes over the tiles and under the dialogue, because an icon
+      flying across a modal reads worse than one behind it.
+
+      Rig: the ghost drawn with its glyph and name; the icon parked and
+      nothing bursting while the dialogue was up; ring, dust and the
+      shrinking icon once Copy was pressed; 13 of 14 frames of the target
+      tile different while it shook, measured away from the burst.
 
       Still to do: honour the reduced-motion switch below.
 
