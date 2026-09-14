@@ -283,6 +283,8 @@ pub enum Message {
     Released,
     /// Which modifiers are held now.
     Modifiers(iced::keyboard::Modifiers),
+    /// Enter, in the filter box.
+    FilterSubmitted(usize),
     /// A breadcrumb, or back, forward, up.
     Go(usize, PathBuf),
     Back(usize),
@@ -659,6 +661,37 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 buffer.rebuild(&list);
             }
             Task::none()
+        }
+
+        // Enter in the filter box means "this one", the way it does in every
+        // launcher. `text_input` captures Enter, so the list never sees it
+        // and cannot activate the row itself.
+        //
+        // The row is read before anything else happens: entering a directory
+        // drops the filter, which re-arranges the listing and makes the same
+        // number a different entry.
+        Message::FilterSubmitted(index) => {
+            let Some(row) = app.buffers.get(index).map(|buffer| buffer.cursor) else {
+                return Task::none();
+            };
+
+            // Nothing matched, so there is nothing to open. Put the box away
+            // rather than leave a listing narrowed to nothing. Done here
+            // rather than through `Action::Filtering`, which answers with a
+            // `Task`: this arm already holds `&mut App`.
+            if app
+                .buffers
+                .get(index)
+                .is_none_or(|buffer| buffer.rows() == 0)
+            {
+                let list = app.config.list.clone();
+                if let Some(buffer) = app.buffers.get_mut(index) {
+                    buffer.leaving(&list);
+                }
+                return Task::none();
+            }
+
+            action::dispatch(app, Action::Activate { buffer: index, row })
         }
 
         Message::TypingPath(index, typing) => {
@@ -1669,6 +1702,7 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             let from = std::mem::replace(&mut found.path, path);
             found.history.push(from);
             found.future.clear();
+            found.leaving(&list);
 
             // Arriving somewhere clears whatever the notice line was
             // complaining about. "`/s` is not a directory" left up after a
@@ -1689,6 +1723,7 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             let from = std::mem::replace(&mut found.path, parent);
             found.history.push(from);
             found.future.clear();
+            found.leaving(&list);
             relist(app, buffer)
         }
 
@@ -1702,6 +1737,7 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
 
             let from = std::mem::replace(&mut found.path, back);
             found.future.push(from);
+            found.leaving(&list);
             relist(app, buffer)
         }
 
@@ -1715,6 +1751,7 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
 
             let from = std::mem::replace(&mut found.path, forward);
             found.history.push(from);
+            found.leaving(&list);
             relist(app, buffer)
         }
 
@@ -1740,6 +1777,7 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             let from = std::mem::replace(&mut found.path, into);
             found.history.push(from);
             found.future.clear();
+            found.leaving(&list);
             relist(app, buffer)
         }
     }
@@ -2128,7 +2166,7 @@ fn tile<'a>(app: &'a App, index: usize, buffer: &'a Buffer, focused: bool) -> El
                 iced::widget::text_input("filter, or :glob", &buffer.filter)
                     .id(filter_id())
                     .on_input(move |text| Message::Filter(index, text))
-                    .on_submit(Message::Filtering(index, false))
+                    .on_submit(Message::FilterSubmitted(index))
                     .size(14)
                     .padding(6),
             )
@@ -3687,6 +3725,59 @@ mod tests {
             Some((0, Some(1))),
             "but the target was noted"
         );
+    }
+
+    /// Enter in the filter box opens what is highlighted, the way it does in
+    /// every launcher. `text_input` captures Enter, so the list never sees it
+    /// and cannot activate the row itself.
+    #[test]
+    fn enter_in_the_filter_box_opens_the_highlighted_row() {
+        let mut app = app();
+        let list = Config::default().list;
+        app.buffers[0].extend(
+            vec![
+                entry("Documents", Kind::Directory),
+                entry("Downloads", Kind::Directory),
+            ],
+            &list,
+        );
+        app.buffers[0].finish(&list);
+
+        // Narrowed to `Downloads`, which is then the only row and the cursor.
+        app.buffers[0].filtering = true;
+        app.buffers[0].filter = String::from("Down");
+        app.buffers[0].rebuild(&list);
+        assert_eq!(app.buffers[0].rows(), 1);
+
+        tell(&mut app, Message::FilterSubmitted(0));
+
+        assert_eq!(
+            app.buffers[0].path,
+            PathBuf::from("/tmp/one/Downloads"),
+            "the highlighted row, not the one that was first before filtering"
+        );
+        assert!(app.buffers[0].filter.is_empty(), "and the filter went");
+        assert!(!app.buffers[0].filtering);
+    }
+
+    /// A filter that matches nothing has nothing to open, so Enter puts the
+    /// box away rather than leaving a listing narrowed to nothing.
+    #[test]
+    fn enter_on_a_filter_that_matches_nothing_just_closes_it() {
+        let mut app = app();
+        let list = Config::default().list;
+        app.buffers[0].extend(vec![entry("Documents", Kind::Directory)], &list);
+        app.buffers[0].finish(&list);
+
+        app.buffers[0].filtering = true;
+        app.buffers[0].filter = String::from("nothing matches this");
+        app.buffers[0].rebuild(&list);
+        assert_eq!(app.buffers[0].rows(), 0);
+
+        tell(&mut app, Message::FilterSubmitted(0));
+
+        assert_eq!(app.buffers[0].path, PathBuf::from("/tmp/one"), "stayed put");
+        assert!(!app.buffers[0].filtering);
     }
 
     /// A view belongs to one buffer. Two tiles side by side wanting different

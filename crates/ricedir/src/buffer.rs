@@ -192,6 +192,25 @@ impl Buffer {
         };
     }
 
+    /// About to show a different directory: drop what belonged to the old one.
+    ///
+    /// A filter is about the listing in front of you. Carrying it into the
+    /// next directory shows a handful of its files with nothing on screen
+    /// saying why the rest are missing -- which is exactly what "filter, then
+    /// open a folder" did.
+    ///
+    /// Not the same as a relist. Watching a directory that is being filtered
+    /// must keep the filter, or typing into the box while files arrive would
+    /// undo itself; see `a_relist_must_not_clear_the_filter`.
+    pub fn leaving(&mut self, list: &List) {
+        if self.filter.is_empty() && !self.filtering {
+            return;
+        }
+        self.filter.clear();
+        self.filtering = false;
+        self.rebuild(list);
+    }
+
     /// Whether a replacement listing is being read behind what is showing.
     pub const fn refreshing(&self) -> bool {
         self.arriving.is_some()
@@ -1049,6 +1068,26 @@ mod tests {
         buffer.rebuild(&list);
         assert_eq!(buffer.rows(), 3);
         assert_eq!(buffer.selected().count(), 3, "the selection came back");
+    }
+
+    /// A filter belongs to the listing in front of you. Carrying it into the
+    /// next directory shows a few of its files and nothing saying why the
+    /// rest are missing -- which is what "filter, then open a folder" did.
+    #[test]
+    fn going_somewhere_else_drops_the_filter() {
+        let list = List::default();
+        let mut buffer = buffer(&["alpha.txt", "beta.txt", "gamma.md"]);
+
+        buffer.filter = String::from("a.txt");
+        buffer.filtering = true;
+        buffer.rebuild(&list);
+        assert_eq!(buffer.rows(), 2);
+
+        buffer.leaving(&list);
+
+        assert!(buffer.filter.is_empty());
+        assert!(!buffer.filtering, "and the box goes with it");
+        assert_eq!(buffer.rows(), 3, "everything is showing again");
     }
 
     /// Typing into a box means a substring to most people; a leading colon is

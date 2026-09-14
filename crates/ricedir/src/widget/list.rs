@@ -689,6 +689,21 @@ where
                 modifiers,
                 ..
             }) => {
+                // The filter box and the path bar's text face sit above this
+                // list in the same column, and `Column::update` hands every
+                // child the same event with the same shell, in order and
+                // without stopping. So a key one of them took is theirs.
+                //
+                // This is what lets the list stay live while a box is up:
+                // `text_input` leaves the vertical arrows, PageUp, PageDown
+                // and Tab alone, and takes everything else. Without the
+                // check, Backspace deleted a character *and* left the
+                // directory, and a letter both narrowed the filter and ran
+                // whatever shortcut it was bound to.
+                if shell.is_event_captured() {
+                    return;
+                }
+
                 if !self.focused || rows == 0 {
                     return;
                 }
