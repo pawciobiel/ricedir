@@ -51,6 +51,7 @@ For this reason ricedir has no headless mode. It will never have one.
 | Copying | Into the tile beside this one. Hold, let go, or stop a job while it runs. |
 | Moving | A rename on one disk, a copy and a delete across two. |
 | Drag and drop | Between tiles. It asks copy or move, or hold Ctrl or Shift to say. |
+| Drag feedback | The icon follows the pointer, flies into the target, and lands with a burst. |
 | Conflicts | Skip, overwrite, keep both, newer only or larger only, asked once. |
 | Deleting | For good, and it asks first. There is no trash yet. |
 | The left panel | Hide it with F9. The choice is remembered. |

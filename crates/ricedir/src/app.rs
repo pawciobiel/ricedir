@@ -17,6 +17,7 @@ use crate::dialogue::{self, Choice, Dialogue};
 use crate::jobs;
 use crate::open::{self, Plan, scan};
 use crate::places::{self, Place};
+use crate::widget::flourish::{self, Flourish};
 use crate::widget::list::{self, FileList};
 
 /// The tiles in one window, and which of them has the keyboard.
@@ -206,6 +207,11 @@ pub struct App {
     pressed: Option<Pressed>,
     /// Which modifiers are held, window-wide. A drop reads them as it lands.
     modifiers: iced::keyboard::Modifiers,
+    /// What a drag looks like: the icon in hand, where it went, the burst.
+    ///
+    /// Drawn over everything and read by nothing else. `update` stays the
+    /// only writer; the overlay widget takes no events at all.
+    flourish: flourish::State,
     /// The place the pointer is over, as an index into `places`.
     ///
     /// `places.len()` means the strip under the last one, which is how
@@ -285,6 +291,8 @@ pub enum Message {
     Modifiers(iced::keyboard::Modifiers),
     /// Enter, in the filter box.
     FilterSubmitted(usize),
+    /// A frame, while something is being animated.
+    Frame(std::time::Instant),
     /// A breadcrumb, or back, forward, up.
     Go(usize, PathBuf),
     Back(usize),
@@ -348,6 +356,7 @@ pub fn new(mut config: Config, start: PathBuf) -> (App, Task<Message>) {
         tick: 0,
         dragging: None,
         modifiers: iced::keyboard::Modifiers::default(),
+        flourish: flourish::State::default(),
         pressed: None,
         over_place: None,
     };
@@ -556,9 +565,23 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
 
+        // A frame, while something is animating. Nothing is worked out here:
+        // every effect reads the clock itself when it draws, so all this does
+        // is throw away what has finished, which is what ends the
+        // subscription.
+        Message::Frame(now) => {
+            app.flourish.tidy(now);
+            Task::none()
+        }
+
         Message::Pointer(x, y) => {
             app.pointer = (x, y);
             pick_up_place(app);
+
+            // The icon goes where the hand goes.
+            if let Some(held) = &mut app.flourish.held {
+                held.at = iced::Point::new(x, y);
+            }
             Task::none()
         }
 
@@ -1075,9 +1098,9 @@ fn drop_into(
     dragging: &Dragging,
     buffer: usize,
     row: Option<usize>,
-) -> Task<Message> {
+) -> (Task<Message>, bool) {
     let Some(found) = app.buffers.get(buffer) else {
-        return Task::none();
+        return (Task::none(), false);
     };
 
     let into = row
@@ -1095,7 +1118,7 @@ fn drop_into(
         .collect();
 
     if sources.is_empty() {
-        return Task::none();
+        return (Task::none(), false);
     }
 
     // The job is made here rather than through `Action::Copy`, because that
@@ -1111,7 +1134,7 @@ fn drop_into(
             jobs::Work::Copy
         };
         let (_, planning) = app.jobs.add(work, sources, into);
-        return planning.map(Message::Job);
+        return (planning.map(Message::Job), true);
     }
 
     app.dialogue = Some(Dialogue::Dropping {
@@ -1119,7 +1142,7 @@ fn drop_into(
         into,
         buffer,
     });
-    Task::none()
+    (Task::none(), true)
 }
 
 /// End a drag, and do whatever it turned out to be.
@@ -1132,13 +1155,32 @@ fn finish_drag(app: &mut App) -> Task<Message> {
         return Task::none();
     };
 
+    let now = std::time::Instant::now();
+
     // Dropped on a listing. The panel is checked after, so a pointer over a
     // tile is never also read as a drop on the places panel.
     if dragging.source == Source::List
         && let Some((buffer, row)) = dragging.over
     {
-        return drop_into(app, &dragging, buffer, row);
+        let (started, took) = drop_into(app, &dragging, buffer, row);
+
+        // The burst goes where the pointer is, which is where the person was
+        // looking. A drop the tile would not take springs back instead: a
+        // burst would say something landed when nothing did.
+        let at = iced::Point::new(app.pointer.0, app.pointer.1);
+        if took {
+            app.flourish.landed(at, Some(buffer), now);
+        } else {
+            app.flourish.refused(now);
+        }
+
+        return started;
     }
+
+    // Everything else: onto the panel, or onto nothing at all. The icon goes
+    // back where it came from rather than vanishing, so a drag that missed
+    // says so.
+    app.flourish.refused(now);
 
     // Dropped somewhere that is not the panel. Nothing happens, quietly:
     // a drag that lands nowhere is how a drag is called off.
@@ -1408,6 +1450,20 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             // says so when a file lands on it; another tile takes whatever
             // it is given, which is the ordinary reason to drag a file.
             if !paths.is_empty() {
+                // The icon in hand. Worked out here, where the entry is:
+                // `flourish` never reads a buffer.
+                let picked = found.at(row);
+                app.flourish.held = Some(flourish::Held::new(
+                    picked.map(crate::icon::of),
+                    picked.map_or_else(
+                        || format!("{} things", paths.len()),
+                        |entry| entry.name.clone(),
+                    ),
+                    paths.len(),
+                    iced::Point::new(app.pointer.0, app.pointer.1),
+                    std::time::Instant::now(),
+                ));
+
                 app.dragging = Some(Dragging {
                     paths,
                     source: Source::List,
@@ -2135,6 +2191,20 @@ pub fn view(app: &App, window: window::Id) -> Element<'_, Message> {
         None => page.into(),
     };
 
+    // The drag overlay goes over the tiles and under the dialogue: the icon
+    // has to cross tiles and the panel, and a dialogue that opens because of
+    // a drop should not have an icon flying across it. It takes no events, so
+    // stacking it over the page costs the page nothing.
+    let page: Element<'_, Message> = if app.flourish.busy(std::time::Instant::now()) {
+        iced::widget::stack![
+            page,
+            Flourish::new(&app.flourish, &app.config, app.icon_font),
+        ]
+        .into()
+    } else {
+        page
+    };
+
     let Some(dialogue) = &app.dialogue else {
         return page;
     };
@@ -2185,7 +2255,9 @@ fn tile<'a>(app: &'a App, index: usize, buffer: &'a Buffer, focused: bool) -> El
         }),
         _ => None,
     });
-    let list = list.dropping(dragging.is_some(), over);
+    let list = list
+        .dropping(dragging.is_some(), over)
+        .shaken(app.flourish.shake(index, std::time::Instant::now()));
 
     let mut page = column![path_bar(app, index, buffer, focused)];
 
@@ -2339,6 +2411,14 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
     let ticking = reading
         .then(|| iced::time::every(std::time::Duration::from_millis(80)).map(|_| Message::Tick));
 
+    // A frame per redraw, and only while a drag or a burst is playing. Held
+    // open for ever this is a file manager that keeps a laptop's GPU awake
+    // for nothing; `State::busy` is what closes it again.
+    let animating = app
+        .flourish
+        .busy(std::time::Instant::now())
+        .then(|| window::frames().map(Message::Frame));
+
     iced::Subscription::batch(
         watches.chain(
             [
@@ -2347,7 +2427,8 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
                 iced::event::listen_with(moved),
             ]
             .into_iter()
-            .chain(ticking),
+            .chain(ticking)
+            .chain(animating),
         ),
     )
 }
@@ -3619,6 +3700,7 @@ mod tests {
             tick: 0,
             dragging: None,
             modifiers: iced::keyboard::Modifiers::default(),
+            flourish: flourish::State::default(),
             pressed: None,
             over_place: None,
         }

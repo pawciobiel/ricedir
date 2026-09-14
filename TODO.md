@@ -1940,18 +1940,37 @@ than the one already installed is partly that it looks good.
       lifting under the pointer, a job's bar and its arrival in the panel, the
       filter box unrolling, a breadcrumb changing, and a directory's rows fading
       in as the listing streams.
-- [ ] **Carry the icon with the pointer while dragging.** A drag picks
-      something up and puts it down, and nothing on screen says so: only the
-      target tile changes, and the thing being moved stays where it was.
+- [x] **Carry the icon with the pointer while dragging.** `widget/flourish.rs`:
+      the icon under the hand with a glow, its name and a count; it flies into
+      the target and shrinks, or springs back when the drop is refused. A ring
+      and a spray of dust where it landed, and the target tile's rows knocked
+      sideways by a sine that dies away.
 
-      Draw the icon under the pointer, with the name and a count when it is
-      more than one, and let it settle into the target or spring back when
-      the drop is refused. `App.dragging` already knows what is held and
-      `App.pointer` where the hand is.
+      **Quads and text only, no new feature.** A `Quad` carries a border
+      radius and a real blurred shadow, which is a rounded icon, a glow and a
+      ring. Stars and arrows would need `canvas` and a second drawing model;
+      particles would need `wgpu` and would cost the software renderer.
+      `Transformation` does translate and uniform scale, so nothing here
+      rotates.
 
-      An overlay, not a row in a list. It has to be drawn over both tiles and
-      the panel, and a primitive issued after `with_layer` returns goes
-      underneath it -- see the trap in `CLAUDE.md`.
+      `EaseOutBack` picking up, `EaseOutCubic` landing, `EaseOutElastic`
+      springing back. The window subscribes to `window::frames()` only while
+      `State::busy`, so an idle window wakes for nothing.
+
+      The dust is worked out from each speck's number rather than from a
+      random source. `draw` runs many times per burst, and dust that jumped
+      between frames would be snow.
+
+      The overlay goes over the tiles and *under* the dialogue: an icon
+      flying across a modal reads worse than one behind it. So the burst is
+      dimmed by the dialogue's wash on an ordinary drop, and fully visible
+      when Ctrl or Shift answered the question instead.
+
+      Rig: the ghost drawn with its glyph and name; dust and the shrinking
+      icon at the drop; 13 of 14 frames of the target tile different while it
+      shook, measured away from the burst.
+
+      Still to do: honour the reduced-motion switch below.
 
 - [ ] **Subscribe to frames only while something is animating.**
       `iced::window::frames()` gives an `Instant` per redraw; a program that

@@ -233,6 +233,10 @@ pub struct FileList<'a, Message> {
     /// Which row the drop marker is on, when this list is the one under the
     /// pointer. Drawn as a ring round the directory that would take the drop.
     over: Option<usize>,
+    /// How far the rows are pushed sideways, when something has just landed
+    /// in this tile. The background stays put: a tile whose background moved
+    /// would show the colour behind it down one edge.
+    shake: f32,
     on_action: Box<dyn Fn(Action) -> Message + 'a>,
 }
 
@@ -265,6 +269,7 @@ impl<'a, Message> FileList<'a, Message> {
             focused,
             dragging: false,
             over: None,
+            shake: 0.0,
             on_action: Box::new(on_action),
         }
     }
@@ -273,6 +278,12 @@ impl<'a, Message> FileList<'a, Message> {
     pub const fn dropping(mut self, dragging: bool, over: Option<usize>) -> Self {
         self.dragging = dragging;
         self.over = over;
+        self
+    }
+
+    /// Knock the rows sideways, for as long as something is shaking them.
+    pub const fn shaken(mut self, by: f32) -> Self {
+        self.shake = by;
         self
     }
 
@@ -829,49 +840,56 @@ where
 
         // Clip to the list, so a row half off the bottom is cut rather than
         // drawn over whatever is below.
+        //
+        // The shake goes inside the clip and around the rows only. The
+        // background is already painted, so the rows slide across it and
+        // nothing shows down the edge; and the clip stays where it is, so a
+        // row cannot be shaken out past the tile it belongs to.
         renderer.with_layer(visible, |renderer| {
-            for row in self.visible(offset, bounds) {
-                let Some(entry) = self.buffer.at(row) else {
-                    continue;
-                };
+            renderer.with_translation(iced::Vector::new(self.shake, 0.0), |renderer| {
+                for row in self.visible(offset, bounds) {
+                    let Some(entry) = self.buffer.at(row) else {
+                        continue;
+                    };
 
-                let rectangle = self.cell(row, bounds, offset);
-                match self.layout {
-                    config::Layout::Icons => self.draw_tile(renderer, entry, row, rectangle),
-                    _ => self.draw_row(renderer, entry, row, rectangle),
+                    let rectangle = self.cell(row, bounds, offset);
+                    match self.layout {
+                        config::Layout::Icons => self.draw_tile(renderer, entry, row, rectangle),
+                        _ => self.draw_row(renderer, entry, row, rectangle),
+                    }
                 }
-            }
 
-            // The band goes inside this layer, not after it. A primitive
-            // issued once `with_layer` has returned belongs to the *parent*
-            // layer, and the parent is composited underneath: drawn outside,
-            // the band appeared only in the strip below the last row, hidden
-            // behind the rows everywhere else. It took a solid red quad to
-            // see that it was painting at all.
-            if let Some((from, to)) = state.band {
-                let rectangle = Rectangle {
-                    x: from.x.min(to.x),
-                    y: from.y.min(to.y) - offset,
-                    width: (to.x - from.x).abs(),
-                    height: (to.y - from.y).abs(),
-                };
+                // The band goes inside this layer, not after it. A primitive
+                // issued once `with_layer` has returned belongs to the *parent*
+                // layer, and the parent is composited underneath: drawn outside,
+                // the band appeared only in the strip below the last row, hidden
+                // behind the rows everywhere else. It took a solid red quad to
+                // see that it was painting at all.
+                if let Some((from, to)) = state.band {
+                    let rectangle = Rectangle {
+                        x: from.x.min(to.x),
+                        y: from.y.min(to.y) - offset,
+                        width: (to.x - from.x).abs(),
+                        height: (to.y - from.y).abs(),
+                    };
 
-                renderer.fill_quad(
-                    renderer::Quad {
-                        bounds: rectangle,
-                        border: iced::Border {
-                            color: self.theme.accent.color(),
-                            width: 1.0,
-                            ..iced::Border::default()
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: rectangle,
+                            border: iced::Border {
+                                color: self.theme.accent.color(),
+                                width: 1.0,
+                                ..iced::Border::default()
+                            },
+                            ..renderer::Quad::default()
                         },
-                        ..renderer::Quad::default()
-                    },
-                    iced::Color {
-                        a: 0.25,
-                        ..self.theme.accent.color()
-                    },
-                );
-            }
+                        iced::Color {
+                            a: 0.25,
+                            ..self.theme.accent.color()
+                        },
+                    );
+                }
+            });
         });
 
         self.draw_scrollbar(renderer, bounds, offset);
