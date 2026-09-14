@@ -42,6 +42,24 @@ pub enum Dialogue {
     /// trash yet and no undo, so this is the only thing standing between a
     /// keystroke and somebody's work.
     Deleting { paths: Vec<PathBuf>, buffer: usize },
+    /// A job found things already at the other end, and waits for one answer
+    /// that covers all of them.
+    Clashing {
+        job: crate::jobs::Id,
+        work: crate::jobs::Work,
+        clashes: Vec<PathBuf>,
+    },
+    /// Something was dropped on a directory, and it is not obvious which of
+    /// the two things the person meant.
+    ///
+    /// GTK and Qt read a modifier at the drop instead. Both are offered: a
+    /// held Shift or Ctrl answers this without it ever being drawn, and
+    /// without one the question is asked rather than guessed.
+    Dropping {
+        sources: Vec<PathBuf>,
+        into: PathBuf,
+        buffer: usize,
+    },
 }
 
 /// What the person chose.
@@ -59,6 +77,11 @@ pub enum Choice {
     Typing(String),
     /// Delete what was named, for good.
     Delete,
+    /// What to do about every destination that is already there.
+    Resolve(crate::jobs::Resolve),
+    /// Copy what was dropped, or move it.
+    CopyHere,
+    MoveHere,
     Dismiss,
 }
 
@@ -69,8 +92,8 @@ impl Dialogue {
             | Self::Warned { path, .. }
             | Self::Blocked { path, .. }
             | Self::Refused { path, .. } => Some(path),
-            // It is about several, and the view names them itself.
-            Self::Deleting { .. } => None,
+            // These are about several, and the view names them itself.
+            Self::Deleting { .. } | Self::Clashing { .. } | Self::Dropping { .. } => None,
         }
     }
 
@@ -186,6 +209,65 @@ pub fn view<'a>(dialogue: &'a Dialogue, theme: &Theme, typed: &'a str) -> Elemen
                 button(text("Cancel").size(13)).on_press(Choice::Dismiss),
             ]
             .spacing(8),
+        ]
+        .spacing(10)
+        .into(),
+
+        Dialogue::Clashing { work, clashes, .. } => {
+            // One button per answer, each saying what it does. "Apply to
+            // all" is not a tick box here: the question is already asked
+            // once for the whole job, which is the same thing without a
+            // second control to read.
+            let mut answers = row![].spacing(8);
+            for how in crate::jobs::Resolve::ALL {
+                answers =
+                    answers.push(button(text(how.name()).size(13)).on_press(Choice::Resolve(how)));
+            }
+
+            column![
+                heading(format!(
+                    "{} thing{} {} already there",
+                    clashes.len(),
+                    if clashes.len() == 1 { "" } else { "s" },
+                    if clashes.len() == 1 { "is" } else { "are" }
+                )),
+                detail(named(clashes)),
+                detail(format!(
+                    "One answer covers all of them. Nothing is {} until you pick.",
+                    if *work == crate::jobs::Work::Move {
+                        "moved"
+                    } else {
+                        "copied"
+                    }
+                )),
+                answers,
+                button(text("Cancel the job").size(13)).on_press(Choice::Dismiss),
+            ]
+            .spacing(10)
+            .into()
+        }
+
+        Dialogue::Dropping { sources, into, .. } => column![
+            heading(format!(
+                "{} thing{} into {}",
+                sources.len(),
+                if sources.len() == 1 { "" } else { "s" },
+                into.file_name().map_or_else(
+                    || into.display().to_string(),
+                    |name| name.to_string_lossy().into_owned()
+                )
+            )),
+            detail(named(sources)),
+            row![
+                button(text("Copy").size(13)).on_press(Choice::CopyHere),
+                button(text("Move").size(13)).on_press(Choice::MoveHere),
+                button(text("Cancel").size(13)).on_press(Choice::Dismiss),
+            ]
+            .spacing(8),
+            detail(String::from(
+                "Hold Ctrl while you let go to copy, or Shift to move, and this \
+                 is not asked."
+            )),
         ]
         .spacing(10)
         .into(),

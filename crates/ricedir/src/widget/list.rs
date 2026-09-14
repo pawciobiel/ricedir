@@ -136,6 +136,13 @@ pub enum Action {
     /// The row is named so that dragging something not selected drags that
     /// one rather than whatever happened to be selected before.
     DragRow(usize),
+    /// The pointer is over this list while something is being dragged.
+    ///
+    /// `None` means it is past the last row, which is a real answer rather
+    /// than an absent one: dropping on empty space means the directory the
+    /// tile is showing. Sent only while a drag is on, so this is not a
+    /// message per mouse move.
+    Over(Option<usize>),
 }
 
 /// How far the pointer moves before a press on a row becomes a drag.
@@ -174,6 +181,30 @@ struct State {
     /// A row that was pressed, and where, while it is still undecided
     /// whether this is a click or the start of a drag.
     from_row: Option<(usize, Point)>,
+    /// What this list last told the application about where a drop would
+    /// land.
+    ///
+    /// What was *sent*, not what was given back. Comparing against the drawn
+    /// marker instead looks right and is not: moving onto the empty space of
+    /// a tile that is already drawing no marker is "no row" against "no row",
+    /// so nothing was published and a drop into a tile's own directory did
+    /// nothing at all.
+    told: Told,
+}
+
+/// Where this list last said a drop would land.
+///
+/// Three cases, so an enum rather than an `Option<Option<usize>>`: saying
+/// nothing and saying "the tile itself" are different, and only the first
+/// means the next mouse move should report again.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Told {
+    /// Nothing, since the pointer was last over this list.
+    #[default]
+    Nothing,
+    /// The tile's own directory, which is what past the last row means.
+    Tile,
+    Row(usize),
 }
 
 pub struct FileList<'a, Message> {
@@ -192,6 +223,16 @@ pub struct FileList<'a, Message> {
     focused: bool,
     /// Which key does what. Read from the config, with the defaults under it.
     keys: &'a crate::keys::Bindings,
+    /// Whether something is being dragged in the window right now.
+    ///
+    /// The widget cannot know: a drag may have started in another tile or in
+    /// the places panel. Told, because it decides whether the pointer moving
+    /// is worth a message. Without it every list would report every mouse
+    /// move, and each report would run the whole loop.
+    dragging: bool,
+    /// Which row the drop marker is on, when this list is the one under the
+    /// pointer. Drawn as a ring round the directory that would take the drop.
+    over: Option<usize>,
     on_action: Box<dyn Fn(Action) -> Message + 'a>,
 }
 
@@ -222,8 +263,17 @@ impl<'a, Message> FileList<'a, Message> {
             layout: buffer.view.layout,
             icons: list.icons.then_some(icons).flatten(),
             focused,
+            dragging: false,
+            over: None,
             on_action: Box::new(on_action),
         }
+    }
+
+    /// Tell the list that a drag is in the air, and where its marker goes.
+    pub const fn dropping(mut self, dragging: bool, over: Option<usize>) -> Self {
+        self.dragging = dragging;
+        self.over = over;
+        self
     }
 
     /// How many entries sit side by side, and how tall one line of them is.
@@ -574,6 +624,27 @@ where
                     return;
                 }
 
+                // Where a drop would land. Only the list the pointer is
+                // actually over says anything: every list hears every mouse
+                // move, and a list reporting one it did not receive is how
+                // the keyboard ended up in the wrong tile once already.
+                if self.dragging {
+                    match cursor.position_over(bounds) {
+                        Some(point) => {
+                            let row = self.row_at(point, bounds, state.offset);
+                            let said = row.map_or(Told::Tile, Told::Row);
+                            if state.told != said {
+                                state.told = said;
+                                shell.publish((self.on_action)(Action::Over(row)));
+                            }
+                        }
+                        // Gone. Say nothing -- whichever list it moved onto
+                        // reports for itself -- but forget what was said, so
+                        // coming back here is heard again.
+                        None => state.told = Told::Nothing,
+                    }
+                }
+
                 let Some((from, _)) = state.band else {
                     return;
                 };
@@ -592,6 +663,7 @@ where
 
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.from_row = None;
+                state.told = Told::Nothing;
 
                 if state.band.take().is_some() {
                     shell.request_redraw();
@@ -835,6 +907,25 @@ impl<Message> FileList<'_, Message> {
             );
         }
 
+        // The directory a drop would land in. An outline rather than a fill:
+        // the fill is already spoken for by the cursor and the selection, and
+        // a drop target that looked like a selection would say the wrong
+        // thing about what is about to be picked up.
+        if self.over == Some(row) {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds,
+                    border: iced::Border {
+                        color: self.theme.accent.color(),
+                        width: 2.0,
+                        radius: 2.0.into(),
+                    },
+                    ..renderer::Quad::default()
+                },
+                iced::Color::TRANSPARENT,
+            );
+        }
+
         let colour = match entry.kind {
             Kind::Link { broken: true, .. } => self.theme.urgent.color(),
             Kind::Directory
@@ -1018,6 +1109,22 @@ impl<Message> FileList<'_, Message> {
                 } else {
                     self.theme.muted.color()
                 },
+            );
+        }
+
+        // Where a drop would land. See `draw_row` for why it is an outline.
+        if self.over == Some(row) {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: bounds.shrink(4.0),
+                    border: iced::Border {
+                        color: self.theme.accent.color(),
+                        width: 2.0,
+                        radius: 6.0.into(),
+                    },
+                    ..renderer::Quad::default()
+                },
+                iced::Color::TRANSPARENT,
             );
         }
 

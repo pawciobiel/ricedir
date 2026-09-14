@@ -4,7 +4,7 @@
 Mouse-driven, one TOML file, no D-Bus. Built with [iced](https://iced.rs) for
 Hyprland, sway and niri.
 
-> **Early.** You can browse, open files, copy and delete. Move, trash, undo
+> **Early.** You can browse, open files, copy, move and delete. Trash, undo
 > and the agent socket are still to come.
 > [`TODO.md`](TODO.md) is the plan and the design record.
 
@@ -49,10 +49,13 @@ For this reason ricedir has no headless mode. It will never have one.
 | Opening files | The handler table and the scan chain, with four refusals. |
 | Menus | On a file, on empty space, and on a place. Each one is different. |
 | Copying | Into the tile beside this one. Hold, let go, or stop a job while it runs. |
+| Moving | A rename on one disk, a copy and a delete across two. |
+| Drag and drop | Between tiles. It asks copy or move, or hold Ctrl or Shift to say. |
+| Conflicts | Skip, overwrite, keep both, newer only or larger only, asked once. |
 | Deleting | For good, and it asks first. There is no trash yet. |
 | The left panel | Hide it with F9. The choice is remembered. |
 
-Not built yet: move, trash, undo (M2), the agent socket and MCP (M3),
+Not built yet: trash, undo (M2), the agent socket and MCP (M3),
 thumbnails (M7).
 
 ## How it is built

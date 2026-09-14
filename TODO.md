@@ -1463,14 +1463,14 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
 
       Rig: 57 MB byte for byte with the link copied as a link; 3 GB to 32%,
       53%, done; held at 1.3 GB; cancelled at 1.8 GB and named the part file.
-- [ ] **Progress that does not flood the loop.** Workers send bytes-done at
-      most 30 times a second per job, coalesced in the channel drain. A
-      progress message per file would make a copy of 200k small files slower
-      than the copy itself. Throttled at the source, five jobs is 150 messages
-      a second, which costs nothing -- see `## Decided: how a job tells the
-      window what changed`. A worker never touches `App`: it owns a
-      `tokio::sync::mpsc::Sender` and nothing else, and `update` is the only
-      writer.
+- [x] **Progress that does not flood the loop.** Workers send bytes-done at
+      most 30 times a second per job. A message per file would make a copy of
+      200k small files slower than the copy itself.
+
+      Throttled at the source rather than coalesced in the drain: five jobs
+      is then 150 messages a second, which costs nothing, and the drain has
+      nothing left to do. A worker never touches `App`. It owns a
+      `tokio::sync::mpsc::Sender` and nothing else.
 - [x] **Delete, for good, before the trash exists.** A file manager that
       cannot remove anything is not usable daily.
 
@@ -1490,24 +1490,55 @@ panel, adding a favourite, and Okular opening a PDF through flatpak.
       Rig: a symlink was unlinked and its target stayed; cancel changed
       nothing; a directory went with its contents.
 
-- [ ] **Conflicts.** Skip, overwrite, keep both, newer only, and larger only,
-      asked once with an apply-to-all, decided up front where the plan already
-      knows there is a clash.
-- [ ] **Drag between tiles.** Onto a directory in another tile puts it in
-      there; onto empty space puts it in that tile's directory. Copy by
-      default, move with a modifier -- Shift is what GTK and Qt use, and
-      Ctrl is copy, so follow them rather than invent.
+- [x] **Conflicts.** Skip, overwrite, keep both, newer only and larger only,
+      asked once for the whole job. The plan already knows every clash, so
+      the question comes before any byte moves.
 
-      The parts are built: `Dragging` names its source, the 6 px threshold
-      tells a click from a drag, and `Action::Copy { buffer, into }` already
-      takes a destination. What is missing is the target half -- a listing
-      has to say which row the pointer is over -- and move itself.
+      **A clashing step is kept, not dropped.** It carries whether the source
+      is newer and whether it is bigger, both measured during the walk.
+      `Plan::resolve` then answers without a second walk and without a stat
+      on the Elm loop. Its bytes stay out of the total until the answer says
+      it will happen, so the bar is right for "skip" without doing anything.
 
-      Read the modifier at the drop, not at the press. People reach for
-      Shift after they have started dragging.
+      A job with clashes waits in `State::Asking`. Nothing is guessed, and
+      cancelling the dialogue cancels the job.
 
-      A drag between filesystems cannot be a rename, so a move there is a
-      copy and a delete. Say which it will be before it starts.
+      Rig: `notes.txt` onto a `notes.txt` gave `notes (2).txt` holding the
+      source, and left the original alone.
+- [x] **Move.** `Work::Move`, beside copy and delete.
+
+      On one filesystem it is a `rename`: one step for a whole tree, whatever
+      it holds, and no byte read. Across two it cannot be, so it becomes the
+      copy steps followed by a removal of each source.
+
+      **`rename` replaces a file at the destination without a word**, so a
+      move has to catch a clash itself rather than leave it to the syscall.
+      It is checked again at the step, in case something arrived while the
+      job waited to be answered.
+
+      **A failed copy removes nothing.** One failure anywhere drops every
+      removal in a cross-filesystem move. Leaving a file in both places beats
+      leaving it in neither, and working out which source a failure belonged
+      to would mean the plan carrying a tree of its own.
+
+- [x] **Drag between tiles.** Onto a directory puts it in there; anywhere
+      else in the tile puts it in that tile's directory.
+
+      **A dialogue asks copy, move or cancel.** GTK and Qt read a modifier
+      instead. Both work: Ctrl copies and Shift moves without the question
+      being drawn. The dialogue is the default because copy and move are not
+      the same mistake, and a modifier nobody knows about is not an answer.
+      Read at the drop, not at the press -- people reach for it after they
+      have started.
+
+      **The widget reports what it last *sent*, not what it was given.**
+      Comparing against the drawn marker looks right and is not: moving onto
+      the empty space of a tile that draws no marker is `None` against
+      `None`, so nothing was published and the drop did nothing at all.
+
+      A drop target is not an action on the tile it crosses. Every other
+      message from a list focuses its tile; this one must not, or letting go
+      would act on the wrong tile's selection.
 
       Inside this window only. winit cannot drag out to another application
       on Wayland.

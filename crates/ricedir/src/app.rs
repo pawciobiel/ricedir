@@ -52,10 +52,21 @@ impl Tiles {
 /// the row under the pointer as hovered.
 #[derive(Debug, Clone)]
 pub struct Dragging {
-    /// Directories only. A file cannot be a place, and picking one up would
-    /// promise a drop that is refused at the end.
+    /// What was picked up. Anything at all when it came from a listing;
+    /// directories only from the places panel, where a file cannot be a
+    /// place and picking one up would promise a drop that is refused.
     pub paths: Vec<PathBuf>,
     pub source: Source,
+    /// Which buffer it was picked up from, when it came from a listing.
+    ///
+    /// A drop back into the same directory would be a job with nothing to do,
+    /// so the destination is checked against this before anything is made.
+    pub from: Option<usize>,
+    /// Which tile the pointer is over, and which row inside it.
+    ///
+    /// `Some((buffer, None))` is the tile's own directory, which is what
+    /// empty space below the last row means.
+    pub over: Option<(usize, Option<usize>)>,
 }
 
 /// Where a drag started, which is what decides what a drop means.
@@ -193,6 +204,8 @@ pub struct App {
     dragging: Option<Dragging>,
     /// A press on a place that is not yet a click or a drag.
     pressed: Option<Pressed>,
+    /// Which modifiers are held, window-wide. A drop reads them as it lands.
+    modifiers: iced::keyboard::Modifiers,
     /// The place the pointer is over, as an index into `places`.
     ///
     /// `places.len()` means the strip under the last one, which is how
@@ -268,6 +281,8 @@ pub enum Message {
     /// The left button came up, anywhere. This finishes a drag and settles
     /// whether a press on a place was a click.
     Released,
+    /// Which modifiers are held now.
+    Modifiers(iced::keyboard::Modifiers),
     /// A breadcrumb, or back, forward, up.
     Go(usize, PathBuf),
     Back(usize),
@@ -330,6 +345,7 @@ pub fn new(mut config: Config, start: PathBuf) -> (App, Task<Message>) {
         jobs: jobs::Queue::new(workers),
         tick: 0,
         dragging: None,
+        modifiers: iced::keyboard::Modifiers::default(),
         pressed: None,
         over_place: None,
     };
@@ -393,6 +409,17 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 }
             }
 
+            Task::none()
+        }
+
+        // Where a drop would land, while the pointer is still moving. Not an
+        // action and not a focus change: hovering must not take the keyboard
+        // off the tile a person dragged *from*, or letting go would act on
+        // the wrong selection.
+        Message::List(index, list::Action::Over(row)) => {
+            if let Some(dragging) = &mut app.dragging {
+                dragging.over = Some((index, row));
+            }
             Task::none()
         }
 
@@ -481,18 +508,26 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             // nothing, or a destination that is not there, is the answer to
             // a question somebody asked and has to reach them.
             match &made {
-                Ok(plan) if !plan.clashes.is_empty() => {
-                    let clashes = plan.clashes.len();
-                    app.notice = Some(format!(
-                        "{}; {clashes} already there and left alone",
-                        plan.describe()
-                    ));
-                }
                 Ok(plan) => app.notice = Some(plan.describe()),
                 Err(why) => app.notice = Some(why.clone()),
             }
 
             app.jobs.planned(id, made);
+
+            // A plan that found something already at the other end stops and
+            // asks. One dialogue for the whole job, and nothing runs until it
+            // is answered.
+            if let Some(job) = app.jobs.get(id)
+                && job.state == jobs::State::Asking
+                && let Some(plan) = &job.plan
+            {
+                app.dialogue = Some(Dialogue::Clashing {
+                    job: id,
+                    work: plan.work,
+                    clashes: plan.clashes.clone(),
+                });
+            }
+
             app.jobs.start_ready().map(Message::Job)
         }
 
@@ -512,6 +547,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             } else {
                 Task::none()
             }
+        }
+
+        Message::Modifiers(modifiers) => {
+            app.modifiers = modifiers;
+            Task::none()
         }
 
         Message::Pointer(x, y) => {
@@ -794,6 +834,9 @@ const fn translate(
     } = view;
 
     match found {
+        // Handled before this, in `Message::List`, because it must not focus
+        // the tile it passes over. It cannot reach here.
+        list::Action::Over(_) => Action::Cursor,
         list::Action::Select(row) => Action::Select { buffer, row },
         list::Action::Toggle(row) => Action::Toggle { buffer, row },
         list::Action::Extend(row) => Action::Extend { buffer, row },
@@ -929,6 +972,8 @@ fn pick_up_place(app: &mut App) {
     app.dragging = Some(Dragging {
         paths: vec![place.path.clone()],
         source: Source::Place,
+        from: None,
+        over: None,
     });
 }
 
@@ -973,6 +1018,67 @@ fn lands_here(app: &App, at: usize) -> bool {
             .is_some_and(|from| lands(&app.places, at, from) != Lands::Nowhere)
 }
 
+/// A drop on a listing: work out where it lands, and ask what it means.
+///
+/// A row that is a directory takes the drop; anything else means the
+/// directory the tile is showing, which is also what empty space below the
+/// last row means.
+///
+/// The modifier is read at the drop rather than at the press, because people
+/// reach for it after they have started dragging. Without one the question is
+/// asked, because copy and move are not the same mistake.
+fn drop_into(
+    app: &mut App,
+    dragging: &Dragging,
+    buffer: usize,
+    row: Option<usize>,
+) -> Task<Message> {
+    let Some(found) = app.buffers.get(buffer) else {
+        return Task::none();
+    };
+
+    let into = row
+        .and_then(|row| found.at(row))
+        .filter(|entry| entry.kind.is_directory())
+        .map_or_else(|| found.path.clone(), |entry| entry.path.clone());
+
+    // Onto itself, or into where it already is. Both are a job that would do
+    // nothing, and saying so beats a row in the panel that reports success.
+    let sources: Vec<PathBuf> = dragging
+        .paths
+        .iter()
+        .filter(|path| path.parent() != Some(into.as_path()) && *path != &into)
+        .cloned()
+        .collect();
+
+    if sources.is_empty() {
+        return Task::none();
+    }
+
+    // The job is made here rather than through `Action::Copy`, because that
+    // one reads the tile's selection and a drag carries its own paths: a row
+    // that was not selected drags only itself. The same shape as
+    // `Choice::Delete`, where the dialogue answer makes the job and the
+    // action was only what asked.
+    let held = app.modifiers;
+    if held.control() || held.shift() {
+        let work = if held.shift() {
+            jobs::Work::Move
+        } else {
+            jobs::Work::Copy
+        };
+        let (_, planning) = app.jobs.add(work, sources, into);
+        return planning.map(Message::Job);
+    }
+
+    app.dialogue = Some(Dialogue::Dropping {
+        sources,
+        into,
+        buffer,
+    });
+    Task::none()
+}
+
 /// End a drag, and do whatever it turned out to be.
 ///
 /// Both ends report a release -- the list widget captures its own, and the
@@ -982,6 +1088,14 @@ fn finish_drag(app: &mut App) -> Task<Message> {
     let Some(dragging) = app.dragging.take() else {
         return Task::none();
     };
+
+    // Dropped on a listing. The panel is checked after, so a pointer over a
+    // tile is never also read as a drop on the places panel.
+    if dragging.source == Source::List
+        && let Some((buffer, row)) = dragging.over
+    {
+        return drop_into(app, &dragging, buffer, row);
+    }
 
     // Dropped somewhere that is not the panel. Nothing happens, quietly:
     // a drag that lands nowhere is how a drag is called off.
@@ -1247,14 +1361,15 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
                     .collect()
             };
 
-            // Directories only. A file cannot be a place, so picking one up
-            // would promise a drop that is refused when it lands.
-            let paths: Vec<PathBuf> = paths.into_iter().filter(|path| path.is_dir()).collect();
-
+            // Anything at all. The places panel takes only directories and
+            // says so when a file lands on it; another tile takes whatever
+            // it is given, which is the ordinary reason to drag a file.
             if !paths.is_empty() {
                 app.dragging = Some(Dragging {
                     paths,
                     source: Source::List,
+                    from: Some(buffer),
+                    over: None,
                 });
             }
             Task::none()
@@ -1435,6 +1550,21 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
 
             let (_, planning) = app.jobs.add(jobs::Work::Copy, sources, into);
             planning.map(Message::Job)
+        }
+
+        Action::Move { buffer, into } => {
+            let Some(sources) = chosen(app, buffer) else {
+                return refuse(app, String::from("nothing is selected"));
+            };
+
+            let (_, planning) = app.jobs.add(jobs::Work::Move, sources, into);
+            planning.map(Message::Job)
+        }
+
+        Action::Resolve { job, how } => {
+            app.jobs.resolve(job, how);
+            app.dialogue = None;
+            app.jobs.start_ready().map(Message::Job)
         }
 
         Action::Delete { buffer } => {
@@ -1721,9 +1851,31 @@ fn chose(app: &mut App, choice: Choice) -> Task<Message> {
             Task::none()
         }
 
+        // Cancelling the question cancels the job. A job left in `Asking`
+        // would sit in the panel for ever, holding a plan nobody answered.
+        (Choice::Dismiss, Dialogue::Clashing { job, .. }) => {
+            app.typed.clear();
+            app.jobs.cancel(job);
+            Task::none()
+        }
+
         (Choice::Dismiss, _) => {
             app.typed.clear();
             Task::none()
+        }
+
+        (Choice::Resolve(how), Dialogue::Clashing { job, .. }) => {
+            Task::done(Message::Act(Action::Resolve { job, how }))
+        }
+
+        (Choice::CopyHere, Dialogue::Dropping { sources, into, .. }) => {
+            let (_, planning) = app.jobs.add(jobs::Work::Copy, sources, into);
+            planning.map(Message::Job)
+        }
+
+        (Choice::MoveHere, Dialogue::Dropping { sources, into, .. }) => {
+            let (_, planning) = app.jobs.add(jobs::Work::Move, sources, into);
+            planning.map(Message::Job)
         }
 
         (Choice::Delete, Dialogue::Deleting { paths, buffer }) => {
@@ -1951,6 +2103,23 @@ fn tile<'a>(app: &'a App, index: usize, buffer: &'a Buffer, focused: bool) -> El
         move |action| Message::List(index, action),
     );
 
+    // Only the tile the pointer is over wears the marker, and only a row
+    // that could actually take a drop: a file cannot, and the marker would
+    // then promise something that does not happen.
+    let dragging = app
+        .dragging
+        .as_ref()
+        .filter(|dragging| dragging.source == Source::List);
+    let over = dragging.and_then(|dragging| match dragging.over {
+        Some((tile, row)) if tile == index => row.filter(|row| {
+            buffer
+                .at(*row)
+                .is_some_and(|entry| entry.kind.is_directory())
+        }),
+        _ => None,
+    });
+    let list = list.dropping(dragging.is_some(), over);
+
     let mut page = column![path_bar(app, index, buffer, focused)];
 
     if buffer.filtering && focused {
@@ -2053,6 +2222,12 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
         match event {
             iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                 Some(Message::Pointer(position.x, position.y))
+            }
+            // Which modifiers are held, window-wide. A drop reads them at the
+            // moment it lands, and by then the pointer may be over a tile
+            // that never saw the key go down.
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+                Some(Message::Modifiers(modifiers))
             }
             // Every release, wherever it lands. A drag that ends outside the
             // panel has to be called off, and the panel never hears about
@@ -2813,6 +2988,13 @@ fn context_menu<'a>(app: &'a App, menu: &'a Menu) -> Element<'a, Message> {
                 format!("Copy to {name}"),
                 Message::Act(Action::Copy {
                     buffer: menu.buffer,
+                    into: into.clone(),
+                }),
+            ));
+            items = items.push(item(
+                format!("Move to {name}"),
+                Message::Act(Action::Move {
+                    buffer: menu.buffer,
                     into,
                 }),
             ));
@@ -3369,6 +3551,7 @@ mod tests {
             jobs: jobs::Queue::new(2),
             tick: 0,
             dragging: None,
+            modifiers: iced::keyboard::Modifiers::default(),
             pressed: None,
             over_place: None,
         }
@@ -3388,6 +3571,122 @@ mod tests {
             // reason, or fail for one.
             hidden: name.starts_with('.'),
         }
+    }
+
+    /// A drag carrying two tiles, ready to be dropped.
+    ///
+    /// Buffer 0 shows `/tmp/one` and holds a directory called `pictures`;
+    /// buffer 1 shows `/tmp/two`, which is where the drag comes from.
+    fn dragging(over: Option<(usize, Option<usize>)>) -> App {
+        let mut app = app();
+        let start = Config::default().list.view();
+        app.buffers
+            .push(Buffer::new(PathBuf::from("/tmp/two"), start));
+        // Directories sort first, so `pictures` is row 0 and `notes.txt` is
+        // row 1 -- which is what the drop tests below name.
+        let list = Config::default().list;
+        app.buffers[0].extend(
+            vec![
+                entry("pictures", Kind::Directory),
+                entry("notes.txt", Kind::File),
+            ],
+            &list,
+        );
+        app.buffers[0].finish(&list);
+
+        app.dragging = Some(Dragging {
+            paths: vec![PathBuf::from("/tmp/two/holiday.jpg")],
+            source: Source::List,
+            from: Some(1),
+            over,
+        });
+        app
+    }
+
+    /// Dropped on a directory, the drop goes inside it. Dropped anywhere
+    /// else in the tile it goes into the directory the tile is showing.
+    #[test]
+    fn where_a_drop_lands_is_the_row_or_the_tile() {
+        // On `pictures`, which is a directory.
+        let mut app = dragging(Some((0, Some(0))));
+        tell(&mut app, Message::Released);
+        let Some(Dialogue::Dropping { into, sources, .. }) = app.dialogue.clone() else {
+            panic!("a drop with no modifier asks");
+        };
+        assert_eq!(into, PathBuf::from("/tmp/one/pictures"));
+        assert_eq!(sources, [PathBuf::from("/tmp/two/holiday.jpg")]);
+
+        // On `notes.txt`, which is not. A file cannot take a drop, so this
+        // means the directory the tile is showing.
+        let mut app = dragging(Some((0, Some(1))));
+        tell(&mut app, Message::Released);
+        let Some(Dialogue::Dropping { into, .. }) = app.dialogue.clone() else {
+            panic!("a drop on a file still lands somewhere");
+        };
+        assert_eq!(into, PathBuf::from("/tmp/one"));
+
+        // Past the last row.
+        let mut app = dragging(Some((0, None)));
+        tell(&mut app, Message::Released);
+        let Some(Dialogue::Dropping { into, .. }) = app.dialogue else {
+            panic!("empty space is the tile's own directory");
+        };
+        assert_eq!(into, PathBuf::from("/tmp/one"));
+    }
+
+    /// A modifier answers the question without it being asked. Read at the
+    /// drop, because people reach for it after they start dragging.
+    #[test]
+    fn a_held_modifier_skips_the_question() {
+        let mut app = dragging(Some((0, Some(0))));
+        app.modifiers = iced::keyboard::Modifiers::CTRL;
+        tell(&mut app, Message::Released);
+        assert!(app.dialogue.is_none(), "Ctrl means copy, and asks nothing");
+        assert_eq!(app.jobs.iter().count(), 1, "and a job was made");
+
+        let mut app = dragging(Some((0, Some(0))));
+        app.modifiers = iced::keyboard::Modifiers::SHIFT;
+        tell(&mut app, Message::Released);
+        assert!(app.dialogue.is_none(), "Shift means move");
+        assert_eq!(app.jobs.iter().count(), 1);
+    }
+
+    /// Dropping something back where it already is would make a job that
+    /// does nothing, and a panel row that reports success for it.
+    #[test]
+    fn a_drop_where_it_already_is_does_nothing() {
+        let mut app = dragging(Some((0, None)));
+        app.dragging.as_mut().expect("dragging").paths = vec![PathBuf::from("/tmp/one/notes.txt")];
+
+        tell(&mut app, Message::Released);
+
+        assert!(app.dialogue.is_none(), "nothing is asked");
+        assert_eq!(app.jobs.iter().count(), 0, "and no job is made");
+    }
+
+    /// Reporting a drop target is not an action on the tile it passes over.
+    ///
+    /// Every other message from a list focuses its tile and goes through the
+    /// registry. This one must not: hovering would take the keyboard off the
+    /// tile the drag came from, and letting go would act on the wrong
+    /// tile's selection.
+    #[test]
+    fn a_drop_target_is_not_an_action_on_the_tile() {
+        let mut app = dragging(None);
+        let was = app.buffers[0].cursor;
+
+        tell(&mut app, Message::List(0, list::Action::Over(Some(1))));
+
+        assert_eq!(app.buffers[0].cursor, was, "the cursor did not move");
+        assert!(
+            app.buffers[0].selected().next().is_none(),
+            "and nothing was selected"
+        );
+        assert_eq!(
+            app.dragging.as_ref().and_then(|dragging| dragging.over),
+            Some((0, Some(1))),
+            "but the target was noted"
+        );
     }
 
     /// A view belongs to one buffer. Two tiles side by side wanting different

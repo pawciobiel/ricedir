@@ -247,6 +247,23 @@ pub enum Action {
         buffer: usize,
         into: PathBuf,
     },
+    /// Move what is selected into another directory.
+    ///
+    /// The same shape as [`Self::Copy`]. On one filesystem the job renames,
+    /// which is one syscall whatever the tree holds; across two it copies and
+    /// then removes, and never removes what did not arrive.
+    Move {
+        buffer: usize,
+        into: PathBuf,
+    },
+    /// Say what to do about the destinations a job found already there.
+    ///
+    /// One answer for the whole job. The job waits in `State::Asking` until
+    /// this arrives, so nothing is guessed.
+    Resolve {
+        job: crate::jobs::Id,
+        how: crate::jobs::Resolve,
+    },
     /// Remove what is selected, for good.
     ///
     /// Asks first, and the dialogue is not a formality: there is no trash and
@@ -307,10 +324,13 @@ impl Action {
             | Self::PauseJob { .. }
             | Self::ResumeJob { .. }
             | Self::CancelJob { .. }
-            | Self::DismissJob { .. } => Kind::View,
+            | Self::DismissJob { .. }
+            // Answering a clash starts no work of its own. The job it
+            // answers was already accepted; this only says how.
+            | Self::Resolve { .. } => Kind::View,
 
             // The ones that change what is on the disk.
-            Self::Copy { .. } | Self::Delete { .. } => Kind::File,
+            Self::Copy { .. } | Self::Move { .. } | Self::Delete { .. } => Kind::File,
 
             // A bookmark writes a file, but ricedir's own, not one of the
             // person's. Nothing in the plan mechanism is about protecting

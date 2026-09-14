@@ -47,10 +47,16 @@ pub struct Id(pub u64);
 /// What a job does.
 ///
 /// One kind per job. Copy came first because it only ever creates, so a fault
-/// in a new engine could not cost anybody a file. Move and trash follow.
+/// in a new engine could not cost anybody a file. Trash follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Work {
     Copy,
+    /// Copy, then take the original away.
+    ///
+    /// On one filesystem this is a rename: one syscall for a whole tree,
+    /// whatever it holds. Across two it cannot be, so it becomes a copy and
+    /// a delete, and the plan says which it turned out to be.
+    Move,
     /// Remove, for good. There is no trash yet and no undo, so a person is
     /// asked before a job of this kind is ever made -- see `Dialogue`.
     Delete,
@@ -60,6 +66,7 @@ impl Work {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Copy => "Copy",
+            Self::Move => "Move",
             Self::Delete => "Delete",
         }
     }
@@ -71,6 +78,76 @@ pub struct Step {
     pub from: PathBuf,
     pub to: PathBuf,
     pub what: What,
+    /// Something is already at `to`. The step does nothing until a person
+    /// answers; see [`Plan::resolve`].
+    pub clash: Option<Clash>,
+    /// Take away what is at `to` first. Only [`Plan::resolve`] sets this.
+    pub replace: bool,
+}
+
+impl Step {
+    /// A step with nothing in the way.
+    const fn plain(from: PathBuf, to: PathBuf, what: What) -> Self {
+        Self {
+            from,
+            to,
+            what,
+            clash: None,
+            replace: false,
+        }
+    }
+}
+
+/// What is already at a destination, measured against what would replace it.
+///
+/// Both answers are worked out during the walk, while the plan is on a
+/// thread. Asking again at the moment a person picks "newer only" would mean
+/// a stat per clash on the Elm loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Clash {
+    /// The source was changed more recently than what is there.
+    pub newer: bool,
+    /// The source holds more bytes than what is there.
+    pub larger: bool,
+}
+
+/// What to do about every destination that is already there.
+///
+/// One answer for the whole job. Asking per file is how a copy of a thousand
+/// entries becomes a thousand dialogues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolve {
+    /// Leave what is there. The source is not copied.
+    Skip,
+    /// Replace what is there.
+    Overwrite,
+    /// Keep both, by giving the arrival a free name beside the other.
+    KeepBoth,
+    /// Replace only where the source was changed more recently.
+    Newer,
+    /// Replace only where the source is bigger.
+    Larger,
+}
+
+impl Resolve {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Skip => "Skip",
+            Self::Overwrite => "Overwrite",
+            Self::KeepBoth => "Keep both",
+            Self::Newer => "Newer only",
+            Self::Larger => "Larger only",
+        }
+    }
+
+    /// Every answer, in the order the dialogue offers them.
+    pub const ALL: [Self; 5] = [
+        Self::Skip,
+        Self::Overwrite,
+        Self::KeepBoth,
+        Self::Newer,
+        Self::Larger,
+    ];
 }
 
 /// What a step makes at the other end.
@@ -106,6 +183,10 @@ pub enum What {
         /// What the walk found under it, for the bar.
         bytes: u64,
     },
+    /// Move on one filesystem: one `rename` for a whole tree, whatever it
+    /// holds. `bytes` is only what the walk counted, so the bar still means
+    /// something; no byte is read or written.
+    Rename(u64),
 }
 
 /// Everything a job will do, worked out before it starts.
@@ -118,11 +199,11 @@ pub struct Plan {
     /// What the files add up to. Directories and links count as nothing,
     /// which is what makes a percentage mean anything on a real tree.
     pub bytes: u64,
-    /// Destinations that are already there, and are therefore left alone.
+    /// Destinations that are already there and have not been answered for.
     ///
-    /// Refusing is the only safe answer until the conflict policies arrive:
-    /// skip, overwrite and keep-both are a question for a person, and
-    /// guessing it is how a file manager eats somebody's work.
+    /// Empty once [`Plan::resolve`] has run. Nothing is guessed: a job with
+    /// anything in this list waits in [`State::Asking`], because guessing is
+    /// how a file manager eats somebody's work.
     pub clashes: Vec<PathBuf>,
     /// What the walk could not read, and why. The job still runs.
     pub skipped: Vec<(PathBuf, String)>,
@@ -137,6 +218,56 @@ impl Plan {
     /// Whether the plan would do nothing at all.
     pub const fn is_empty(&self) -> bool {
         self.steps.is_empty()
+    }
+
+    /// Apply one answer to every destination that is already there.
+    ///
+    /// The walk kept the clashing steps rather than dropping them, so this
+    /// needs no second walk and no second stat. A step that is not kept goes,
+    /// and only the kept ones add to `bytes` -- `plan()` leaves a clashing
+    /// step out of the total, so "skip" is what the bar already assumed.
+    pub fn resolve(&mut self, how: Resolve) {
+        let mut taken: Vec<PathBuf> = Vec::new();
+
+        self.steps.retain_mut(|step| {
+            let Some(clash) = step.clash else {
+                return true;
+            };
+
+            let keep = match how {
+                Resolve::Skip => false,
+                Resolve::Overwrite | Resolve::KeepBoth => true,
+                Resolve::Newer => clash.newer,
+                Resolve::Larger => clash.larger,
+            };
+
+            if !keep {
+                return false;
+            }
+
+            step.clash = None;
+            if how == Resolve::KeepBoth {
+                step.to = beside(&step.to, &taken);
+                taken.push(step.to.clone());
+            } else {
+                step.replace = true;
+            }
+            true
+        });
+
+        // Only now, because `beside` may have moved a step somewhere that
+        // costs the same but the skipped ones cost nothing.
+        self.bytes += self
+            .steps
+            .iter()
+            .filter(|step| step.replace || taken.contains(&step.to))
+            .map(|step| match step.what {
+                What::File(bytes) | What::Rename(bytes) => bytes,
+                _ => 0,
+            })
+            .sum::<u64>();
+
+        self.clashes.clear();
     }
 
     /// One line saying what this will do, for the panel and the notice.
@@ -169,6 +300,9 @@ impl Plan {
 pub enum State {
     /// Being worked out. No byte has moved and cancelling costs nothing.
     Planning,
+    /// Planned, and waiting for a person to say what to do about the
+    /// destinations that are already there. Nothing runs until they answer.
+    Asking,
     /// Planned, waiting for a worker.
     Queued,
     Running,
@@ -298,6 +432,7 @@ impl Job {
             ),
             State::Paused => format!("{} \u{2014} held", self.work.name()),
             State::Queued => format!("{} \u{2014} waiting", self.work.name()),
+            State::Asking => format!("{} \u{2014} asking", self.work.name()),
             State::Running => {
                 let percent = (self.fraction() * 100.0) as u8;
                 format!("{} {percent}%", self.work.name())
@@ -409,11 +544,45 @@ impl Queue {
                 job.plan = Some(plan);
             }
             Ok(plan) => {
+                job.state = if plan.clashes.is_empty() {
+                    State::Queued
+                } else {
+                    State::Asking
+                };
                 job.plan = Some(plan);
-                job.state = State::Queued;
             }
             Err(why) => job.state = State::Failed(why),
         }
+    }
+
+    /// Answer the clashes on a job, and let it go.
+    ///
+    /// A plan that resolves to nothing at all fails rather than running: a
+    /// job that skipped every one of its steps did nothing, and saying so
+    /// beats a bar that jumps to done.
+    pub fn resolve(&mut self, id: Id, how: Resolve) {
+        let Some(job) = self.find(id) else {
+            return;
+        };
+        if job.state != State::Asking {
+            return;
+        }
+
+        let Some(plan) = &mut job.plan else {
+            return;
+        };
+
+        plan.resolve(how);
+        job.state = if plan.is_empty() {
+            State::Failed(String::from("there was nothing left to do"))
+        } else {
+            State::Queued
+        };
+    }
+
+    /// The job, if any, that is waiting to be asked about its clashes.
+    pub fn asking(&self) -> Option<&Job> {
+        self.jobs.iter().find(|job| job.state == State::Asking)
     }
 
     /// Start whatever is waiting, up to the worker count.
@@ -589,7 +758,7 @@ fn working(id: Id, plan: Plan, control: Arc<Control>) -> Task<Message> {
 ///
 /// Blocking, and never called from `update`.
 pub fn plan(work: Work, sources: &[PathBuf], into: &Path) -> Result<Plan, String> {
-    if work == Work::Copy && !into.is_dir() {
+    if work != Work::Delete && !into.is_dir() {
         return Err(format!("{} is not a directory", into.display()));
     }
 
@@ -609,6 +778,11 @@ pub fn plan(work: Work, sources: &[PathBuf], into: &Path) -> Result<Plan, String
         return Ok(plan);
     }
 
+    // A move that stays on one filesystem is a rename, which is one syscall
+    // however big the tree is. Asked here rather than at the moment of the
+    // move, so the plan can say which of the two this turned out to be.
+    let landing = device(into);
+
     for source in sources {
         // Into itself, or into something inside itself. Both copy for ever,
         // and the second is the one nobody sees coming.
@@ -625,10 +799,132 @@ pub fn plan(work: Work, sources: &[PathBuf], into: &Path) -> Result<Plan, String
             continue;
         };
 
-        walk(source, &into.join(name), 0, &mut plan);
+        let to = into.join(name);
+
+        if source.parent() == Some(into) {
+            plan.skipped
+                .push((source.clone(), String::from("it is already there")));
+            continue;
+        }
+
+        if work == Work::Move && landing.is_some() && device(source) == landing {
+            rename(source, &to, &mut plan);
+            continue;
+        }
+
+        walk(source, &to, 0, &mut plan);
+
+        // Across two filesystems a move cannot be a rename, so it is a copy
+        // and then a delete. The removals go last, and `carry_out` drops them
+        // if any step failed: a move must never take the original away when
+        // the copy did not arrive.
+        if work == Work::Move {
+            plan.steps.push(Step::plain(
+                source.clone(),
+                source.clone(),
+                What::Remove {
+                    tree: source.is_dir(),
+                    bytes: 0,
+                },
+            ));
+        }
     }
 
     Ok(plan)
+}
+
+/// Which filesystem a path is on, or `None` if it cannot be read.
+fn device(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::metadata(path).ok().map(|found| found.dev())
+}
+
+/// A move on one filesystem: one step, whatever the tree holds.
+fn rename(from: &Path, to: &Path, plan: &mut Plan) {
+    let found = match crate::entry::Entry::read(from.to_path_buf()) {
+        Ok(found) => found,
+        Err(error) => {
+            plan.skipped.push((from.to_path_buf(), error.to_string()));
+            return;
+        }
+    };
+
+    // The walk is only for the bar, the same as a delete. A rename moves a
+    // whole tree without reading a byte of it.
+    let bytes = if found.kind == Kind::Directory {
+        under(from, 0, plan)
+    } else {
+        found.size
+    };
+
+    let mut step = Step::plain(from.to_path_buf(), to.to_path_buf(), What::Rename(bytes));
+
+    // `rename` replaces a file at the destination without a word, so a clash
+    // has to be caught here rather than left to the syscall.
+    match clash(&found, to) {
+        Ok(None) => plan.bytes += bytes,
+        Ok(Some(found)) => {
+            step.clash = Some(found);
+            plan.clashes.push(to.to_path_buf());
+        }
+        Err(why) => {
+            plan.skipped.push((from.to_path_buf(), why));
+            return;
+        }
+    }
+
+    plan.steps.push(step);
+}
+
+/// What is already at `to`, measured against what would replace it.
+///
+/// `Ok(None)` means the way is clear. An error means this pair can never be
+/// resolved, whatever a person answers, so the step is dropped instead.
+fn clash(source: &crate::entry::Entry, to: &Path) -> Result<Option<Clash>, String> {
+    let Ok(there) = to.symlink_metadata() else {
+        return Ok(None);
+    };
+
+    if there.is_dir() {
+        return Err(String::from("a directory is already there"));
+    }
+
+    // A time that cannot be read counts as older, so "newer only" copies
+    // rather than silently doing nothing.
+    let newer = match (source.modified, there.modified().ok()) {
+        (Some(mine), Some(theirs)) => mine > theirs,
+        _ => true,
+    };
+
+    Ok(Some(Clash {
+        newer,
+        larger: source.size > there.len(),
+    }))
+}
+
+/// A free name beside `path`: `note.txt`, then `note (2).txt`.
+///
+/// `taken` is what this plan has already claimed and not yet written, so two
+/// clashes on one name do not both land on `(2)`. If nothing is free the
+/// original comes back unchanged, and the step then fails on `create_new`
+/// and is reported -- which loses nothing, unlike guessing.
+fn beside(path: &Path, taken: &[PathBuf]) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+
+    // A leading dot is part of the name, not an extension: `.bashrc` is all
+    // stem. `archive.tar.gz` keeps only the last suffix, which is what every
+    // other file manager does.
+    let (stem, extension) = match name.rfind('.') {
+        Some(at) if at > 0 => (&name[..at], &name[at..]),
+        _ => (name.as_ref(), ""),
+    };
+
+    (2..10_000)
+        .map(|number| parent.join(format!("{stem} ({number}){extension}")))
+        .find(|candidate| !taken.contains(candidate) && candidate.symlink_metadata().is_err())
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 /// One thing to delete, and a count of what is under it.
@@ -656,11 +952,11 @@ fn count(path: &Path, depth: usize, plan: &mut Plan) {
     };
 
     plan.bytes += bytes;
-    plan.steps.push(Step {
-        from: path.to_path_buf(),
-        to: path.to_path_buf(),
-        what: What::Remove { tree, bytes },
-    });
+    plan.steps.push(Step::plain(
+        path.to_path_buf(),
+        path.to_path_buf(),
+        What::Remove { tree, bytes },
+    ));
 }
 
 /// What a directory holds, in bytes. Counted, never touched.
@@ -713,16 +1009,24 @@ fn walk(from: &Path, to: &Path, depth: usize, plan: &mut Plan) {
 
     // Already there. A directory is merged into, which is what every file
     // manager does and what makes copying into a half-copied tree work.
-    // Anything else is a question for a person, so it is left alone.
+    // Anything else is a question for a person.
     let there = to.symlink_metadata();
     match found.kind {
         Kind::Directory => {
-            if there.is_err() {
-                plan.steps.push(Step {
-                    from: from.to_path_buf(),
-                    to: to.to_path_buf(),
-                    what: What::Directory,
-                });
+            if let Ok(there) = &there {
+                if !there.is_dir() {
+                    plan.skipped.push((
+                        from.to_path_buf(),
+                        String::from("a file of that name is already there"),
+                    ));
+                    return;
+                }
+            } else {
+                plan.steps.push(Step::plain(
+                    from.to_path_buf(),
+                    to.to_path_buf(),
+                    What::Directory,
+                ));
             }
 
             let listing = match std::fs::read_dir(from) {
@@ -740,25 +1044,41 @@ fn walk(from: &Path, to: &Path, depth: usize, plan: &mut Plan) {
             }
         }
 
-        _ if there.is_ok() => plan.clashes.push(to.to_path_buf()),
+        Kind::File | Kind::Link { .. } => {
+            let what = if found.kind == Kind::File {
+                What::File(found.size)
+            } else {
+                match std::fs::read_link(from) {
+                    Ok(target) => What::Link(target),
+                    Err(error) => {
+                        plan.skipped.push((from.to_path_buf(), error.to_string()));
+                        return;
+                    }
+                }
+            };
 
-        Kind::File => {
-            plan.bytes += found.size;
-            plan.steps.push(Step {
-                from: from.to_path_buf(),
-                to: to.to_path_buf(),
-                what: What::File(found.size),
-            });
+            let mut step = Step::plain(from.to_path_buf(), to.to_path_buf(), what);
+
+            // A clashing step is kept rather than dropped, so answering it
+            // later needs no second walk. Its bytes stay out of the total
+            // until `Plan::resolve` says it will happen.
+            match clash(&found, to) {
+                // A link counts as nothing, the same as a directory: a
+                // percentage only means something if it is bytes that move.
+                Ok(None) if found.kind == Kind::File => plan.bytes += found.size,
+                Ok(None) => {}
+                Ok(Some(found)) => {
+                    step.clash = Some(found);
+                    plan.clashes.push(to.to_path_buf());
+                }
+                Err(why) => {
+                    plan.skipped.push((from.to_path_buf(), why));
+                    return;
+                }
+            }
+
+            plan.steps.push(step);
         }
-
-        Kind::Link { .. } => match std::fs::read_link(from) {
-            Ok(target) => plan.steps.push(Step {
-                from: from.to_path_buf(),
-                to: to.to_path_buf(),
-                what: What::Link(target),
-            }),
-            Err(error) => plan.skipped.push((from.to_path_buf(), error.to_string())),
-        },
 
         Kind::Other => plan.skipped.push((
             from.to_path_buf(),
@@ -791,6 +1111,7 @@ fn carry_out(plan: &Plan, control: &Control, sender: &tokio::sync::mpsc::Sender<
 
     let mut done = 0u64;
     let mut last = std::time::Instant::now();
+    let mut failures = 0usize;
 
     for (at, step) in plan.steps.iter().enumerate() {
         let steps = at;
@@ -799,9 +1120,45 @@ fn carry_out(plan: &Plan, control: &Control, sender: &tokio::sync::mpsc::Sender<
             return;
         }
 
+        // A move across two filesystems is a copy and then a delete, and the
+        // deletes are the last steps. One failed copy stops all of them: it
+        // is better to leave a file in both places than in neither, and
+        // working out which source the failure belonged to would mean the
+        // plan carrying a tree of its own.
+        if plan.work == Work::Move && failures > 0 && matches!(step.what, What::Remove { .. }) {
+            continue;
+        }
+
         let outcome = match &step.what {
             What::Directory => std::fs::create_dir_all(&step.to).map(|()| 0),
-            What::Link(target) => std::os::unix::fs::symlink(target, &step.to).map(|()| 0),
+
+            What::Link(target) => {
+                if step.replace {
+                    let _ = std::fs::remove_file(&step.to);
+                }
+                std::os::unix::fs::symlink(target, &step.to).map(|()| 0)
+            }
+
+            What::Rename(bytes) => {
+                // `rename` replaces a file at the destination without a word,
+                // so a step that was not resolved to replace must find the
+                // way clear. `clash` said it was when the plan was built;
+                // this is the guard against it changing since.
+                let gone = if step.replace || step.to.symlink_metadata().is_err() {
+                    std::fs::rename(&step.from, &step.to)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "something arrived there while the job waited",
+                    ))
+                };
+
+                if gone.is_ok() {
+                    done += bytes;
+                }
+                gone.map(|()| 0)
+            }
+
             What::File(_) => match copy(step, control, &mut done, steps, &mut last, sender) {
                 Copied::Whole => Ok(0),
                 Copied::Failed(error) => Err(error),
@@ -830,6 +1187,7 @@ fn carry_out(plan: &Plan, control: &Control, sender: &tokio::sync::mpsc::Sender<
         };
 
         if let Err(error) = outcome {
+            failures += 1;
             let _ = sender.blocking_send(Update::Failed(step.to.clone(), error.to_string()));
         }
 
@@ -872,12 +1230,16 @@ fn copy(
         Err(error) => return Copied::Failed(error),
     };
 
-    // `create_new`: the plan said this was not there, and between the plan
-    // and now somebody may have made it. Overwriting on a race is exactly
-    // the fault the clash list exists to avoid.
+    // `create_new` unless a person said to replace this one. The plan said
+    // nothing was there, and between the plan and now somebody may have made
+    // it; overwriting on a race is exactly the fault the clash list exists to
+    // avoid. `truncate` where replacing, or the tail of a longer file is left
+    // on the end of a shorter one.
     let mut write = match std::fs::File::options()
         .write(true)
-        .create_new(true)
+        .create_new(!step.replace)
+        .create(step.replace)
+        .truncate(step.replace)
         .open(&step.to)
     {
         Ok(file) => file,
@@ -986,8 +1348,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A destination that is already there is a question for a person, so
-    /// the plan writes it down and leaves it alone.
+    /// A destination that is already there is a question for a person. The
+    /// step is kept so the answer needs no second walk, but it costs nothing
+    /// and does nothing until [`Plan::resolve`] runs.
     #[test]
     fn a_file_that_is_already_there_is_a_clash() {
         let root = tree("clash");
@@ -995,14 +1358,155 @@ mod tests {
         std::fs::write(root.join("into/from/one.txt"), b"mine").expect("should write");
 
         let made = plan(Work::Copy, &[root.join("from")], &root.join("into")).expect("should plan");
+        let at = root.join("into/from/one.txt");
 
-        assert_eq!(made.clashes, [root.join("into/from/one.txt")]);
+        assert_eq!(made.clashes, std::slice::from_ref(&at));
+
+        let step = made
+            .steps
+            .iter()
+            .find(|step| step.to == at)
+            .expect("the step is kept, so the answer needs no second walk");
+        assert!(step.clash.is_some());
+        assert!(!step.replace, "and nothing replaces anything yet");
+        assert_eq!(
+            made.bytes, 7,
+            "only `two two` counts; the clashing file is not in the total"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Each answer does one plain thing, and only "skip" leaves the plan as
+    /// it was before anybody asked.
+    #[test]
+    fn every_answer_to_a_clash_does_what_it_says() {
+        let root = tree("resolve");
+        std::fs::create_dir_all(root.join("into/from")).expect("should make it");
+        std::fs::write(root.join("into/from/one.txt"), b"mine").expect("should write");
+        let at = root.join("into/from/one.txt");
+
+        // Said rather than assumed. The order the test wrote the two files in
+        // is not a time to test against: it made the destination the newer of
+        // the two, which is the opposite of what reads naturally here.
+        let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&at)
+            .expect("should open")
+            .set_times(std::fs::FileTimes::new().set_modified(long_ago))
+            .expect("should set the time");
+
+        let made = || plan(Work::Copy, &[root.join("from")], &root.join("into")).expect("plans");
+        let of = |plan: &Plan, path: &Path| plan.steps.iter().any(|step| step.to == path);
+
+        let mut skipped = made();
+        skipped.resolve(Resolve::Skip);
+        assert!(!of(&skipped, &at), "skip drops the step");
+        assert_eq!(skipped.bytes, 7, "and adds nothing to the total");
+        assert!(skipped.clashes.is_empty(), "the question is answered");
+
+        let mut over = made();
+        over.resolve(Resolve::Overwrite);
+        let step = over.steps.iter().find(|step| step.to == at).expect("kept");
+        assert!(step.replace, "overwrite replaces what is there");
+        assert_eq!(over.bytes, 7 + 3, "and now its bytes count");
+
+        let mut both = made();
+        both.resolve(Resolve::KeepBoth);
+        assert!(!of(&both, &at), "keep both writes somewhere else");
         assert!(
-            !made
-                .steps
-                .iter()
-                .any(|step| step.to == root.join("into/from/one.txt")),
-            "and it is not in the steps"
+            of(&both, &root.join("into/from/one (2).txt")),
+            "beside the one that is there, with a free name"
+        );
+
+        // `one.txt` holds `one`, three bytes, against `mine`, which is four.
+        let mut larger = made();
+        larger.resolve(Resolve::Larger);
+        assert!(!of(&larger, &at), "the source is smaller, so it is left");
+
+        // And the destination was set to 1970, so the source is the newer.
+        let mut newer = made();
+        newer.resolve(Resolve::Newer);
+        assert!(of(&newer, &at), "the source is newer, so it replaces");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A move inside one filesystem is a rename: one step for a whole tree,
+    /// and no byte read.
+    #[test]
+    fn a_move_on_one_filesystem_is_one_rename() {
+        let root = tree("rename");
+        let made = plan(Work::Move, &[root.join("from")], &root.join("into")).expect("should plan");
+
+        assert_eq!(made.steps.len(), 1, "one step, whatever the tree holds");
+        assert_eq!(made.steps[0].what, What::Rename(3 + 7));
+        assert_eq!(made.steps[0].to, root.join("into/from"));
+
+        let (sender, _receiver) = tokio::sync::mpsc::channel(64);
+        carry_out(&made, &Control::default(), &sender);
+
+        assert!(!root.join("from").exists(), "the original is gone");
+        assert!(root.join("into/from/one.txt").is_file(), "and arrived");
+        assert!(root.join("into/from/inner/two.txt").is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A move onto a name that is taken must not go through: `rename`
+    /// replaces a file without a word, so the clash has to be caught first.
+    #[test]
+    fn a_move_onto_a_name_that_is_taken_asks_first() {
+        let root = tree("rename-clash");
+        std::fs::write(root.join("into/from"), b"do not lose me").expect("should write");
+
+        let made = plan(Work::Move, &[root.join("from")], &root.join("into")).expect("should plan");
+        assert_eq!(made.clashes, [root.join("into/from")]);
+
+        let (sender, _receiver) = tokio::sync::mpsc::channel(64);
+        carry_out(&made, &Control::default(), &sender);
+
+        assert_eq!(
+            std::fs::read(root.join("into/from")).expect("still there"),
+            b"do not lose me",
+            "an unanswered clash moves nothing"
+        );
+        assert!(root.join("from").is_dir(), "and the source stays put");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A move that cannot rename must never take the original away when the
+    /// copy did not arrive.
+    #[test]
+    fn a_failed_copy_keeps_the_original() {
+        let root = tree("move-failed");
+
+        // A cross-filesystem move, built by hand: the copy steps, then the
+        // removal, which is the shape `plan` makes when the devices differ.
+        let mut made =
+            plan(Work::Copy, &[root.join("from")], &root.join("into")).expect("should plan");
+        made.work = Work::Move;
+        made.steps.push(Step::plain(
+            root.join("from"),
+            root.join("from"),
+            What::Remove {
+                tree: true,
+                bytes: 0,
+            },
+        ));
+
+        // Something is already at one destination, so that step fails.
+        std::fs::create_dir_all(root.join("into/from")).expect("should make it");
+        std::fs::write(root.join("into/from/one.txt"), b"in the way").expect("should write");
+
+        let (sender, _receiver) = tokio::sync::mpsc::channel(64);
+        carry_out(&made, &Control::default(), &sender);
+
+        assert!(
+            root.join("from/one.txt").is_file(),
+            "one step failed, so nothing is removed"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1158,11 +1662,11 @@ mod tests {
         Plan {
             work: Work::Copy,
             into: PathBuf::from("/tmp"),
-            steps: vec![Step {
-                from: PathBuf::from("/tmp/a"),
-                to: PathBuf::from("/tmp/b"),
-                what: What::File(1),
-            }],
+            steps: vec![Step::plain(
+                PathBuf::from("/tmp/a"),
+                PathBuf::from("/tmp/b"),
+                What::File(1),
+            )],
             bytes: 1,
             clashes: Vec::new(),
             skipped: Vec::new(),
@@ -1188,14 +1692,14 @@ mod tests {
         let plan = Plan {
             work: Work::Delete,
             into: PathBuf::from("/etc"),
-            steps: vec![Step {
-                from: PathBuf::from("/etc/passwd"),
-                to: PathBuf::from("/etc/passwd"),
-                what: What::Remove {
+            steps: vec![Step::plain(
+                PathBuf::from("/etc/passwd"),
+                PathBuf::from("/etc/passwd"),
+                What::Remove {
                     tree: false,
                     bytes: 1,
                 },
-            }],
+            )],
             bytes: 1,
             clashes: Vec::new(),
             skipped: Vec::new(),
