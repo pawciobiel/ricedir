@@ -1940,6 +1940,19 @@ than the one already installed is partly that it looks good.
       lifting under the pointer, a job's bar and its arrival in the panel, the
       filter box unrolling, a breadcrumb changing, and a directory's rows fading
       in as the listing streams.
+- [ ] **Carry the icon with the pointer while dragging.** A drag picks
+      something up and puts it down, and nothing on screen says so: only the
+      target tile changes, and the thing being moved stays where it was.
+
+      Draw the icon under the pointer, with the name and a count when it is
+      more than one, and let it settle into the target or spring back when
+      the drop is refused. `App.dragging` already knows what is held and
+      `App.pointer` where the hand is.
+
+      An overlay, not a row in a list. It has to be drawn over both tiles and
+      the panel, and a primitive issued after `with_layer` returns goes
+      underneath it -- see the trap in `CLAUDE.md`.
+
 - [ ] **Subscribe to frames only while something is animating.**
       `iced::window::frames()` gives an `Instant` per redraw; a program that
       holds it open forever is a program that keeps a laptop's GPU awake for no

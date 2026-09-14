@@ -259,14 +259,14 @@ pub enum Message {
     TypingPath(usize, bool),
     /// The typed path was submitted.
     PathSubmitted(usize),
-    /// Escape, from the subscription rather than the list. Only the path
-    /// bar's text face uses it; everything else Escape does still comes
+    /// Escape, from the subscription rather than the list. Used while a text
+    /// box holds the keyboard; everything else Escape does still comes
     /// through the list widget.
     ///
     /// The window, because the subscription knows no tile. It reaches the
     /// buffer the focused tile of that window is showing, which is the one
     /// whose text face is on screen.
-    EscapedPath(window::Id),
+    Escaped(window::Id),
     /// Tab, likewise: complete the path being typed.
     CompletePath(window::Id),
     /// The pointer went down on a place. Not yet a click: it may be a drag.
@@ -773,15 +773,25 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
 
-        Message::EscapedPath(window) => {
-            // Only this. Every other thing Escape puts away still comes
-            // through the list widget's own `Action::Escape`.
-            if let Some(index) = focused_buffer(app, window)
-                && let Some(buffer) = app.buffers.get_mut(index)
-            {
-                buffer.typing_path = None;
+        Message::Escaped(window) => {
+            let Some(index) = focused_buffer(app, window) else {
+                return Task::none();
+            };
+
+            // Only while a text box has the keyboard. `text_input` captures
+            // Escape and unfocuses itself, so the list never sees it and
+            // cannot report it. With no box up the list reports it as usual,
+            // and acting here as well would spend two steps on one press.
+            let boxed = app
+                .buffers
+                .get(index)
+                .is_some_and(|buffer| buffer.typing_path.is_some() || buffer.filtering);
+
+            if !boxed {
+                return Task::none();
             }
-            Task::none()
+
+            action::dispatch(app, Action::Escape { buffer: index })
         }
 
         Message::CompletePath(window) => {
@@ -1645,6 +1655,25 @@ pub fn carry_out(app: &mut App, action: Action) -> Task<Message> {
             {
                 return Task::none();
             }
+
+            // The filter box goes in two steps. A filter typed by mistake is
+            // the common case, and one Escape that took the box away with it
+            // would mean opening the box again to carry on. An empty box has
+            // nothing left to lose, so it goes on the first press.
+            //
+            // The box is focused again by hand: `text_input` captures Escape
+            // and unfocuses itself on the way past, so without this the box
+            // would stay on screen and take nothing typed into it.
+            let list = app.config.list.clone();
+            if let Some(found) = app.buffers.get_mut(buffer)
+                && found.filtering
+                && !found.filter.is_empty()
+            {
+                found.filter.clear();
+                found.rebuild(&list);
+                return iced::widget::operation::focus(filter_id());
+            }
+
             Task::done(Message::Filtering(buffer, false))
         }
 
@@ -2279,7 +2308,7 @@ pub fn subscription(app: &App) -> iced::Subscription<Message> {
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                 ..
-            }) => Some(Message::EscapedPath(window)),
+            }) => Some(Message::Escaped(window)),
             // Tab, for the same reason. `text_input` does not capture it
             // either, so without this it would reach nothing at all.
             iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
@@ -4198,6 +4227,51 @@ mod tests {
         );
     }
 
+    /// Escape clears the filter before it closes the box.
+    ///
+    /// A filter typed by mistake is the common case, and one Escape that
+    /// took the box away as well would mean opening it again to carry on.
+    #[test]
+    fn escape_clears_the_filter_then_closes_the_box() {
+        let mut app = app();
+        let list = Config::default().list;
+        app.buffers[0].extend(
+            vec![entry("alpha.txt", Kind::File), entry("beta.md", Kind::File)],
+            &list,
+        );
+        app.buffers[0].finish(&list);
+
+        app.buffers[0].filtering = true;
+        app.buffers[0].filter = String::from("alpha");
+        app.buffers[0].rebuild(&list);
+        assert_eq!(app.buffers[0].rows(), 1);
+
+        // First: the text goes, the box stays.
+        tell(&mut app, Message::Act(Action::Escape { buffer: 0 }));
+        assert!(app.buffers[0].filter.is_empty(), "the filter went");
+        assert!(app.buffers[0].filtering, "but the box is still up");
+        assert_eq!(app.buffers[0].rows(), 2, "and everything is showing");
+
+        // Second: the box goes.
+        tell(&mut app, Message::Act(Action::Escape { buffer: 0 }));
+        tell(&mut app, Message::Filtering(0, false));
+        assert!(!app.buffers[0].filtering);
+    }
+
+    /// An empty box has nothing left to lose, so one press takes it away.
+    #[test]
+    fn escape_closes_an_empty_filter_box_at_once() {
+        let mut app = app();
+        app.buffers[0].filtering = true;
+
+        // `Action::Escape` answers with the message that closes it, so the
+        // step being tested is that it did not stop to clear anything first.
+        tell(&mut app, Message::Act(Action::Escape { buffer: 0 }));
+        tell(&mut app, Message::Filtering(0, false));
+
+        assert!(!app.buffers[0].filtering);
+    }
+
     /// Escape leaves the text face. It arrives from the subscription rather
     /// than the list, because the list is not taking keys while the box is up.
     #[test]
@@ -4207,7 +4281,7 @@ mod tests {
         app.windows.insert(window, Tiles::new(0));
         app.buffers[0].typing_path = Some(String::from("/tmp/half-typed"));
 
-        tell(&mut app, Message::EscapedPath(window));
+        tell(&mut app, Message::Escaped(window));
         assert!(app.buffers[0].typing_path.is_none());
     }
 
