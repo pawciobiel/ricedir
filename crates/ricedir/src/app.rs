@@ -3762,8 +3762,7 @@ mod tests {
     /// it never guesses between two directories.
     #[test]
     fn tab_completes_to_the_shared_prefix() {
-        let root = std::env::temp_dir().join("ricedir-complete");
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::testing::scratch("complete");
         for name in ["workspace", "workbench", "other"] {
             std::fs::create_dir_all(root.join(name)).expect("make the tree");
         }

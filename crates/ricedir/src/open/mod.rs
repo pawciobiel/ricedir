@@ -658,7 +658,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let text = "[[handler]]\nmime = \"text/*\"\nrun = [\"evil\"]\n";
-        let path = std::env::temp_dir().join(format!("ricedir-trust-{}.toml", std::process::id()));
+        let path = crate::testing::scratch("trust").join("config.toml");
 
         std::fs::write(&path, text).expect("should write");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))

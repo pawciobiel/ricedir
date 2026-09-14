@@ -17,8 +17,15 @@ target/
 secrets.*
 *_history
 
-# Screenshots and recordings from the rig. `dev/rig.sh` writes to /tmp, but a
-# `grim` run from the repository root lands here.
+# Everything a test or the rig writes. Anchored, so only the one at the top.
+# Tests build their trees here and `jobs::carry_out` refuses under `cfg(test)`
+# to change anything outside it, so a test that names the wrong path stops
+# instead of deleting something real. `dev/rig.sh` puts the rig's HOME here
+# too.
+/tmp/
+
+# Screenshots and recordings from the rig. A `grim` run from the repository
+# root lands here.
 *.png
 *.ppm
 *.gif

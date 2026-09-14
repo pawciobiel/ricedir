@@ -13,11 +13,21 @@
 # that does not look like one it made.
 set -eu
 
-ROOT=${1:-/tmp/ricedir-test}
+# Inside the rig's home, not beside it. The rig's home holds the config
+# ricedir writes on first run, and it is made once and kept; `tmp/` under it
+# is the part that is built and thrown away. It used to be
+# `/tmp/ricedir-test`.
+REPO=$(cd "$(dirname "$0")/.." && pwd)
+RIG_HOME=$REPO/tmp/rig-home
+ROOT=${1:-$RIG_HOME/tmp/tree}
 COUNT=${2:-100000}
 
+# A tree is removed before it is rebuilt, so the name has to be one that is
+# safe to remove. The rig's home and everything above it are not: destroying
+# the home to rebuild a tree inside it is the accident this list exists to
+# stop.
 case "$ROOT" in
-    /|/home|/home/*/|"$HOME")
+    /|/home|/home/*/|"$HOME"|"$REPO"|"$REPO"/|"$REPO"/tmp|"$RIG_HOME"|"$RIG_HOME"/tmp)
         echo "make-test-tree: refusing to touch $ROOT" >&2
         exit 1
         ;;

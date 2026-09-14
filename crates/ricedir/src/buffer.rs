@@ -708,10 +708,7 @@ mod tests {
 
     /// A scratch directory of this test's own, so two tests never collide.
     fn scratch(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("ricedir-reconcile-{name}"));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("make the scratch directory");
-        root
+        crate::testing::scratch(&format!("reconcile-{name}"))
     }
 
     /// What the worker hands back for a set of paths: each one, and what it

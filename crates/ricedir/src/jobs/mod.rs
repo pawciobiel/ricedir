@@ -769,6 +769,26 @@ fn walk(from: &Path, to: &Path, depth: usize, plan: &mut Plan) {
 
 /// The worker itself. Blocking, on a thread of its own.
 fn carry_out(plan: &Plan, control: &Control, sender: &tokio::sync::mpsc::Sender<Update>) {
+    // A test that names the wrong path copies or deletes for real, and a
+    // delete leaves nothing behind to notice it by. The run stops here rather
+    // than reporting an error the test could ignore. `cfg(test)`, so the
+    // shipped binary carries none of it.
+    #[cfg(test)]
+    for step in &plan.steps {
+        // What the step changes. A removal takes `from` away; everything else
+        // writes `to`. Reading a path outside `tmp/` harms nothing.
+        let touched = match step.what {
+            What::Remove { .. } => &step.from,
+            _ => &step.to,
+        };
+        assert!(
+            crate::testing::inside(touched),
+            "a test may only change what is under {}: {}",
+            crate::testing::root().display(),
+            touched.display()
+        );
+    }
+
     let mut done = 0u64;
     let mut last = std::time::Instant::now();
 
@@ -919,8 +939,7 @@ mod tests {
     /// A tree to copy, under a name of this test's own so two tests never
     /// share one.
     fn tree(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("ricedir-jobs-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::testing::scratch(&format!("jobs-{name}"));
         std::fs::create_dir_all(root.join("from/inner")).expect("should make the tree");
         std::fs::create_dir_all(root.join("into")).expect("should make the destination");
         std::fs::write(root.join("from/one.txt"), b"one").expect("should write");
@@ -1148,6 +1167,42 @@ mod tests {
             clashes: Vec::new(),
             skipped: Vec::new(),
         }
+    }
+
+    /// The guard is the reason a wrong path in a test is not a lost file.
+    ///
+    /// `one_step` names `/tmp/b`, which is outside the repository's `tmp/`.
+    /// The queue tests hand that plan about safely, because a dropped `Task`
+    /// never runs it; the moment anything does run it, it stops.
+    #[test]
+    #[should_panic(expected = "a test may only change what is under")]
+    fn a_copy_outside_tmp_stops_the_test() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(64);
+        carry_out(&one_step(), &Control::default(), &sender);
+    }
+
+    /// And the same for a delete, which is the one with nothing to put back.
+    #[test]
+    #[should_panic(expected = "a test may only change what is under")]
+    fn a_delete_outside_tmp_stops_the_test() {
+        let plan = Plan {
+            work: Work::Delete,
+            into: PathBuf::from("/etc"),
+            steps: vec![Step {
+                from: PathBuf::from("/etc/passwd"),
+                to: PathBuf::from("/etc/passwd"),
+                what: What::Remove {
+                    tree: false,
+                    bytes: 1,
+                },
+            }],
+            bytes: 1,
+            clashes: Vec::new(),
+            skipped: Vec::new(),
+        };
+
+        let (sender, _receiver) = tokio::sync::mpsc::channel(64);
+        carry_out(&plan, &Control::default(), &sender);
     }
 
     /// A job waits for its plan before it is worth starting, and a plan that

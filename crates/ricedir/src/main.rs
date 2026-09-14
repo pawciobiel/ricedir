@@ -17,6 +17,8 @@ mod keys;
 mod open;
 mod places;
 mod state;
+#[cfg(test)]
+mod testing;
 mod watch;
 mod widget;
 

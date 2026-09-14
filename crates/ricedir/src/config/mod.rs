@@ -705,11 +705,12 @@ mod tests {
     fn parse_text(text: &str) -> Result<Config, String> {
         use std::os::unix::fs::PermissionsExt;
 
-        let path = std::env::temp_dir().join(format!(
-            "ricedir-config-test-{}-{:?}.toml",
+        let path = crate::testing::root().join(format!(
+            "config-test-{}-{:?}.toml",
             std::process::id(),
             std::thread::current().id()
         ));
+        std::fs::create_dir_all(crate::testing::root()).expect("should make the test directory");
 
         std::fs::write(&path, text).expect("should write a test config");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
@@ -783,7 +784,7 @@ mod tests {
     fn a_written_handler_parses_again() {
         use std::os::unix::fs::PermissionsExt;
 
-        let path = std::env::temp_dir().join(format!("ricedir-append-{}.toml", std::process::id()));
+        let path = crate::testing::scratch("append").join("config.toml");
         std::fs::write(&path, "[list]\nrow-height = 24\n").expect("should write");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
 

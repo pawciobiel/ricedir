@@ -2,8 +2,11 @@
 # Start a headless sway and print the environment for talking to it.
 #
 #   eval "$(dev/rig.sh)"
-#   ricedir /tmp/ricedir-test
+#   dev/ricedir.sh tmp/tree          # relative to the rig home, never ~/
 #   dev/wait-for-window.sh          # before the first screenshot
+#
+# Start ricedir through `dev/ricedir.sh`, which also gives it a HOME it may
+# ruin. This script only redirects the config.
 #
 # Two things this exists to stop.
 #
@@ -19,6 +22,7 @@
 set -eu
 
 HERE=$(dirname "$0")
+REPO=$(cd "$HERE/.." && pwd)
 RUNTIME=/run/user/$(id -u)
 
 if ! pgrep -x sway >/dev/null 2>&1; then
@@ -56,11 +60,19 @@ if [ -z "$DISPLAY_NAME" ]; then
     exit 1
 fi
 
-# Never the real one. ricedir writes a config on first run and appends to it
+# Never the real config. ricedir writes one on first run and appends to it
 # when somebody picks a handler or a bookmark, and a test run has no business
-# in `~/.config/ricedir`.
-mkdir -p /tmp/ricedir-cfg
+# in `~/.config/ricedir`. One appeared there uninvited during the keyboard
+# work.
+#
+# HOME is *not* set here, on purpose. `dev/ricedir.sh` sets it for the program
+# alone. Exported from this script it would follow the shell, and `CARGO_HOME`
+# is unset on this machine, so the next `cargo build` would look for its
+# registry in the rig's home and fetch the lot again.
+#
+# The rig's home is made once and kept. Only `~/tmp` inside it is thrown away.
+mkdir -p "$REPO/tmp/rig-home/.config" "$REPO/tmp/rig-home/tmp"
 
 echo "export SWAYSOCK=$SOCK"
 echo "export WAYLAND_DISPLAY=$DISPLAY_NAME"
-echo "export XDG_CONFIG_HOME=/tmp/ricedir-cfg"
+echo "export XDG_CONFIG_HOME=$REPO/tmp/rig-home/.config"
